@@ -53,7 +53,6 @@ endmacro()
 
 add_libsession_util_library(util
     file.cpp
-    image/thumbhash.cpp
     logging.cpp
     util.cpp
 )
@@ -253,6 +252,7 @@ endif()
 target_link_libraries(core PUBLIC network)
 
 add_libsession_util_library(image
+    image/thumbhash.cpp
     image/vips.cpp
 )
 target_link_libraries(image
