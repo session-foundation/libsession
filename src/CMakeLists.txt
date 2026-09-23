@@ -252,6 +252,16 @@ endif()
 # depends on the network target (defined after core above).
 target_link_libraries(core PUBLIC network)
 
+add_libsession_util_library(image
+    image/vips.cpp
+)
+target_link_libraries(image
+    PUBLIC
+    util
+    PRIVATE
+    sessiondep::vips
+)
+
 if(WARNINGS_AS_ERRORS AND NOT USE_LTO AND CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION MATCHES "^11\\.")
     # GCC 11 has an overzealous (and false) stringop-overread warning, but only when LTO is off.
     # Um, yeah.

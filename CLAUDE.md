@@ -52,6 +52,7 @@ util     ← file, logging, util (uses zstd, simdutf)
 crypto   ← util + libsodium (blinding, ed25519, session_encrypt, etc.)
 config   ← crypto + libsodium + protos (all config types)
 core     ← crypto + SQLite + mlkem768 (PQC key encapsulation)
+image    ← util + libvips (image processing)
 onionreq ← crypto + quic + nettle (optional)
 ```
 
@@ -63,6 +64,7 @@ Public headers are in `include/session/`:
 - `include/session/config/` — config type headers (`.h` = C API, `.hpp` = C++ API)
 - `include/session/config/groups/` — closed group configs (keys, info, members)
 - `include/session/core/` — Core persistent state components
+- `include/session/image/` — image processing (libvips setup and its loader whitelist)
 - `include/session/onionreq/` — onion request types
 
 ### Dependency System

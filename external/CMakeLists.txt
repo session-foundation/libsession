@@ -138,6 +138,11 @@ endif()
 session_dep(simdutf 7)
 libsession_static_bundle(sessiondep::simdutf)
 
+# 8.13 added vips_operation_block_set(), which the loader whitelist in src/image/vips.cpp needs: a
+# system libvips may carry loaders (svg, pdf, tiff, ...) that our static build leaves out.
+session_dep(vips 8.13)
+libsession_static_bundle(sessiondep::vips)
+
 
 add_subdirectory(session-sqlite)
 
