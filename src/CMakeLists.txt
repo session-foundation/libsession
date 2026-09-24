@@ -252,6 +252,7 @@ endif()
 target_link_libraries(core PUBLIC network)
 
 add_libsession_util_library(image
+    image/jpeg_encode.cpp
     image/thumbhash.cpp
     image/vips.cpp
 )
@@ -261,6 +262,12 @@ target_link_libraries(image
     PRIVATE
     sessiondep::vips
 )
+if(SESSION_ENABLE_JPEGLI)
+    # jpegli's include directory comes first and holds its own <jpeglib.h>, so no source in this
+    # library may use libjpeg(-turbo) directly; only libvips, compiled elsewhere, does.
+    target_link_libraries(image PRIVATE sessiondep::jpegli)
+    target_compile_definitions(image PRIVATE SESSION_ENABLE_JPEGLI)
+endif()
 
 if(WARNINGS_AS_ERRORS AND NOT USE_LTO AND CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION MATCHES "^11\\.")
     # GCC 11 has an overzealous (and false) stringop-overread warning, but only when LTO is off.

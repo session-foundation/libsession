@@ -44,6 +44,7 @@ set(LIB_SESSION_UTESTS_SOURCES
     test_group_info.cpp
     test_group_members.cpp
     test_hash.cpp
+    test_image_jpeg.cpp
     test_image_thumbhash.cpp
     test_image_vips.cpp
     #test_logging.cpp  # Handled separately, see below
@@ -97,6 +98,9 @@ target_link_libraries(test_libs INTERFACE
     libsession::image
     # The image tests inspect libvips directly to confirm what libsession::image configured in it.
     sessiondep::vips)
+if(SESSION_ENABLE_JPEGLI)
+    target_compile_definitions(test_libs INTERFACE SESSION_ENABLE_JPEGLI)
+endif()
 
 add_executable(testAll main.cpp ${LIB_SESSION_UTESTS_SOURCES})
 target_include_directories(testAll PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

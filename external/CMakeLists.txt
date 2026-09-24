@@ -143,6 +143,14 @@ libsession_static_bundle(sessiondep::simdutf)
 session_dep(vips 8.13)
 libsession_static_bundle(sessiondep::vips)
 
+if(SESSION_ENABLE_JPEGLI)
+    # Always our own build, even when everything else comes from the system: distributions do not
+    # package jpegli, and we want every client encoding JPEGs the same way whatever libvips it has.
+    set(BUILD_STATIC_jpegli ON CACHE BOOL "" FORCE)
+    session_dep(jpegli 0)
+    libsession_static_bundle(sessiondep::jpegli)
+endif()
+
 
 add_subdirectory(session-sqlite)
 
