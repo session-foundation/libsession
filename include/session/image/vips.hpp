@@ -18,6 +18,9 @@ namespace session::image {
 ///
 /// libvips' own `untrusted` flag is not a substitute: the TIFF and matrix loaders, for instance,
 /// are not flagged untrusted, and the matrix loader is built into every libvips.
+///
+/// `displayable_image_types` (content_types.hpp) lists the attachment content types these cover,
+/// and is to be kept in step with this.
 inline constexpr std::array<std::string_view, 5> allowed_loaders{
         "VipsForeignLoadJpeg",
         // libspng in our static build; a system libvips built with libpng provides the same class.

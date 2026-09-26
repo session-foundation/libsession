@@ -1,7 +1,10 @@
 #include <vips/vips.h>
 
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
+#include <map>
 #include <optional>
+#include <session/image/content_types.hpp>
 #include <session/image/vips.hpp>
 #include <string>
 #include <vector>
@@ -108,6 +111,32 @@ TEST_CASE("libvips loader whitelist", "[image][vips]") {
     // The matrix, csv, raw and vips loaders are built into every libvips, so there is always
     // something that has to be blocked; seeing none would mean the audit saw nothing at all.
     CHECK(audit.blocked > 0);
+}
+
+TEST_CASE("every displayable image type has a whitelisted loader", "[image][vips]") {
+    // A content type the clients treat as an image but that we then refuse to decode would show as
+    // a broken gallery.
+    const std::map<std::string_view, std::string_view> loader_for{
+            {"image/jpeg", "VipsForeignLoadJpeg"},
+            {"image/jpg", "VipsForeignLoadJpeg"},
+            {"image/pjpeg", "VipsForeignLoadJpeg"},
+            {"image/png", "VipsForeignLoadPng"},
+            {"image/webp", "VipsForeignLoadWebp"},
+            {"image/gif", "VipsForeignLoadNsgif"},
+            {"image/avif", "VipsForeignLoadHeif"},
+    };
+    for (auto type : session::image::displayable_image_types) {
+        INFO(type);
+        auto loader = loader_for.find(type);
+        REQUIRE(loader != loader_for.end());
+        CHECK(std::ranges::find(image::allowed_loaders, loader->second) !=
+              image::allowed_loaders.end());
+    }
+    CHECK(session::image::is_displayable_image("IMAGE/Jpeg"));
+    CHECK_FALSE(session::image::is_displayable_image("image/svg+xml"));
+    CHECK_FALSE(session::image::is_displayable_image("image/heic"));
+    CHECK_FALSE(session::image::is_displayable_image("image/pn"));
+    CHECK_FALSE(session::image::is_displayable_image("image/pngx"));
 }
 
 TEST_CASE("libvips loads only whitelisted formats", "[image][vips]") {

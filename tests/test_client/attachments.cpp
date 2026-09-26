@@ -1573,7 +1573,7 @@ TEST_CASE("Client: a conversation set to auto-download fetches on arrival", "[cl
     net->served["img"] = image_ct;
     net->served["doc"] = doc_ct;
 
-    auto arrive = [&](std::string hash, bool with_doc) {
+    auto arrive = [&](std::string hash, bool with_doc, std::string_view image_type = "image/png") {
         deliver(*c,
                 peer,
                 "",
@@ -1588,7 +1588,7 @@ TEST_CASE("Client: a conversation set to auto-download fetches on arrival", "[cl
                     a->set_key(std::string{
                             reinterpret_cast<const char*>(image_key.data()), image_key.size()});
                     a->set_size(image.size());
-                    a->set_contenttype("image/png");
+                    a->set_contenttype(std::string{image_type});
                     if (with_doc) {
                         auto* b = data.add_attachments();
                         b->set_id(2);
@@ -1621,6 +1621,13 @@ TEST_CASE("Client: a conversation set to auto-download fetches on arrival", "[cl
         auto m = c->conversation(convo, await)->messages(await)[0];
         CHECK_FALSE(m.gallery_viewable);
         CHECK_FALSE(m.gallery);
+    }
+
+    SECTION("images only leaves an image type we do not display") {
+        c->conversation(convo, await)->set_auto_download(AutoDownload::image_attachments, await);
+        arrive("h6", false, "image/svg+xml");
+        CHECK(net->downloads.empty());
+        CHECK_FALSE(c->conversation(convo, await)->messages(await)[0].gallery_viewable);
     }
 
     SECTION("all fetches both, and an all-image message opens as a gallery") {
@@ -2038,6 +2045,66 @@ TEST_CASE("Client: the list preview describes a message's attachments", "[client
     CHECK(w.body == "look at this");
     CHECK(w.filenames == std::vector<std::string>{"photo.png"});
     CHECK(w.all_images);
+}
+
+TEST_CASE("Client: only image types we display count as images", "[client][attachments]") {
+    // One conversation per content type, so each preview describes exactly one attachment.  The
+    // preview's flag comes from SQL and gallery_viewable from C++, and they must agree on every
+    // one.
+    const std::vector<std::pair<std::string_view, bool>> types{
+            {"image/png", true},
+            {"image/jpeg", true},
+            {"image/jpg", true},
+            {"image/webp", true},
+            {"image/gif", true},
+            {"image/avif", true},
+            // MIME types are case-insensitive.
+            {"IMAGE/PNG", true},
+            {"Image/WebP", true},
+            // Image types we will not decode, so not images as far as presentation goes.
+            {"image/svg+xml", false},
+            {"image/tiff", false},
+            {"image/bmp", false},
+            // Converted to JPEG before any Session client sends it; one arriving anyway is a file.
+            {"image/heic", false},
+            {"image/heif", false},
+    };
+
+    TempClient c;
+    std::vector<SenderKeys> senders(types.size());
+    uint64_t next_id = 700;
+    for (size_t i = 0; i < types.size(); i++) {
+        approve(*c, senders[i].session_id);
+        deliver(*c,
+                senders[i],
+                "",
+                from_epoch_ms(1000 + i),
+                "h{}"_format(i),
+                "",
+                std::nullopt,
+                [&](SessionProtos::DataMessage& data) {
+                    auto* a = data.add_attachments();
+                    a->set_id(next_id);
+                    a->set_url("http://fs.example/file/{}#d"_format(next_id++));
+                    a->set_key(std::string(32, 'k'));
+                    a->set_size(10);
+                    a->set_contenttype(std::string{types[i].first});
+                });
+    }
+    sync(*c);
+
+    auto convos = c->conversations(await);
+    REQUIRE(convos.size() == types.size());
+    for (size_t i = 0; i < types.size(); i++) {
+        auto [type, image] = types[i];
+        INFO(type);
+        auto id = ConversationId::dm(senders[i].session_id);
+        auto found = std::ranges::find_if(convos, [&](const auto& c) { return c.id() == id; });
+        REQUIRE(found != convos.end());
+        REQUIRE(found->last_preview());
+        CHECK(found->last_preview()->all_images == image);
+        CHECK(c->conversation(id, await)->messages(await)[0].gallery_viewable == image);
+    }
 }
 
 TEST_CASE("Client: a text-only message previews no attachments", "[client][attachments]") {
