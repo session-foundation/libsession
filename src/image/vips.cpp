@@ -1,5 +1,6 @@
 #include "session/image/vips.hpp"
 
+#include <libheif/heif.h>
 #include <vips/vips.h>
 
 #include <mutex>
@@ -42,6 +43,13 @@ void init() {
                         vips_version_string(),
                         name);
         }
+
+        // The operation cache memoises operations by their arguments, which helps only a program
+        // repeating identical pipelines, and can keep decoded images alive after we are done.
+        vips_cache_set_max(0);
+
+        // probe() calls libheif itself, which must be initialised first; libvips does its own.
+        heif_init(nullptr);
     });
 }
 

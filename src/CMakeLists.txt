@@ -253,14 +253,18 @@ target_link_libraries(core PUBLIC network)
 
 add_libsession_util_library(image
     image/jpeg_encode.cpp
+    image/probe.cpp
+    image/source.cpp
     image/thumbhash.cpp
     image/vips.cpp
 )
 target_link_libraries(image
     PUBLIC
-    util
+    # Source reads encrypted files with attachment::SeekableDecryptor.
+    crypto
     PRIVATE
     sessiondep::vips
+    sessiondep::libheif
 )
 if(SESSION_ENABLE_JPEGLI)
     # jpegli's include directory comes first and holds its own <jpeglib.h>, so no source in this

@@ -143,6 +143,11 @@ libsession_static_bundle(sessiondep::simdutf)
 session_dep(vips 8.13)
 libsession_static_bundle(sessiondep::vips)
 
+# libvips' own HEIF support cannot say which codec a HEIF file uses (it guesses from the brand),
+# so libsession::image asks libheif directly; 1.19 is the first with the grid tile API it needs.
+session_dep(libheif 1.19)
+libsession_static_bundle(sessiondep::libheif)
+
 if(SESSION_ENABLE_JPEGLI)
     # Always our own build, even when everything else comes from the system: distributions do not
     # package jpegli, and we want every client encoding JPEGs the same way whatever libvips it has.

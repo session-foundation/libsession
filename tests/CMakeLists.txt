@@ -45,6 +45,7 @@ set(LIB_SESSION_UTESTS_SOURCES
     test_group_members.cpp
     test_hash.cpp
     test_image_jpeg.cpp
+    test_image_probe.cpp
     test_image_thumbhash.cpp
     test_image_vips.cpp
     #test_logging.cpp  # Handled separately, see below
@@ -96,8 +97,9 @@ target_link_libraries(test_libs INTERFACE
 target_link_libraries(test_libs INTERFACE
     libsession::network
     libsession::image
-    # The image tests inspect libvips directly to confirm what libsession::image configured in it.
-    sessiondep::vips)
+    # The image tests inspect libvips and libheif directly to confirm what libsession::image did.
+    sessiondep::vips
+    sessiondep::libheif)
 if(SESSION_ENABLE_JPEGLI)
     target_compile_definitions(test_libs INTERFACE SESSION_ENABLE_JPEGLI)
 endif()
