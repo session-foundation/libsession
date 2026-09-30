@@ -503,7 +503,7 @@ void SnodePool::_launch_next_refresh_request(
                             // possible that the node is offline so don't both including it in the
                             // initial cache (if we get a successful connection and refresh the
                             // cache then it would be added back at that point)
-                            if (snode.requested_unlock_height &&
+                            if (snode.requested_unlock_height > 0 &&
                                 snode.requested_unlock_height <= expected_current_height) {
                                 unlocked_count++;
                                 continue;
