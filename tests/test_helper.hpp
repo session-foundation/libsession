@@ -402,7 +402,7 @@ class TestHelper {
         net._loop->call_get([&] {
             net._current_clock_resync_id = "test";
             net._clock_resync_results = std::move(measured);
-            net._on_clock_resync_complete(static_cast<uint8_t>(net._clock_resync_results.size()));
+            net._on_clock_resync_complete();
         });
     }
 

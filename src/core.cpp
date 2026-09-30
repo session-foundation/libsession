@@ -553,15 +553,15 @@ void Core::_swarm_response(
         bool timeout,
         int16_t status,
         std::optional<std::string> body) {
-    // Not this member's swarm.  Network has already taken the corrected membership
-    // out of the rejection, so resolving again gets the new one -- and whatever we
-    // were sticking to is exactly what was wrong.
+    // Not this member's swarm.  Network reports this only once the swarm has been corrected -- from
+    // the rejection's redirect, or by a refresh -- so resolving again gets the new one, and
+    // whatever we were sticking to is exactly what was wrong.  A rejection it could not correct
+    // arrives as ERROR_SWARM_UNRESOLVED instead, and ends the operation below.
     if (status == network::ERROR_MISDIRECTED_REQUEST) {
         op->prefer.reset();
 
         // Spent, not merely wrong to stick to: a member that says the account is not its own will
-        // say so again, and the corrected swarm may not have arrived -- an older server sends no
-        // swarm with the rejection, and then re-resolving returns the very same membership.
+        // say so again, and a refreshed pool can still place it in the account's swarm.
         op->spent.push_back(node);
 
         if (++op->redirects > SWARM_REDIRECT_LIMIT)

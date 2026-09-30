@@ -6,8 +6,10 @@
 
 #include <chrono>
 #include <concepts>
+#include <condition_variable>
 #include <cstddef>
 #include <future>
+#include <mutex>
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
 #include <set>
