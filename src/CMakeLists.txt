@@ -266,6 +266,14 @@ target_link_libraries(image
     sessiondep::vips
     sessiondep::libheif
 )
+if(APPLE)
+    # HEIC decodes through ImageIO, since we ship no HEVC decoder.
+    target_sources(image PRIVATE image/platform_apple.cpp)
+    target_link_libraries(image PRIVATE
+        "-framework ImageIO" "-framework CoreGraphics" "-framework CoreFoundation")
+else()
+    target_sources(image PRIVATE image/platform_none.cpp)
+endif()
 if(SESSION_ENABLE_JPEGLI)
     # jpegli's include directory comes first and holds its own <jpeglib.h>, so no source in this
     # library may use libjpeg(-turbo) directly; only libvips, compiled elsewhere, does.

@@ -44,9 +44,7 @@ struct Info {
 
     bool has_alpha;
 
-    /// Whether this build can decode the image.  False only for HEIC when no HEVC decoder is
-    /// available: libsession does not ship one (the codec is patent-encumbered), so HEIC decodes
-    /// only through a system libheif that has one, or a platform decoder.
+    /// Whether this build can decode the image: `can_decode(format)`.
     bool decodable;
 
     /// The encoded size in bytes: Source::size().
@@ -61,6 +59,17 @@ struct Info {
         return frame <= max_frame_pixels && (!all_frames || frame * frames <= max_total_pixels);
     }
 };
+
+/// API: image/can_decode
+///
+/// Whether this build can decode images of `format`, e.g. for whether a file picker should offer
+/// HEIC files.
+///
+/// HEIC is the one that varies.  libsession ships no HEVC decoder (the codec is patent-encumbered),
+/// so HEIC decodes only through the platform's own decoder (ImageIO on Apple platforms) or through
+/// a system libheif that has an HEVC decoder.  The other formats are always decodable, unless a
+/// system libvips was built without them.
+bool can_decode(Format format);
 
 /// API: image/probe
 ///

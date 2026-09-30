@@ -116,6 +116,28 @@ namespace detail {
         }
     }
 
+    std::vector<std::byte> source_access::read_all(Source& source) {
+        VipsSource* vsrc = source.pimpl->source;
+        if (vips_source_rewind(vsrc)) {
+            rethrow_error(source);
+            throw_vips_error("image source: cannot rewind");
+        }
+        std::vector<std::byte> out(source.pimpl->size);
+        for (size_t got = 0; got < out.size();) {
+            gint64 n = vips_source_read(vsrc, out.data() + got, out.size() - got);
+            if (n <= 0) {
+                rethrow_error(source);
+                if (n < 0)
+                    throw_vips_error("image source: read failed");
+                throw std::runtime_error{
+                        "image source: ended after {} of {} bytes"_format(got, out.size())};
+            }
+            got += static_cast<size_t>(n);
+        }
+        vips_source_rewind(vsrc);
+        return out;
+    }
+
 }  // namespace detail
 
 }  // namespace session::image

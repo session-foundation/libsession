@@ -45,6 +45,7 @@ set(LIB_SESSION_UTESTS_SOURCES
     test_group_members.cpp
     test_hash.cpp
     test_image_jpeg.cpp
+    test_image_platform.cpp
     test_image_probe.cpp
     test_image_thumbhash.cpp
     test_image_vips.cpp
