@@ -45,6 +45,7 @@ set(LIB_SESSION_UTESTS_SOURCES
     test_group_members.cpp
     test_hash.cpp
     test_image_jpeg.cpp
+    test_image_platform.cpp
     test_image_probe.cpp
     test_image_thumbhash.cpp
     test_image_vips.cpp
@@ -100,6 +101,12 @@ target_link_libraries(test_libs INTERFACE
     # The image tests inspect libvips and libheif directly to confirm what libsession::image did.
     sessiondep::vips
     sessiondep::libheif)
+if(APPLE)
+    # The platform tests encode their own HEIC fixtures with ImageIO.  libsession::image links these
+    # privately, which reaches us only when it is a static library.
+    target_link_libraries(test_libs INTERFACE
+        "-framework ImageIO" "-framework CoreGraphics" "-framework CoreFoundation")
+endif()
 if(SESSION_ENABLE_JPEGLI)
     target_compile_definitions(test_libs INTERFACE SESSION_ENABLE_JPEGLI)
 endif()

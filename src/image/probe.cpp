@@ -11,6 +11,8 @@
 #include <string_view>
 #include <utility>
 
+#include "platform.hpp"
+#include "session/image/vips.hpp"
 #include "source_internal.hpp"
 #include "vips_internal.hpp"
 
@@ -164,10 +166,30 @@ std::optional<Info> probe(Source& source) {
     if (info.orientation >= 5)
         std::swap(info.width, info.height);
     info.has_alpha = vips_image_hasalpha(img.get());
-    info.decodable =
-            info.format != Format::heic || heif_have_decoder_for_format(heif_compression_HEVC);
+    info.decodable = can_decode(info.format);
     info.size = source.size();
     return info;
+}
+
+bool can_decode(Format format) {
+    init();
+    // By base class: these are what the loader whitelist leaves open, and a system libvips built
+    // without a format simply lacks the class.
+    auto have_loader = [](const char* name) { return g_type_from_name(name) != 0; };
+    switch (format) {
+        case Format::jpeg: return have_loader("VipsForeignLoadJpeg");
+        case Format::png: return have_loader("VipsForeignLoadPng");
+        case Format::webp: return have_loader("VipsForeignLoadWebp");
+        case Format::gif: return have_loader("VipsForeignLoadNsgif");
+        case Format::avif:
+            return have_loader("VipsForeignLoadHeif") &&
+                   heif_have_decoder_for_format(heif_compression_AV1);
+        case Format::heic:
+            return (have_loader("VipsForeignLoadHeif") &&
+                    heif_have_decoder_for_format(heif_compression_HEVC)) ||
+                   detail::platform_decodes(Format::heic);
+    }
+    return false;
 }
 
 }  // namespace session::image

@@ -13,16 +13,13 @@
 #include <vector>
 
 #include "../src/image/jpeg_encode.hpp"
+#include "../src/image/vips_internal.hpp"
 
 namespace detail = session::image::detail;
+using detail::image_ptr;
 using detail::Subsampling;
 
 namespace {
-
-struct gobject_unref {
-    void operator()(void* p) const { g_object_unref(p); }
-};
-using image_ptr = std::unique_ptr<VipsImage, gobject_unref>;
 
 // A deterministic stand-in for a photo: gradients for smooth areas plus noise for texture.  An
 // alpha band, when asked for, is a plain gradient.

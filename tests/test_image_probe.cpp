@@ -15,50 +15,18 @@
 #include <string>
 #include <vector>
 
+#include "../src/image/vips_internal.hpp"
+#include "image_fixtures.hpp"
 #include "utils.hpp"
 
 namespace image = session::image;
 using Catch::Matchers::Message;
 using image::Format;
+using image::detail::image_ptr;
+using image_fixtures::avif_64x48;
+using image_fixtures::heic_64x48;
 
 namespace {
-
-struct gobject_unref {
-    void operator()(void* p) const { g_object_unref(p); }
-};
-using image_ptr = std::unique_ptr<VipsImage, gobject_unref>;
-
-// 64x48, from `vips heifsave --compression hevc` (libheif with x265).
-constexpr auto heic_64x48 =
-        "AAAAHGZ0eXBoZWljAAAAAG1pZjFoZWljbWlhZgAAAaptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAA"
-        "AAAAAAAAAA"
-        "ADRpbG9jAAAAAERAAAIAAQAAAAABzgABAAAAAAAAABYAAgAAAAAB5AABAAAAAAAAAL4AAAA4aWluZgAAAAAAAgAAAB"
-        "VpbmZlAgAA"
-        "AAABAABodmMxAAAAABVpbmZlAgAAAQACAABFeGlmAAAAAA5waXRtAAAAAAABAAAA6WlwcnAAAADKaXBjbwAAAHZodm"
-        "NDAQNwAAAA"
-        "AAAAAAAAHvAA/P34+AAADwNgAAEAGEABDAH//"
-        "wNwAAADAJAAAAMAAAMAHroCQGEAAQAqQgEBA3AAAAMAkAAAAwAAAwAeoCCBBZbq"
-        "5Ka5uAhoMCAAAAMDIAAAAwAhYgABAAZEAcFzwIkAAAAUaXNwZQAAAAAAAABAAAAAQAAAAChjbGFwAAAAQAAAAAEAAA"
-        "AwAAAAAQAA"
-        "AAAAAAAC////"
-        "8AAAAAIAAAAQcGl4aQAAAAADCAgIAAAAF2lwbWEAAAAAAAAAAQABBIECBIMAAAAaaXJlZgAAAAAAAAAOY2RzYwAC"
-        "AAEAAQAAANxtZGF0AAAAEigBrxOA+FDQp//"
-        "+MofGYpU1eAAAAAZFeGlmAABJSSoACAAAAAYAEgEDAAEAAAABAAAAGgEFAAEAAABW"
-        "AAAAGwEFAAEAAABeAAAAKAEDAAEAAAACAAAAEwIDAAEAAAABAAAAaYcEAAEAAABmAAAAAAAAADhjAADoAwAAOGMAAO"
-        "gDAAAGAACQ"
-        "BwAEAAAAMDIxMAGRBwAEAAAAAQIDAACgBwAEAAAAMDEwMAGgAwABAAAA//8AAAKgBAABAAAAQAAAAAOgBAABAAAAMAAAAAAAAAA="_b64_b;
-
-// 64x48, from ffmpeg with libaom-av1.
-constexpr auto avif_64x48 =
-        "AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUIAAAD5bWV0YQAAAAAAAAAvaGRscgAAAAAAAAAAcGljdAAAAA"
-        "AAAAAAAAAA"
-        "AFBpY3R1cmVIYW5kbGVyAAAAAA5waXRtAAAAAAABAAAAHmlsb2MAAAAARAAAAQABAAAAAQAAASEAAAAWAAAAKGlpbm"
-        "YAAAAAAAEA"
-        "AAAaaW5mZQIAAAAAAQAAYXYwMUNvbG9yAAAAAGppcHJwAAAAS2lwY28AAAAUaXNwZQAAAAAAAABAAAAAMAAAABBwaX"
-        "hpAAAAAAMI"
-        "CAgAAAAMYXYxQ4EADAAAAAATY29scm5jbHgAAgACAAIAAAAAF2lwbWEAAAAAAAAAAQABBAECgwQAAAAebWRhdAoGGB"
-        "V/vbAIMgwa"
-        "AAAAUAAAAAoFfNg="_b64_b;
 
 // A w x h image with `bands` bands; `frames` of them stacked vertically, as libvips holds
 // animation.  Each frame is a different shade: animation encoders merge a frame identical to the
@@ -181,7 +149,11 @@ TEST_CASE("probe reads each accepted format's header", "[image][probe]") {
         CHECK(info->format == Format::heic);
         CHECK(info->width == 64);
         CHECK(info->height == 48);
+#ifdef __APPLE__
+        CHECK(info->decodable);
+#else
         CHECK(info->decodable == (heif_have_decoder_for_format(heif_compression_HEVC) != 0));
+#endif
     }
 }
 
