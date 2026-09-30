@@ -11,6 +11,7 @@
 
 #include "session/image/vips.hpp"
 #include "source_internal.hpp"
+#include "vips_internal.hpp"
 
 namespace session::image {
 
@@ -60,15 +61,7 @@ struct Source::impl {
     }
 };
 
-namespace {
-
-    [[noreturn]] void throw_vips_error(std::string_view what) {
-        std::string err = vips_error_buffer();
-        vips_error_clear();
-        throw std::runtime_error{"{}: {}"_format(what, err)};
-    }
-
-}  // namespace
+using detail::throw_vips_error;
 
 Source::Source(std::span<const std::byte> data, std::shared_ptr<void> keep_alive) :
         pimpl{std::make_unique<impl>()} {

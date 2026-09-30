@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "vips_internal.hpp"
+
 #ifdef SESSION_ENABLE_JPEGLI
 #include "lib/jpegli/encode.h"
 #endif
@@ -19,17 +21,6 @@ namespace session::image::detail {
 using namespace oxen::log::literals;
 
 namespace {
-
-    struct gobject_unref {
-        void operator()(void* p) const { g_object_unref(p); }
-    };
-    using image_ptr = std::unique_ptr<VipsImage, gobject_unref>;
-
-    [[noreturn]] void throw_vips_error(std::string_view what) {
-        std::string err = vips_error_buffer();
-        vips_error_clear();
-        throw std::runtime_error{"encode_jpeg: {}: {}"_format(what, err)};
-    }
 
     // What a JPEG can hold: 8-bit sRGB, or 8-bit greyscale for a single band.
     image_ptr to_jpeg_colourspace(VipsImage* in) {
@@ -46,12 +37,12 @@ namespace {
                     "source_space",
                     vips_image_guess_interpretation(in),
                     nullptr))
-            throw_vips_error("colour conversion failed");
+            throw_vips_error("encode_jpeg: colour conversion failed");
         image_ptr img{out};
 
         if (img->BandFmt != VIPS_FORMAT_UCHAR) {
             if (vips_cast_uchar(img.get(), &out, nullptr))
-                throw_vips_error("conversion to 8 bits failed");
+                throw_vips_error("encode_jpeg: conversion to 8 bits failed");
             img.reset(out);
         }
         return img;
@@ -179,7 +170,7 @@ namespace {
                                      TRUE,
                                      nullptr);
         if (rc)
-            throw_vips_error("libvips JPEG encoding failed");
+            throw_vips_error("encode_jpeg: libvips JPEG encoding failed");
         std::unique_ptr<void, decltype(&g_free)> owned{buf, &g_free};
         auto* data = static_cast<const std::byte*>(buf);
         return {data, data + len};

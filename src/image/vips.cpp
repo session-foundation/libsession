@@ -9,11 +9,19 @@
 #include <stdexcept>
 #include <string>
 
+#include "vips_internal.hpp"
+
 namespace session::image {
 
 using namespace oxen::log::literals;
 
 static auto cat = oxen::log::Cat("image");
+
+void detail::throw_vips_error(std::string_view what) {
+    std::string err = vips_error_buffer();
+    vips_error_clear();
+    throw std::runtime_error{"{}: {}"_format(what, err)};
+}
 
 void init() {
     static std::once_flag once;

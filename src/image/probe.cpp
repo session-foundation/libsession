@@ -12,14 +12,11 @@
 #include <utility>
 
 #include "source_internal.hpp"
+#include "vips_internal.hpp"
 
 namespace session::image {
 
 namespace {
-
-    struct gobject_unref {
-        void operator()(void* p) const { g_object_unref(p); }
-    };
 
     // HEIF item types, spelled out because libheif only gained named constants for them in 1.23.5.
     constexpr uint32_t fourcc(const char (&code)[5]) {
@@ -158,7 +155,7 @@ std::optional<Info> probe(Source& source) {
         vips_error_clear();
         return std::nullopt;
     }
-    std::unique_ptr<VipsImage, gobject_unref> img{raw};
+    detail::image_ptr img{raw};
 
     info.width = static_cast<uint32_t>(img->Xsize);
     info.height = static_cast<uint32_t>(vips_image_get_page_height(img.get()));
