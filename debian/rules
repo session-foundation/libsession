@@ -13,7 +13,3 @@ export PYBUILD_NAME = session-util
 
 override_dh_auto_configure:
 	dh_auto_configure -- -DBUILD_SHARED_LIBS=ON -DWITH_TESTS=OFF
-
-# Ubuntu's default zstd compression for control, data is not well supported outside Ubuntu:
-override_dh_builddeb:
-	dh_builddeb -- -Zxz
