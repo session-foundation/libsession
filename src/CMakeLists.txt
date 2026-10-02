@@ -155,6 +155,7 @@ if(ENABLE_NETWORKING)
             PRIVATE
             network/routing/session_router_router.cpp)
         target_link_libraries(network PUBLIC session-router::core)
+        target_compile_definitions(network PRIVATE ENABLE_NETWORKING_SROUTER)
     endif()
 
     if (BUILD_STATIC_DEPS)

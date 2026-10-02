@@ -18,7 +18,9 @@
 #include "session/network/request_queue.hpp"
 #include "session/network/routing/direct_router.hpp"
 #include "session/network/routing/onion_request_router.hpp"
+#ifdef ENABLE_NETWORKING_SROUTER
 #include "session/network/routing/session_router_router.hpp"
+#endif
 #include "session/network/session_network.h"
 #include "session/network/session_network_types.hpp"
 #include "session/network/transport/quic_transport.hpp"
@@ -87,6 +89,7 @@ namespace {
         return {file_server_config};
     }
 
+#ifdef ENABLE_NETWORKING_SROUTER
     config::SessionRouter build_session_router_config(
             const config::Config& main_config, const config::FileServer& file_server_config) {
         if (!main_config.cache_directory)
@@ -101,6 +104,7 @@ namespace {
                 *main_config.cache_directory,
                 main_config.path_length};
     }
+#endif
 
     config::OnionRequestRouter build_onion_request_router_config(
             const config::Config& main_config, const config::FileServer& file_server_config) {
@@ -203,12 +207,16 @@ Network::Network(config::Config _conf) :
             break;
 
         case opt::router::Type::session_router:
+#ifdef ENABLE_NETWORKING_SROUTER
             _router = SessionRouter::make(
                     std::move(build_session_router_config(config, file_server_config)),
                     _loop,
                     _snode_pool,
                     _transport);
             break;
+#else
+            throw std::runtime_error{"Session Router support is not enabled in this build!"};
+#endif
 
         case opt::router::Type::direct:
             _router = std::make_unique<DirectRouter>(
