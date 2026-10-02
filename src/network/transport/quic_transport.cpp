@@ -150,8 +150,7 @@ void QuicTransport::_recreate_endpoint() {
     // std::optional<max_udp_payload>{} silently leaves discovery enabled.
     //
     // Capping the payload at the QUIC minimum leaves path MTU discovery nothing to probe, which is
-    // what "disable" has always meant here.  This replaces the deprecated
-    // opt::disable_mtu_discovery, which libquic defines as exactly this value.
+    // how "disable" is expressed to libquic.
     _endpoint = quic::Endpoint::endpoint(
             *_loop,
             quic::Address{},
