@@ -23,11 +23,6 @@ endif()
 libsession_static_bundle(protos)
 
 add_library(libsession::protos ALIAS protos)
-export(
-    TARGETS protos
-    NAMESPACE libsession::
-    FILE libsessionTargets.cmake
-)
 list(APPEND libsession_export_targets protos)
 set(libsession_export_targets "${libsession_export_targets}" PARENT_SCOPE)
 

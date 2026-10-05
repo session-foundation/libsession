@@ -212,11 +212,6 @@ target_link_libraries(common INTERFACE version)
 foreach(tgt ${export_targets})
     add_library("libsession::${tgt}" ALIAS "${tgt}")
 endforeach()
-export(
-    TARGETS ${export_targets} common version
-    NAMESPACE libsession::
-    APPEND FILE libsessionTargets.cmake
-)
 
 list(APPEND libsession_export_targets ${export_targets})
 set(libsession_export_targets "${libsession_export_targets}" PARENT_SCOPE)
