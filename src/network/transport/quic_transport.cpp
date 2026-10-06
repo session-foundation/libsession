@@ -413,9 +413,13 @@ void QuicTransport::_establish_connection(
                     }
                 },
                 [this, address_pubkey_hex, initiating_req_id](
-                        oxen::quic::Connection&, uint64_t error_code) {
+                        oxen::quic::Connection& conn, uint64_t error_code) {
                     _fail_connection(
-                            address_pubkey_hex, initiating_req_id, error_code, std::nullopt);
+                            address_pubkey_hex,
+                            initiating_req_id,
+                            error_code,
+                            std::nullopt,
+                            conn.reference_id());
                 });
     } catch (const std::exception& e) {
         _fail_connection(address_pubkey_hex, initiating_req_id, std::nullopt, e.what());
@@ -606,7 +610,8 @@ void QuicTransport::_fail_connection(
         const std::string& address_pubkey_hex,
         const std::string& initiating_req_id,
         std::optional<uint64_t> error_code,
-        std::optional<std::string> custom_error) {
+        std::optional<std::string> custom_error,
+        std::optional<oxen::quic::ConnectionID> conn_id) {
     if (error_code == 0)
         log::info(
                 cat,
@@ -649,8 +654,16 @@ void QuicTransport::_fail_connection(
                 address_pubkey_hex,
                 custom_error.value_or("Unknown error"));
 
-    // Clear the connection and stream ids
-    if (auto id = _active_connection_ids.extract(address_pubkey_hex))
+    // Clear the connection and stream ids.  When the closed connection is known, only its own
+    // state goes: a newer connection to the same node can be established before an old one's close
+    // arrives, and clearing by pubkey alone would drop the new connection and orphan the old one's
+    // stream ids.
+    if (conn_id) {
+        _available_stream_ids.erase(*conn_id);
+        if (auto it = _active_connection_ids.find(address_pubkey_hex);
+            it != _active_connection_ids.end() && it->second == *conn_id)
+            _active_connection_ids.erase(it);
+    } else if (auto id = _active_connection_ids.extract(address_pubkey_hex))
         _available_stream_ids.erase(id.mapped());
 
     // Process any waiting verification requests
