@@ -91,10 +91,3 @@ endif()
 
 add_executable(swarm-auth-test EXCLUDE_FROM_ALL swarm-auth-test.cpp)
 target_link_libraries(swarm-auth-test PRIVATE config)
-
-if(STATIC_BUNDLE)
-    add_executable(static-bundle-test static_bundle.cpp)
-    target_include_directories(static-bundle-test PUBLIC ../include)
-    target_link_libraries(static-bundle-test PRIVATE "${PROJECT_BINARY_DIR}/libsession-util.a" oxenc::oxenc quic)
-    add_dependencies(static-bundle-test session-util)
-endif()

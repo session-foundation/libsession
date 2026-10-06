@@ -174,6 +174,25 @@ if(STATIC_BUNDLE)
     message(STATUS "Static bundle libsession-util.a combines: ${bundle_archives}")
     message(STATUS "Static bundle libsession-util.a also needs: ${bundle_system_libs}")
     combine_archives(session-util libsession-static-bundle ${bundle_archives})
+
+    # Links the bundle and only what the walk says it needs from the system, so that a library
+    # missing from the bundle fails here rather than in whatever consumes it.  Headers come from our
+    # targets' usage requirements, without linking them.
+    add_executable(static-bundle-test tests/static_bundle.cpp)
+    if(ENABLE_NETWORKING)
+        set(bundle_header_target network)
+    else()
+        set(bundle_header_target config)
+        target_compile_definitions(static-bundle-test PRIVATE DISABLE_NETWORKING)
+    endif()
+    target_include_directories(static-bundle-test PRIVATE
+        $<TARGET_PROPERTY:${bundle_header_target},INTERFACE_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(static-bundle-test PRIVATE
+        $<TARGET_PROPERTY:${bundle_header_target},INTERFACE_COMPILE_DEFINITIONS>)
+    target_link_libraries(static-bundle-test PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/libsession-util.a" ${bundle_system_libs})
+    add_dependencies(static-bundle-test session-util)
+
     set(lib_folder lib)
     if(IOS)
         set(lib_folder "${lib_folder}-${ARCH}")

@@ -71,7 +71,9 @@ cmake -G 'Unix Makefiles' \
     "$@" \
     "$projdir"
 
-make -j${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)} VERBOSE=1 session-util
+# static-bundle-test links against nothing but the bundle and its declared system libraries, so
+# building it is what catches a dependency missing from the bundle.
+make -j${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)} VERBOSE=1 session-util static-bundle-test
 
 if [ -z "$archive" ]; then
     exit 0
