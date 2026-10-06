@@ -167,8 +167,13 @@ if(STATIC_BUNDLE)
 
     include(combine_archives)
 
-    libsession_static_bundle_resolve()
-    combine_archives(session-util libsession-static-bundle "${LIBSESSION_STATIC_BUNDLE_LIBS}")
+    # Threads::Threads comes from find_package() calls in subdirectories, which make it visible only
+    # there; the bundle walk has to be able to see it.
+    find_package(Threads REQUIRED)
+    libsession_static_bundle_libs(bundle_archives bundle_system_libs ${libsession_export_targets})
+    message(STATUS "Static bundle libsession-util.a combines: ${bundle_archives}")
+    message(STATUS "Static bundle libsession-util.a also needs: ${bundle_system_libs}")
+    combine_archives(session-util libsession-static-bundle ${bundle_archives})
     set(lib_folder lib)
     if(IOS)
         set(lib_folder "${lib_folder}-${ARCH}")
