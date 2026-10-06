@@ -140,8 +140,8 @@ if(ENABLE_NETWORKING)
         PUBLIC
         crypto
         oxen::quic
-        PRIVATE
         nlohmann_json::nlohmann_json
+        PRIVATE
         sessiondep::libsodium
         sessiondep::nettle
         date::date
