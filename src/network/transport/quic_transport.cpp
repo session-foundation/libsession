@@ -510,13 +510,21 @@ void QuicTransport::_send_on_connection(
                 // Since the request completed it's round-trip if it isn't the "reserverd" stream
                 // (not used for general requests) then we can either add it back to the pool, or
                 // close it if there are more that the active stream price limit
+                //
+                // The connection can already be gone: libquic fires a request's callback from its
+                // destructor when the connection closes, and the connection's streams go with it.
+                // Then there is nothing to return to the pool or close, and any ids pooled for it
+                // are dead too.
                 if (stream_id != 0 && _endpoint) {
-                    auto conn = _endpoint->get_conn(conn_id);
-
-                    if (conn && conn->get_streams_available() <= ACTIVE_STREAM_PRUNE_LIMIT)
-                        _available_stream_ids[conn_id].insert(stream_id);
-                    else if (auto stream = conn->get_stream<oxen::quic::BTRequestStream>(stream_id))
-                        stream->close();
+                    if (auto conn = _endpoint->get_conn(conn_id)) {
+                        if (conn->get_streams_available() <= ACTIVE_STREAM_PRUNE_LIMIT)
+                            _available_stream_ids[conn_id].insert(stream_id);
+                        else if (
+                                auto stream =
+                                        conn->get_stream<oxen::quic::BTRequestStream>(stream_id))
+                            stream->close();
+                    } else
+                        _available_stream_ids.erase(conn_id);
                 }
 
                 if (resp.timed_out) {
