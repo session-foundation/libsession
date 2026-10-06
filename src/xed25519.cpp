@@ -2,7 +2,6 @@
 
 #include <sodium/crypto_core_ed25519.h>
 #include <sodium/crypto_generichash_blake2b.h>
-#include <sodium/crypto_internal_fe25519.h>
 #include <sodium/crypto_scalarmult_ed25519.h>
 #include <sodium/crypto_sign_ed25519.h>
 #include <sodium/randombytes.h>
@@ -20,16 +19,6 @@ template <size_t N>
 using bytes = std::array<unsigned char, N>;
 
 namespace {
-
-    void fe25519_montx_to_edy(fe25519 y, const fe25519 u) {
-        fe25519 one;
-        crypto_internal_fe25519_1(one);
-        fe25519 um1, up1;
-        crypto_internal_fe25519_sub(um1, u, one);
-        crypto_internal_fe25519_add(up1, u, one);
-        crypto_internal_fe25519_invert(up1, up1);
-        crypto_internal_fe25519_mul(y, um1, up1);
-    }
 
     // We construct an Ed25519-like signature with one important difference: where Ed25519
     // calculates `r = H(S || M) mod L` (where S is the second half of the SHA-512 hash of the
@@ -144,16 +133,7 @@ bool verify(std::string_view signature, std::string_view curve25519_pubkey, std:
     return verify(sig.first<64>(), pubkey.first<32>(), to_span(msg));
 }
 
-std::array<unsigned char, 32> pubkey(std::span<const unsigned char, 32> curve25519_pubkey) {
-    fe25519 u, y;
-    crypto_internal_fe25519_frombytes(u, curve25519_pubkey.data());
-    fe25519_montx_to_edy(y, u);
-
-    std::array<unsigned char, 32> ed_pubkey;
-    crypto_internal_fe25519_tobytes(ed_pubkey.data(), y);
-
-    return ed_pubkey;
-}
+// pubkey(std::span<const unsigned char, 32>) is in xed25519-tweetnacl.cpp
 
 std::string pubkey(std::string_view curve25519_pubkey) {
     auto x_pk = to_span(curve25519_pubkey);

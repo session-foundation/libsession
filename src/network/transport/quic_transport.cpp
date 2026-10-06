@@ -147,25 +147,13 @@ void QuicTransport::send_request(Request request, network_response_callback_t ca
 void QuicTransport::_recreate_endpoint() {
     // The optional must CONTAIN the option to have any effect: libquic's optional-taking
     // handle_ep_opt overload does nothing when the optional is empty, so a default-constructed
-    // std::optional<disable_mtu_discovery>{} silently leaves discovery enabled.
-    //
-    // TODO: replace with quic::opt::max_udp_payload::minimum(), which is the same value under the
-    // name that isn't deprecated.  That needs a newer libquic than this pin carries, and moving the
-    // pin needs the dependency handling in external/CMakeLists.txt moved onto session-deps first -
-    // the newer session-router defines oxen::quic itself, which collides with our own definition of
-    // it.  Both of those come over with the Session client work, and this goes when they do.
-    //
-    // Until then the deprecated name is the only spelling that compiles against both this pin and
-    // the newer liboxenquic the Linux CI stages take from the system, which deprecates it under
-    // -Werror.  The replacement does not exist in the pinned copy at all.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    // std::optional<max_udp_payload>{} silently leaves discovery uncapped.
     _endpoint = quic::Endpoint::endpoint(
             *_loop,
             quic::Address{},
-            (_config.disable_mtu_discovery ? std::make_optional<quic::opt::disable_mtu_discovery>()
-                                           : std::nullopt));
-#pragma GCC diagnostic pop
+            (_config.max_udp_payload
+                     ? std::make_optional<quic::opt::max_udp_payload>(*_config.max_udp_payload)
+                     : std::nullopt));
 }
 
 void QuicTransport::_close_connections() {
