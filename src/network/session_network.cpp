@@ -18,7 +18,9 @@
 #include "session/network/request_queue.hpp"
 #include "session/network/routing/direct_router.hpp"
 #include "session/network/routing/onion_request_router.hpp"
+#ifdef ENABLE_NETWORKING_SROUTER
 #include "session/network/routing/session_router_router.hpp"
+#endif
 #include "session/network/session_network.h"
 #include "session/network/session_network_types.hpp"
 #include "session/network/transport/quic_transport.hpp"
@@ -79,7 +81,7 @@ namespace {
     config::QuicTransport build_quic_transport_config(const config::Config& main_config) {
         return {main_config.quic_handshake_timeout,
                 main_config.quic_keep_alive,
-                main_config.quic_disable_mtu_discovery};
+                main_config.quic_max_udp_payload};
     }
 
     config::DirectRouter build_direct_router_config(
@@ -87,6 +89,7 @@ namespace {
         return {file_server_config};
     }
 
+#ifdef ENABLE_NETWORKING_SROUTER
     config::SessionRouter build_session_router_config(
             const config::Config& main_config, const config::FileServer& file_server_config) {
         if (!main_config.cache_directory)
@@ -101,6 +104,7 @@ namespace {
                 *main_config.cache_directory,
                 main_config.path_length};
     }
+#endif
 
     config::OnionRequestRouter build_onion_request_router_config(
             const config::Config& main_config, const config::FileServer& file_server_config) {
@@ -203,12 +207,16 @@ Network::Network(config::Config _conf) :
             break;
 
         case opt::router::Type::session_router:
+#ifdef ENABLE_NETWORKING_SROUTER
             _router = SessionRouter::make(
                     std::move(build_session_router_config(config, file_server_config)),
                     _loop,
                     _snode_pool,
                     _transport);
             break;
+#else
+            throw std::runtime_error{"Session Router support is not enabled in this build!"};
+#endif
 
         case opt::router::Type::direct:
             _router = std::make_unique<DirectRouter>(
@@ -1341,7 +1349,8 @@ LIBSESSION_C_API session_network_config session_network_config_default() {
                     .count();
     config.quic_keep_alive_seconds =
             std::chrono::duration_cast<std::chrono::seconds>(cpp_defaults.quic_keep_alive).count();
-    config.quic_disable_mtu_discovery = cpp_defaults.quic_disable_mtu_discovery;
+    config.quic_disable_mtu_discovery = false;
+    config.quic_max_udp_payload = cpp_defaults.quic_max_udp_payload.value_or(0);
 
     return config;
 }
@@ -1528,7 +1537,9 @@ LIBSESSION_C_API bool session_network_init(
                     cpp_opts.emplace_back(opt::quic_keep_alive{
                             std::chrono::seconds{config->quic_keep_alive_seconds}});
 
-                if (config->quic_disable_mtu_discovery)
+                if (config->quic_max_udp_payload > 0)
+                    cpp_opts.emplace_back(opt::quic_max_udp_payload{config->quic_max_udp_payload});
+                else if (config->quic_disable_mtu_discovery)
                     cpp_opts.emplace_back(opt::quic_disable_mtu_discovery{});
 
                 break;

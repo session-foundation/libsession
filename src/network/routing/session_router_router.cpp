@@ -302,6 +302,10 @@ void SessionRouter::_close_connections() {
     // Clear all storage of requests, paths and connections so that we are in a fresh state on
     // relaunch
     _active_tunnels.clear();
+    {
+        std::lock_guard lock{_tunnel_claims_mutex};
+        _tunnel_claims.clear();
+    }
     _pending_requests.clear();
     _update_status(ConnectionStatus::disconnected);
     log::info(cat, "Closed all connections.");
@@ -855,7 +859,7 @@ void SessionRouter::_establish_tunnel(
             "[Request {}] Establishing new tunnel to {}.",
             initiating_req_id,
             address_pubkey_hex);
-    srouter->establish_udp(
+    auto claim = srouter->establish_udp(
             srouter_address,
             test_port,
             [weak_self = weak_from_this(), this, address_pubkey_hex, initiating_req_id](
@@ -888,18 +892,26 @@ void SessionRouter::_establish_tunnel(
                         _send_via_tunnel(info, std::move(req), std::move(cb));
                 }
             },
-            [weak_self = weak_from_this(), this, address_pubkey_hex, initiating_req_id]() mutable {
+            [weak_self = weak_from_this(), this, address_pubkey_hex, initiating_req_id](
+                    router::tunnel_failure reason) mutable {
                 auto self = weak_self.lock();
                 if (!self)
                     return;
 
                 log::info(
                         cat,
-                        "[Request {}] Unable to establish session router UDP connection to {}.",
+                        "[Request {}] Unable to establish session router UDP connection to {} "
+                        "({}).",
                         initiating_req_id,
-                        address_pubkey_hex);
+                        address_pubkey_hex,
+                        reason == router::tunnel_failure::unreachable ? "no relay contact"
+                                                                      : "timed out");
 
                 _active_tunnels.erase(address_pubkey_hex);
+                {
+                    std::lock_guard lock{_tunnel_claims_mutex};
+                    _tunnel_claims.erase(address_pubkey_hex);
+                }
 
                 // Fail all the pending requests for this connection
                 if (auto it = _pending_requests.find(address_pubkey_hex);
@@ -924,6 +936,13 @@ void SessionRouter::_establish_tunnel(
                 if (_active_tunnels.empty())
                     _update_status(ConnectionStatus::disconnected);
             });
+
+    // Keep the tunnel open for as long as we hold the node's entry.  If the failure callback has
+    // already run on session-router's thread this leaves a claim behind for a tunnel that failed,
+    // which is harmless: a later request to the same node replaces it.
+    std::lock_guard lock{_tunnel_claims_mutex};
+    _tunnel_claims.insert_or_assign(
+            address_pubkey_hex, std::make_shared<router::udp_tunnel>(std::move(claim)));
 }
 
 void SessionRouter::_send_via_tunnel(

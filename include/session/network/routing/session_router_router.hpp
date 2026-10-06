@@ -42,6 +42,15 @@ class SessionRouter : public IRouter, public std::enable_shared_from_this<Sessio
     std::weak_ptr<ITransport> _transport;
 
     std::unordered_map<std::string, session::router::tunnel_info> _active_tunnels;
+
+    // The claim on each tunnel we have asked session-router for.  session-router closes a tunnel
+    // when its last claim is destroyed, so these have to outlive the request that created them:
+    // dropping the return value of establish_udp() tears the tunnel down immediately.  Type-erased
+    // (each is a session::router::udp_tunnel) so that this header need not include
+    // <session/router.hpp>.  Guarded separately from `_active_tunnels` because session-router
+    // invokes the failure callback, which releases a claim, from its own thread.
+    std::mutex _tunnel_claims_mutex;
+    std::unordered_map<std::string, std::shared_ptr<void>> _tunnel_claims;
     std::unordered_map<std::string, std::vector<std::pair<Request, network_response_callback_t>>>
             _pending_requests;
     std::unordered_map<std::string, std::pair<UploadRequest, std::thread>> _active_uploads;

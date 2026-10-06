@@ -17,7 +17,7 @@ if(CCACHE_PROGRAM)
 endif()
 
 project(libsession-util
-    VERSION 1.9.2
+    VERSION 1.9.3
     DESCRIPTION "Session client utility library"
     LANGUAGES ${LANGS})
 
@@ -58,7 +58,12 @@ else()
     set(static_default ON)
 endif()
 
-option(BUILD_STATIC_DEPS "Build all dependencies statically rather than trying to link to them on the system" ${static_default})
+# session-deps declares BUILD_STATIC_DEPS itself, defaulting to OFF; setting the cache entry first
+# keeps the historical "static unless building a shared library" default.
+set(BUILD_STATIC_DEPS ${static_default} CACHE BOOL "Build all dependencies statically rather than trying to link to them on the system")
+
+include(cmake/session-deps/Deps.cmake)
+
 option(STATIC_BUNDLE "Build a single static .a containing everything (both code and dependencies)" ${BUILD_STATIC_DEPS})
 
 if(STATIC_BUNDLE AND NOT BUILD_STATIC_DEPS)
@@ -88,7 +93,9 @@ option(USE_LTO "Use Link-Time Optimization" ${use_lto_default})
 
 # Provide this as an option for now because GMP and Desktop are sometimes unhappy with each other.
 option(ENABLE_NETWORKING "Build with networking functionality" ON)
-option(ENABLE_NETWORKING_SROUTER "Build with session-router networking support (requires ENABLE_NETWORKING)" ON)
+# No client on this branch routes through session-router, so it is off by default rather than costing
+# every networking build its dependency tree.
+option(ENABLE_NETWORKING_SROUTER "Build with session-router networking support (requires ENABLE_NETWORKING)" OFF)
 
 if(USE_LTO)
   include(CheckIPOSupported)
@@ -107,6 +114,22 @@ if(IPO_ENABLED AND NOT DEFINED CMAKE_INTERPROCEDURAL_OPTIMIZATION)
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
 
+# USE_LTO is the single LTO knob.  Two submodule-provided options default ON independently of it:
+# SESSIONDEPS_LTO (session-deps) controls LTO for static dependency builds, and WITH_LTO
+# (session-router's enable_lto.cmake) controls LTO for session-router's own targets.  Leaving either
+# ON in a non-LTO build breaks the link: LTO'd static archives can't be consumed by a non-LTO link
+# (clang emits pure bitcode archives that a plain bfd link reports as "file format not recognized",
+# or silently drops the members), and session-router's LTO probe fails outright on iOS, where the
+# build script configures with the macOS SDK.  Seed both before any submodule evaluates its own
+# option() so there is exactly one LTO switch.
+set(SESSIONDEPS_LTO ${USE_LTO} CACHE BOOL "Use LTO for static dependency builds, where supported" FORCE)
+set(WITH_LTO ${USE_LTO} CACHE BOOL "enable lto on compile time" FORCE)
+
+# The same for plain subdirectories: one whose cmake_minimum_required predates 3.9 (protobuf's is
+# 3.5) has CMP0069 OLD, which makes CMake ignore CMAKE_INTERPROCEDURAL_OPTIMIZATION and build it
+# without LTO, so a link that pulls such an archive's members in late fails on inline std:: functions.
+set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
+
 if(STATIC_LIBSTD)
     add_link_options(-static-libstdc++)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES Clang)
@@ -123,28 +146,22 @@ include(AddStaticBundleLib)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 
+# For a static-deps build we build everything from source; don't let oxen-logging pick up system
+# fmt/spdlog via find_package.  Beyond the usual reasons to prefer our own versions, a system
+# fmt/spdlog is built against libstdc++ and cannot be linked into a libc++ build (undefined
+# std::__1 symbols), so force the bundled submodules which build with our toolchain.
+if(BUILD_STATIC_DEPS)
+    set(OXEN_LOGGING_FORCE_SUBMODULES ON CACHE INTERNAL "")
+endif()
+
 add_subdirectory(external)
 
 if(ENABLE_NETWORKING)
-    if(NOT TARGET nettle::nettle)
-        if(BUILD_STATIC_DEPS)
-            message(FATAL_ERROR "Internal error: nettle::nettle target (expected via libquic BUILD_STATIC_DEPS) not found")
-        else()
-            find_package(PkgConfig REQUIRED)
-            pkg_check_modules(NETTLE REQUIRED IMPORTED_TARGET nettle)
-            add_library(nettle INTERFACE)
-            target_link_libraries(nettle INTERFACE PkgConfig::NETTLE)
-            add_library(nettle::nettle ALIAS nettle)
-        endif()
-    endif()
+    session_dep(nettle 3)
 endif()
 
 add_subdirectory(src)
 add_subdirectory(proto)
-
-if (BUILD_STATIC_DEPS)
-    include(StaticBuild)
-endif()
 
 if(STATIC_BUNDLE)
 

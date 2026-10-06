@@ -235,9 +235,18 @@ void Config::handle_config_opt(opt::quic_keep_alive qka) {
     log::debug(cat, "Network config quic keep alive set to {}s", qka.duration.count());
 }
 
+void Config::handle_config_opt(opt::quic_max_udp_payload qmup) {
+    // libquic rejects anything smaller, but only once the endpoint is built: catch it here, where
+    // it is still a configuration error rather than a failure deep inside network setup.
+    if (qmup.size < 1200)
+        throw std::invalid_argument{
+                "quic_max_udp_payload must be at least 1200, got {}"_format(qmup.size)};
+    quic_max_udp_payload = qmup.size;
+    log::debug(cat, "Network config max QUIC UDP payload set to {} bytes", qmup.size);
+}
+
 void Config::handle_config_opt(opt::quic_disable_mtu_discovery) {
-    quic_disable_mtu_discovery = true;
-    log::debug(cat, "Network config disabled MTU discovery for Quic");
+    handle_config_opt(opt::quic_max_udp_payload{1200});
 }
 
 // MARK: Onion Request Router Options

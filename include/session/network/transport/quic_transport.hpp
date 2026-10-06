@@ -24,7 +24,7 @@ namespace config {
         std::chrono::milliseconds handshake_timeout;
         std::chrono::seconds keep_alive;
 
-        bool disable_mtu_discovery;
+        std::optional<size_t> max_udp_payload;
     };
 }  // namespace config
 
