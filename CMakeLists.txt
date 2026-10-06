@@ -167,6 +167,7 @@ if(STATIC_BUNDLE)
 
     include(combine_archives)
 
+    libsession_static_bundle_resolve()
     combine_archives(session-util libsession-static-bundle "${LIBSESSION_STATIC_BUNDLE_LIBS}")
     set(lib_folder lib)
     if(IOS)
