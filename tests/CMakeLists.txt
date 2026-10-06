@@ -41,6 +41,7 @@ set(LIB_SESSION_UTESTS_SOURCES
 )
 
 if(ENABLE_NETWORKING)
+    list(APPEND LIB_SESSION_UTESTS_SOURCES test_network_config.cpp)
     list(APPEND LIB_SESSION_UTESTS_SOURCES test_network_swarm.cpp)
     list(APPEND LIB_SESSION_UTESTS_SOURCES test_onionreq.cpp)
     list(APPEND LIB_SESSION_UTESTS_SOURCES test_onion_request_router.cpp)

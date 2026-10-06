@@ -81,7 +81,7 @@ namespace {
     config::QuicTransport build_quic_transport_config(const config::Config& main_config) {
         return {main_config.quic_handshake_timeout,
                 main_config.quic_keep_alive,
-                main_config.quic_disable_mtu_discovery};
+                main_config.quic_max_udp_payload};
     }
 
     config::DirectRouter build_direct_router_config(
@@ -1349,7 +1349,8 @@ LIBSESSION_C_API session_network_config session_network_config_default() {
                     .count();
     config.quic_keep_alive_seconds =
             std::chrono::duration_cast<std::chrono::seconds>(cpp_defaults.quic_keep_alive).count();
-    config.quic_disable_mtu_discovery = cpp_defaults.quic_disable_mtu_discovery;
+    config.quic_disable_mtu_discovery = false;
+    config.quic_max_udp_payload = cpp_defaults.quic_max_udp_payload.value_or(0);
 
     return config;
 }
@@ -1536,7 +1537,9 @@ LIBSESSION_C_API bool session_network_init(
                     cpp_opts.emplace_back(opt::quic_keep_alive{
                             std::chrono::seconds{config->quic_keep_alive_seconds}});
 
-                if (config->quic_disable_mtu_discovery)
+                if (config->quic_max_udp_payload > 0)
+                    cpp_opts.emplace_back(opt::quic_max_udp_payload{config->quic_max_udp_payload});
+                else if (config->quic_disable_mtu_discovery)
                     cpp_opts.emplace_back(opt::quic_disable_mtu_discovery{});
 
                 break;

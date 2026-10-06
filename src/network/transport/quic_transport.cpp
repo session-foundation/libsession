@@ -147,15 +147,12 @@ void QuicTransport::send_request(Request request, network_response_callback_t ca
 void QuicTransport::_recreate_endpoint() {
     // The optional must CONTAIN the option to have any effect: libquic's optional-taking
     // handle_ep_opt overload does nothing when the optional is empty, so a default-constructed
-    // std::optional<max_udp_payload>{} silently leaves discovery enabled.
-    //
-    // Capping the payload at the QUIC minimum leaves path MTU discovery nothing to probe, which is
-    // how "disable" is expressed to libquic.
+    // std::optional<max_udp_payload>{} silently leaves discovery uncapped.
     _endpoint = quic::Endpoint::endpoint(
             *_loop,
             quic::Address{},
-            (_config.disable_mtu_discovery
-                     ? std::make_optional(quic::opt::max_udp_payload::minimum())
+            (_config.max_udp_payload
+                     ? std::make_optional<quic::opt::max_udp_payload>(*_config.max_udp_payload)
                      : std::nullopt));
 }
 
