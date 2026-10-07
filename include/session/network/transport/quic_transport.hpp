@@ -93,7 +93,8 @@ class QuicTransport : public ITransport, public std::enable_shared_from_this<Qui
             const std::string& address_pubkey_hex,
             const std::string& initiating_req_id,
             std::optional<uint64_t> error_code,
-            std::optional<std::string> custom_error);
+            std::optional<std::string> custom_error,
+            std::optional<oxen::quic::ConnectionID> conn_id = std::nullopt);
 };
 
 }  // namespace session::network

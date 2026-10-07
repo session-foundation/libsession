@@ -1,7 +1,4 @@
 
-libsession_static_bundle(protobuf::libprotobuf-lite)
-
-
 add_library(protos
     SessionProtos.pb.cc
     WebSocketResources.pb.cc)
@@ -19,8 +16,6 @@ if (MSVC)
 else()
     target_compile_options(protos PUBLIC -Wno-error=unused-parameter)
 endif()
-
-libsession_static_bundle(protos)
 
 add_library(libsession::protos ALIAS protos)
 list(APPEND libsession_export_targets protos)

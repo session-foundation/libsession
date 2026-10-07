@@ -24,7 +24,6 @@ endfunction()
 # Stock libsodium, not the libsodium-internal fork: the one thing the fork exposed that we used was
 # the field arithmetic behind xed25519::pubkey(), which src/xed25519-tweetnacl.cpp now supplies.
 session_dep(libsodium 1.0.21)
-libsession_static_bundle(sessiondep::libsodium)
 
 # Needed even without networking: oxenc is part of the public interface of `common`.
 if(NOT TARGET oxenc::oxenc)
@@ -40,7 +39,6 @@ if(ENABLE_NETWORKING AND ENABLE_NETWORKING_SROUTER)
     set(SROUTER_JEMALLOC OFF CACHE BOOL "")
 
     add_static_subdirectory(session-router EXCLUDE_FROM_ALL)
-    libsession_static_bundle(session-router::core)
 endif()
 
 # session-router provides oxen::quic when it is built (above); otherwise pull in oxen-libquic alone.
@@ -80,7 +78,6 @@ sessiondep_or_submodule(protobuf-lite 3.21 protobuf protobuf::libprotobuf-lite)
 # configs get deduplicated at the swarm.
 set(BUILD_STATIC_libzstd ON CACHE BOOL "" FORCE)
 session_dep(libzstd 1.5)
-libsession_static_bundle(sessiondep::libzstd)
 
 if(NOT TARGET nlohmann_json::nlohmann_json)
     set(JSON_BuildTests OFF CACHE INTERNAL "")
@@ -89,7 +86,6 @@ if(NOT TARGET nlohmann_json::nlohmann_json)
 endif()
 
 session_dep(simdutf 7)
-libsession_static_bundle(sessiondep::simdutf)
 
 # We need Howard Hinnant's header-only date library for now because the STL implementation of
 # std::chrono::parse() is spotty or broken on:
