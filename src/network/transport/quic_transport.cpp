@@ -515,10 +515,9 @@ void QuicTransport::_send_on_connection(
                 // (not used for general requests) then we can either add it back to the pool, or
                 // close it if there are more that the active stream price limit
                 //
-                // The connection can already be gone: libquic fires a request's callback from its
-                // destructor when the connection closes, and the connection's streams go with it.
-                // Then there is nothing to return to the pool or close, and any ids pooled for it
-                // are dead too.
+                // The connection can be gone by the time this runs, e.g. if the stream outlived it
+                // (libquic then fails the request from ~sent_request).  Then there is nothing to
+                // return to the pool or close, and any ids pooled for it are dead too.
                 if (stream_id != 0 && _endpoint) {
                     if (auto conn = _endpoint->get_conn(conn_id)) {
                         if (conn->get_streams_available() <= ACTIVE_STREAM_PRUNE_LIMIT)
