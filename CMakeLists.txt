@@ -17,7 +17,7 @@ if(CCACHE_PROGRAM)
 endif()
 
 project(libsession-util
-    VERSION 1.9.3
+    VERSION 1.9.4
     DESCRIPTION "Session client utility library"
     LANGUAGES ${LANGS})
 
@@ -167,7 +167,32 @@ if(STATIC_BUNDLE)
 
     include(combine_archives)
 
-    combine_archives(session-util libsession-static-bundle "${LIBSESSION_STATIC_BUNDLE_LIBS}")
+    # Threads::Threads comes from find_package() calls in subdirectories, which make it visible only
+    # there; the bundle walk has to be able to see it.
+    find_package(Threads REQUIRED)
+    libsession_static_bundle_libs(bundle_archives bundle_system_libs ${libsession_export_targets})
+    message(STATUS "Static bundle libsession-util.a combines: ${bundle_archives}")
+    message(STATUS "Static bundle libsession-util.a also needs: ${bundle_system_libs}")
+    combine_archives(session-util libsession-static-bundle ${bundle_archives})
+
+    # Links the bundle and only what the walk says it needs from the system, so that a library
+    # missing from the bundle fails here rather than in whatever consumes it.  Headers come from our
+    # targets' usage requirements, without linking them.
+    add_executable(static-bundle-test tests/static_bundle.cpp)
+    if(ENABLE_NETWORKING)
+        set(bundle_header_target network)
+    else()
+        set(bundle_header_target config)
+        target_compile_definitions(static-bundle-test PRIVATE DISABLE_NETWORKING)
+    endif()
+    target_include_directories(static-bundle-test PRIVATE
+        $<TARGET_PROPERTY:${bundle_header_target},INTERFACE_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(static-bundle-test PRIVATE
+        $<TARGET_PROPERTY:${bundle_header_target},INTERFACE_COMPILE_DEFINITIONS>)
+    target_link_libraries(static-bundle-test PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/libsession-util.a" ${bundle_system_libs})
+    add_dependencies(static-bundle-test session-util)
+
     set(lib_folder lib)
     if(IOS)
         set(lib_folder "${lib_folder}-${ARCH}")
