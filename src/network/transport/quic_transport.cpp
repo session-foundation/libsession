@@ -371,10 +371,14 @@ void QuicTransport::_establish_connection(
                     }
                 },
                 [weak_self = weak_from_this(), address_pubkey_hex, initiating_req_id](
-                        oxen::quic::Connection&, uint64_t error_code) {
+                        oxen::quic::Connection& conn, uint64_t error_code) {
                     if (auto self = weak_self.lock())
                         self->_fail_connection(
-                                address_pubkey_hex, initiating_req_id, error_code, std::nullopt);
+                                address_pubkey_hex,
+                                initiating_req_id,
+                                error_code,
+                                std::nullopt,
+                                conn.reference_id());
                 });
     } catch (const std::exception& e) {
         _fail_connection(address_pubkey_hex, initiating_req_id, std::nullopt, e.what());
@@ -510,13 +514,20 @@ void QuicTransport::_send_on_connection(
                 // Since the request completed it's round-trip if it isn't the "reserverd" stream
                 // (not used for general requests) then we can either add it back to the pool, or
                 // close it if there are more that the active stream price limit
+                //
+                // The connection can be gone by the time this runs, e.g. if the stream outlived it
+                // (libquic then fails the request from ~sent_request).  Then there is nothing to
+                // return to the pool or close, and any ids pooled for it are dead too.
                 if (stream_id != 0 && _endpoint) {
-                    auto conn = _endpoint->get_conn(conn_id);
-
-                    if (conn && conn->get_streams_available() <= ACTIVE_STREAM_PRUNE_LIMIT)
-                        _available_stream_ids[conn_id].insert(stream_id);
-                    else if (auto stream = conn->get_stream<oxen::quic::BTRequestStream>(stream_id))
-                        stream->close();
+                    if (auto conn = _endpoint->get_conn(conn_id)) {
+                        if (conn->get_streams_available() <= ACTIVE_STREAM_PRUNE_LIMIT)
+                            _available_stream_ids[conn_id].insert(stream_id);
+                        else if (
+                                auto stream =
+                                        conn->get_stream<oxen::quic::BTRequestStream>(stream_id))
+                            stream->close();
+                    } else
+                        _available_stream_ids.erase(conn_id);
                 }
 
                 if (resp.timed_out) {
@@ -562,7 +573,8 @@ void QuicTransport::_fail_connection(
         const std::string& address_pubkey_hex,
         const std::string& initiating_req_id,
         std::optional<uint64_t> error_code,
-        std::optional<std::string> custom_error) {
+        std::optional<std::string> custom_error,
+        std::optional<oxen::quic::ConnectionID> conn_id) {
     if (error_code == NGTCP2_NO_ERROR)
         log::info(
                 cat,
@@ -605,8 +617,16 @@ void QuicTransport::_fail_connection(
                 address_pubkey_hex,
                 custom_error.value_or("Unknown error"));
 
-    // Clear the connection and stream ids
-    if (auto id = _active_connection_ids.extract(address_pubkey_hex))
+    // Clear the connection and stream ids.  When the closed connection is known, only its own
+    // state goes: a newer connection to the same node can be established before an old one's close
+    // arrives, and clearing by pubkey alone would drop the new connection and orphan the old one's
+    // stream ids.
+    if (conn_id) {
+        _available_stream_ids.erase(*conn_id);
+        if (auto it = _active_connection_ids.find(address_pubkey_hex);
+            it != _active_connection_ids.end() && it->second == *conn_id)
+            _active_connection_ids.erase(it);
+    } else if (auto id = _active_connection_ids.extract(address_pubkey_hex))
         _available_stream_ids.erase(id.mapped());
 
     // Process any waiting verification requests
