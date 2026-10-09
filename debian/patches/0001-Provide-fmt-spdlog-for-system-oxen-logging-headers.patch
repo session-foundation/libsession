@@ -9,36 +9,22 @@ whose system fmt/spdlog are too old.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
- external/CMakeLists.txt | 19 ++++++++++---------
- 1 file changed, 10 insertions(+), 9 deletions(-)
+ external/CMakeLists.txt | 5 +++++
+ 1 file changed, 5 insertions(+)
 
 diff --git a/external/CMakeLists.txt b/external/CMakeLists.txt
-index b79fbf8..3ed42e8 100644
+index 932e2e1..ad0338f 100644
 --- a/external/CMakeLists.txt
 +++ b/external/CMakeLists.txt
-@@ -112,15 +112,16 @@ libsession_system_or_submodule(OXENC oxenc oxenc::oxenc liboxenc>=1.5.0 session-
- 
- libsession_system_or_submodule(OXENLOGGING oxenlogging oxen::logging liboxen-logging>=1.2.0 session-router/external/oxen-libquic/external/oxen-logging)
- if(OXENLOGGING_FOUND)
--    if(NOT TARGET oxen::logging)
--        # If we load oxen-logging via system lib then we won't necessarily have fmt/spdlog targets,
--        # but this script will give us them:
--        include(session-router/external/oxen-libquic/external/oxen-logging/cmake/load_fmt_spdlog.cmake)
--
--        add_library(oxen-logging-fmt-spdlog INTERFACE)
--        target_link_libraries(oxen-logging-fmt-spdlog INTERFACE oxenlogging::oxenlogging ${OXEN_LOGGING_FMT_TARGET} ${OXEN_LOGGING_SPDLOG_TARGET})
--        add_library(oxen::logging ALIAS oxen-logging-fmt-spdlog)
--    endif()
-+    # A system liboxen-logging's headers include <fmt/...> and <spdlog/...>, but its pkg-config
-+    # advertises neither, so grab the fmt/spdlog targets from oxen-logging's own helper and attach
-+    # them to the imported target that oxen::logging aliases, so anything using oxen::logging can
-+    # compile its headers.  Force the bundled submodules (header-only) so we always build against a
-+    # known fmt/spdlog rather than the system copies, which on this distro are too old for us.
+@@ -58,6 +58,11 @@ if(NOT TARGET oxen::logging)
+     if(BUILD_STATIC_DEPS OR DEPS_FORCE_SUBMODULE OR DEPS_FORCE_liboxen-logging_SUBMODULE)
+         set(OXEN_LOGGING_FORCE_SUBMODULES ON)
+     endif()
++    # This distro's system fmt/spdlog are too old, so load.cmake falls back to the bundled
++    # submodules.  Those must be header-only: with BUILD_SHARED_LIBS=ON they would otherwise be
++    # built as shared libraries that get linked into libsession-util but never installed.
 +    set(OXEN_LOGGING_FMT_HEADER_ONLY ON)
 +    set(OXEN_LOGGING_SPDLOG_HEADER_ONLY ON)
-+    set(OXEN_LOGGING_FORCE_SUBMODULES ON)
-+    include(session-router/external/oxen-libquic/external/oxen-logging/cmake/load_fmt_spdlog.cmake)
-+    target_link_libraries(oxenlogging INTERFACE ${OXEN_LOGGING_FMT_TARGET} ${OXEN_LOGGING_SPDLOG_TARGET})
+     include(session-router/external/oxen-libquic/external/oxen-logging/cmake/load.cmake)
  endif()
- 
  
