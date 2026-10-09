@@ -100,6 +100,7 @@ target_link_libraries(crypto
     util
     PRIVATE
     sessiondep::libsodium
+    sessiondep::libzstd
     nlohmann_json::nlohmann_json
     libsession::protos
 )
