@@ -1,0 +1,22 @@
+From: Jason Rhinelander <jason@imaginary.ca>
+Date: Fri, 9 Oct 2026 14:13:05 -0300
+Subject: Fix missing direct linking to libzstd
+
+Static builds were getting this via implicit deps, but shared builds
+were failing to pick up libzstd headers.
+---
+ src/CMakeLists.txt | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 96a5b98..2497bc1 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -100,6 +100,7 @@ target_link_libraries(crypto
+     util
+     PRIVATE
+     sessiondep::libsodium
++    sessiondep::libzstd
+     nlohmann_json::nlohmann_json
+     libsession::protos
+ )
