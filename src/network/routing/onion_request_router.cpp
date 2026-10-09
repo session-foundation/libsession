@@ -1731,11 +1731,17 @@ void OnionRequestRouter::_handle_transport_response(
                     auto pubkey = ed25519_pubkey::from_hex(*extracted_pubkey);
                     snode_pool->record_node_failure(pubkey, pattern.force_remove_node);
                     penalized_nodes.insert(pubkey);
+                    // An unreachable *next* node is a path hop - `parse_error_response` has
+                    // already turned the destination's own case into `DestinationUnreachable` -
+                    // so it is named as the path lines name it.  "Snode not ready" can name the
+                    // destination, which stays in full.
                     log::debug(
                             cat,
                             "[Request {}]: Penalized extracted node {} ({} strikes).",
                             original_request.request_id,
-                            pubkey.hex(),
+                            pattern.error_type == ErrorType::IntermediateNodeUnreachable
+                                    ? pubkey.short_string()
+                                    : pubkey.hex(),
                             pattern.force_remove_node ? "permanent" : "1");
                 } catch (...) {
                     log::warning(
