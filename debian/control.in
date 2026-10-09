@@ -13,7 +13,8 @@ Build-Depends:
     libunbound-dev,
     nettle-dev,
     libprotobuf-dev,
-    libsodium-dev
+    libsodium-dev,
+    libsimdutf-dev (>= 7)
 Standards-Version: 4.4.1
 Section: libs
 Homepage: https://github.com/oxen-io/libsession-util
