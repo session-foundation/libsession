@@ -212,16 +212,16 @@ std::vector<unsigned char> HopEncryption::encrypt_xchacha20(
 
 std::vector<unsigned char> HopEncryption::decrypt_xchacha20(
         std::vector<unsigned char> ciphertext_, const network::x25519_pubkey& pubKey) const {
+    if (ciphertext_.size() <
+        crypto_aead_xchacha20poly1305_ietf_NPUBBYTES + crypto_aead_xchacha20poly1305_ietf_ABYTES)
+        throw std::invalid_argument{
+                "Invalid ciphertext: too short to contain valid encrypted data"};
+
     std::span<const unsigned char> ciphertext = to_span(ciphertext_);
 
     // Extract nonce from the beginning of the ciphertext:
     auto nonce = ciphertext.subspan(0, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
     ciphertext = ciphertext.subspan(nonce.size());
-
-    if (!response_long_enough(EncryptType::xchacha20, ciphertext_.size()))
-        throw std::invalid_argument{
-                "Ciphertext data is too short: " +
-                std::string(reinterpret_cast<const char*>(ciphertext_.data()))};
 
     const auto key = xchacha20_shared_key(public_key_, private_key_, pubKey, !server_);
 
