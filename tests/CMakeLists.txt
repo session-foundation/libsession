@@ -15,6 +15,7 @@ set(LIB_SESSION_UTESTS_SOURCES
     test_configdata.cpp
     test_config_contacts.cpp
     test_config_convo_info_volatile.cpp
+    test_config_determinism.cpp
     test_config_local.cpp
     test_config_pro.cpp
     test_curve25519.cpp

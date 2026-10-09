@@ -87,6 +87,15 @@ std::vector<unsigned char> Keys::make_dump() const {
     }
 
     {
+        // Raw bytes of the messages named in "A", so they can be re-stored verbatim if they expire
+        // from the swarm.  `key_msgs_` is a std::map, so this comes out in the sorted order bt_dict
+        // requires.  Old dumps simply won't have this key, and old code skips it.
+        auto msgs = d.append_dict("C");
+        for (const auto& [hash, data] : key_msgs_)
+            msgs.append(hash, to_string_view(data));
+    }
+
+    {
         auto keys = d.append_list("L");
         for (auto& k : keys_) {
             auto ki = keys.append_dict();
@@ -121,6 +130,16 @@ void Keys::load_dump(std::span<const unsigned char> dump) {
         }
     } else {
         throw config_value_error{"Invalid Keys dump: `active` not found"};
+    }
+
+    // Optional: absent in dumps written before we retained message bytes, in which case we simply
+    // have hashes we cannot re-store.  Not an error.
+    if (d.skip_until("C")) {
+        auto msgs = d.consume_dict_consumer();
+        while (!msgs.is_finished()) {
+            auto [hash, data] = msgs.next_string();
+            key_msgs_.emplace(hash, to_vector(data));
+        }
     }
 
     if (d.skip_until("L")) {
@@ -176,6 +195,24 @@ void Keys::load_dump(std::span<const unsigned char> dump) {
                     std::to_string(pk.size()) + ")"};
         std::memcpy(pending_key_.data(), pk.data(), pending_key_.size());
     }
+
+    // `key_msgs_` must never outlive the hashes in `active_msgs_`; enforce that on the way in too,
+    // so a hand-written or corrupted dump can't seed an entry that nothing will ever prune.  What
+    // we just pruned is still on disk, so the cleaned state has to be written back.
+    if (prune_key_msgs())
+        needs_dump_ = true;
+}
+
+bool Keys::prune_key_msgs() {
+    if (key_msgs_.empty())
+        return false;
+    // Views, not copies: `active_msgs_` owns these strings and outlives the lookup.
+    std::unordered_set<std::string_view> keep;
+    for (const auto& [gen, hashes] : active_msgs_)
+        keep.insert(hashes.begin(), hashes.end());
+    auto dropped =
+            std::erase_if(key_msgs_, [&](const auto& item) { return !keep.contains(item.first); });
+    return dropped > 0;
 }
 
 size_t Keys::size() const {
@@ -833,7 +870,8 @@ std::optional<std::span<const unsigned char>> Keys::pending_config() const {
     return std::span<const unsigned char>{pending_key_config_.data(), pending_key_config_.size()};
 }
 
-void Keys::insert_key(std::string_view msg_hash, key_info&& new_key) {
+void Keys::insert_key(
+        std::string_view msg_hash, std::span<const unsigned char> msg_data, key_info&& new_key) {
     // Find all keys with the same generation and see if our key is in there (that is: we are
     // deliberately ignoring timestamp so that we don't add the same key with slight timestamp
     // variations).
@@ -843,7 +881,17 @@ void Keys::insert_key(std::string_view msg_hash, key_info&& new_key) {
             });
     for (auto it = gen_begin; it != gen_end; ++it)
         if (it->key == new_key.key) {
-            active_msgs_[new_key.generation].emplace(msg_hash);
+            // We already have this key, but this may be a *different* message carrying it (the
+            // same key can arrive again under another hash), in which case we want to renew and be
+            // able to re-store this copy too.  Flag a dump only when something actually changed,
+            // so re-loading a message we already know stays free.
+            bool new_hash = active_msgs_[new_key.generation].emplace(msg_hash).second;
+            auto key = std::string{msg_hash};
+            bool new_bytes = !key_msgs_.contains(key);
+            if (new_bytes)
+                key_msgs_.emplace(std::move(key), to_vector(msg_data));
+            if (new_hash || new_bytes)
+                needs_dump_ = true;
             return;
         }
 
@@ -856,6 +904,10 @@ void Keys::insert_key(std::string_view msg_hash, key_info&& new_key) {
         return;
 
     active_msgs_[new_key.generation].emplace(msg_hash);
+    // A supplemental carries every key in `keys_`, so one message reaches this once per generation
+    // it brought that we didn't already hold -- same hash, same bytes each time.
+    if (auto key = std::string{msg_hash}; !key_msgs_.contains(key))
+        key_msgs_.emplace(std::move(key), to_vector(msg_data));
     keys_.insert(it, std::move(new_key));
     remove_expired();
     needs_dump_ = true;
@@ -1102,15 +1154,23 @@ bool Keys::load_key_message(
 
     if (!new_keys.empty()) {
         for (auto& k : new_keys)
-            insert_key(hash, std::move(k));
+            insert_key(hash, data, std::move(k));
 
         auto new_key_list = group_keys();
         members.replace_keys(new_key_list, /*dirty=*/false);
         info.replace_keys(new_key_list, /*dirty=*/false);
         return true;
     } else if (max_gen) {
+        // A valid keys message that held no key for us — a supplemental aimed at other members,
+        // typically.  Still worth retaining: it is part of the generation, and a member who gets
+        // only some of a generation's messages doesn't get the key.
         active_msgs_[*max_gen].emplace(hash);
+        // Same hash means same ciphertext (the storage server derives one from the other) so a
+        // re-delivery brings bytes we already hold, and the first copy is kept.
+        if (auto key = std::string{hash}; !key_msgs_.contains(key))
+            key_msgs_.emplace(std::move(key), to_vector(data));
         remove_expired();
+        // Unconditional: `remove_expired()` above can prune without flagging a dump of its own.
         needs_dump_ = true;
     }
 
@@ -1122,6 +1182,20 @@ std::unordered_set<std::string> Keys::active_hashes() const {
     for (const auto& [g, hash] : active_msgs_)
         hashes.insert(hash.begin(), hash.end());
     return hashes;
+}
+
+std::map<std::string, std::span<const unsigned char>> Keys::active_key_messages() const {
+    std::map<std::string, std::span<const unsigned char>> msgs;
+    for (const auto& [hash, data] : key_msgs_)
+        msgs.emplace(hash, std::span<const unsigned char>{data.data(), data.size()});
+    return msgs;
+}
+
+std::optional<std::span<const unsigned char>> Keys::active_key_message(
+        std::string_view msg_hash) const {
+    if (auto it = key_msgs_.find(std::string{msg_hash}); it != key_msgs_.end())
+        return std::span<const unsigned char>{it->second.data(), it->second.size()};
+    return std::nullopt;
 }
 
 void Keys::remove_expired() {
@@ -1162,14 +1236,33 @@ void Keys::remove_expired() {
     }
 
     // Drop any active message hashes for generations we are no longer keeping around
-    if (!keys_.empty())
-        active_msgs_.erase(
-                active_msgs_.begin(), active_msgs_.lower_bound(keys_.front().generation));
-    else
+    bool dropped_hashes = false;
+    if (!keys_.empty()) {
+        auto keep_from = active_msgs_.lower_bound(keys_.front().generation);
+        dropped_hashes = keep_from != active_msgs_.begin();
+        active_msgs_.erase(active_msgs_.begin(), keep_from);
+    } else {
         // Keys is empty, which means we aren't keep *any* keys around (or they are all invalid or
         // something) and so it isn't really up to us to keep them alive, since that's a history of
         // the group we apparently don't have access to.
+        dropped_hashes = !active_msgs_.empty();
         active_msgs_.clear();
+    }
+
+    // Retained message bytes follow the hashes exactly, for both of the above branches, so they
+    // expire on the same schedule as the keys; without this an expired generation's bytes would sit
+    // on disk forever.
+    //
+    // Note what that does and does not bound: it bounds the WINDOW, not the size within it.  Every
+    // rekey and every supplemental inside KEY_EXPIRY is held verbatim, and a full rekey message is
+    // 177 + 48*N bytes for N members rounded up to a multiple of MESSAGE_KEY_MULTIPLE (see the
+    // arithmetic in keys.hpp), so a large group that rekeys often can carry a sizeable dump.
+    // Bounded and predictable, not necessarily small.
+    //
+    // Every path that adds bytes adds the hash too, so nothing can be orphaned unless a hash was
+    // just dropped -- which is the uncommon case, and this runs on every message load.
+    if (dropped_hashes)
+        prune_key_msgs();
 }
 
 bool Keys::needs_rekey() const {
@@ -1464,6 +1557,20 @@ LIBSESSION_C_API bool groups_keys_load_message(
 
 LIBSESSION_C_API config_string_list* groups_keys_active_hashes(const config_group_keys* conf) {
     return make_string_list(unbox(conf).active_hashes());
+}
+
+LIBSESSION_C_API bool groups_keys_active_message(
+        const config_group_keys* conf,
+        const char* msg_hash,
+        const unsigned char** data,
+        size_t* datalen) {
+    assert(msg_hash && data && datalen);
+    if (auto msg = unbox(conf).active_key_message(msg_hash)) {
+        *data = msg->data();
+        *datalen = msg->size();
+        return true;
+    }
+    return false;
 }
 
 LIBSESSION_C_API bool groups_keys_needs_rekey(const config_group_keys* conf) {
