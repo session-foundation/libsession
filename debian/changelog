@@ -1,3 +1,204 @@
+libsession-util (1.9.4-1~ubuntu2610) stonking; urgency=medium
+
+  [ Morgan Pretty ]
+  * Actually use the `custom_file_server_pubkey_hex` value
+  * SnodePool: fix use-after-free when running post-refresh callbacks
+  * Addressed PR feedback
+  * Rename function
+  * Replacing `shrink_to_fit` with refined alternative
+  * Comment tweak for accuracy
+  * SnodePool: don't let an undersized refresh wipe a good cache
+  * SnodePool: hold a weak ref in discard_and_retry
+  * Update tests/test_snode_pool.cpp
+  * tests/snode_pool: use a duration literal in the update_cache config
+  * tests/pro_backend: inline the day-rounding seed_payment needs
+  * user_profile: add the pro grace period (config key `G`)
+  * pro_backend: parse the grace period and renewal flag off the proof response
+  * user_profile: clear the auto-renewing flag with the expiry it describes
+  * user_profile, pro_backend: correct the expiry/grace model in the docs
+  * pro_backend: correct the get_pro_status docs to match the backend's model
+  * user_profile: fix a sign typo in the grace-period docs
+  * Bumped the version number
+  * quic: actually apply disable_mtu_discovery when the config asks for it
+  * fix: carry the file server port in generated download urls
+  * tests: pin that a valueless `d=` is not the stream-encryption fragment
+  * test: motivate the port guard with IPv6 rather than a contrived colon
+  * chore: apply clang-format
+  * fix: treat the file server pubkey as Ed25519, as the other clients do
+  * test: pin the x25519 key derived from the default file server pubkey
+  * chore: drop the unused legacy file server constants
+  * chore: bump to 1.9.0
+  * chore: apply clang-format
+  * Recover from a 421 on the evidence rather than on the cache's age
+  * Follow a 421's redirect instead of refreshing the whole pool
+  * Expire snode strikes where it matters, not only where it's reported
+  * Drop a cached edge node once it has been struck out
+  * Tell callers when the snode pool could not be refreshed
+  * Ask for a refresh whenever a redirect resolves to too few nodes
+  * Silence the disable_mtu_discovery deprecation until the pin can move
+  * Include what the test helpers use
+  * Version bump
+  * Switch dependency handling to session-deps
+  * Port session_router_router to session-router's tunnel claims; bump session-router to afb98f9
+  * quic: use max_udp_payload::minimum() instead of the deprecated disable_mtu_discovery
+  * Bump version number
+  * Drop the unused build-tree export() calls; clang-format
+  * Add opt::quic_max_udp_payload (from client)
+  * Fix the static bundle missing session-deps libraries
+  * Don't dereference a connection that is already gone when a response arrives
+  * Clear only the closed connection's state when a connection fails
+
+  [ Jason Rhinelander ]
+  * Hash signing: encode integers as explicit little-endian
+  * Remove dead SeshProBackend__ personalisation constant
+  * Widen revocation ticket to 64-bit; accept signed ints in json_require
+  * Pro wire format: milliseconds -> integer seconds
+  * Fix fmt/spdlog linking when using system lib
+  * Pro & config timestamps: milliseconds -> integer seconds, signed int64_t
+  * Rename gen_index_hash -> revocation_tag
+  * Rename protobuf ProProof field genIndexHash -> revocationTag
+  * Reshape revocation list: drop per-entry expiry, add effective_ts/retry_in/retain_for
+  * Pro payments: collapse provider/plan enums + typed IDs into opaque payment_id
+  * Reference wire spec instead of backend source permalinks
+  * Redesign pro_backend C/C++ API around free functions
+  * Preserve sub-second precision on purchased_ts/revoked_ts (+ rename unredeemed→purchased)
+  * Remove wire version: gone from requests, personalisation-encoded for the proof
+  * tests: purge arcane fprintf debug output in favour of Catch2 INFO
+  * pro_backend: build request bodies with a single nlohmann literal
+  * pro_backend: parse payment/user status as opaque string codes
+  * pro_backend: fill in the backend proof-signing pubkey
+  * pro_backend: add backend base URL + C export of the signing pubkey
+  * utils: add occasional big-endian test audit script
+  * test-bigendian: use local qemu-user-static + debian:sid
+  * Pro: rename *_unix_ts fields to *_at
+  * Pro: give ProRequest an explicit content_type; body -> opaque data
+  * clang-format fixups after the *_unix_ts -> *_at rename
+  * Pro C API: collapse request builders into thin C++ wrappers
+  * Pro: add PUBKEY_X25519 constant (X25519 form of the backend pubkey)
+  * test-bigendian: local qemu-user-static + sid, quic-deps via apt, guarded tags
+  * Pro: drop the overloaded Response.status field
+  * Pro: response envelope -> status enum + error_code slug + single error (Delta #12)
+  * Pro signing: sign the message directly (Delta #13), drop BLAKE2b
+  * pro_backend: add visible_platforms() — user-visible purchasable slugs
+  * Bump version to 1.7.0
+  * pro_backend: parse the plan billing-period code (Delta #14)
+  * pro_backend.h: collapse redundant forward-typedef struct declarations
+  * pro_backend: make C++ the owner of the payment-provider code constants
+  * pro_backend: C responses wrap the owned C++ object; drop the arena
+  * session_protocol: idiomatic C header + C++-owned constants, misc cleanup
+  * pro_backend: redesign ProviderURLs (optional fields, static per-provider constants)
+  * pro_backend: add `found` to session_pro_backend_provider_urls (C)
+  * Eliminate string8; it duplicated span_u8
+  * pro_backend: split get_pro_details into get_pro_status + get_payment_details (Delta #15)
+  * pro_backend: drop stale "Delta #14" spec citations
+  * Add live Pro-backend integration tests ([pro_live]) + CI — stable
+  * Add server-less known-answer vectors for Pro signed messages ([pro_kat])
+  * Harness: drop stale Delta-N spec citations; track backend upstream dev
+  * CI: install python3-psycopg-pool for the Pro-backend live pipeline
+  * CI: force a UTF-8 locale in the ephemeral-backend launcher
+  * Clamp revocation list retry/cleanup values
+  * tests/pro_backend: fix seed_payment obfuscated-account-id derivation
+  * config: add synced refund-requested flag to UserProfile
+  * pro_backend: remove set_payment_refund_requested endpoint
+  * config: drop redundant condition in if-init statements
+  * config: ignore refund-requested values older than a week
+  * pro_backend: remove /add_pro_payment; redemption is now implicit
+  * config: migrate legacy millisecond pro_access_expiry on read
+  * pro_backend: collapse redundant ProProofResponse base
+  * config: stop persisting the proof version (dicts aren't atomic)
+  * config: store the pro credential as one atomic bt-encoded value
+  * pro: add ProProof::rotating_seed deterministic generator
+  * config: add maybe_span dict helper
+  * config: add pro_prepaid (purchase-in-flight) flag + auto-clears
+  * config: add UserProfile::pro_renewal_target (when to re-request a proof)
+  * tests: use chrono duration literals for pro/refund timestamps
+  * pro_message: assert the previously-ignored to_chars ec
+  * config: use maybe_span instead of maybe_vector for pro/group key loads
+  * session_protocol: drop the ProSignedMessage struct
+  * pro_backend: drop the redundant public *_sig(s) helpers
+  * session_protocol: make ProProof::status const
+  * session_protocol: fix stale doc comments
+  * session_protocol: use a cheap validly-encoded decoy signature
+  * Fix unused parameters
+  * session_protocol: drop the unused sent_timestamp from encode_for_community_inbox
+  * session_encrypt/quic: drop parameters missed in the unused-parameters backport
+  * session_protocol: rename ProProof::rotating_seed's timestamp param to now
+  * config: defer pro_renewal_target briefly at a rotation boundary
+  * attachments: keep is_final for the assert in process_chunk (fix debug build)
+  * session_protocol/config: apply review to the rotating-seed rename + renewal deferral
+  * util: view-based utf16_truncate/utf16_count; drop asserts on user input
+  * session_protocol: pro_features_for_utf8/16 -> pro_features_for_message
+  * session_protocol/user_profile: fix "weekly rotation" mischaracterization in docs
+  * user_profile: only schedule a proof fetch when there's an entitlement signal
+  * pro_backend: surface advisory account_expiry_ts from the proof response
+  * session_protocol: document PRO_RENEWAL_LEAD as a locked backend contract
+  * formatting
+  * Drop redeemed_at/redeemed_ts and the "unredeemed" status
+  * Replace char comparisons with .starts_with
+  * Add more 25-prefixed failure validation tests
+  * Add missing backend modules
+  * Rename payment provider rangeproof -> stf
+  * Drop error_report from get_pro_status
+  * decrypt_group_message: parse via bt_dict_consumer require/maybe helpers
+  * ci: backend: kwarg rename fix
+  * pro_backend: throw on parse errors instead of an error vector
+  * user_profile: fetch a proof when entitled but holding none
+  * Re-resolve the right swarm after a 421
+  * Formatting & stale comment fix
+  * user_profile: add pro auto-renewing status (config key `A`)
+  * pro_backend: shared JSON parse helpers + parse_error hierarchy
+  * pro_backend: read grace/renewal on subscription_expired; missing means not-applicable
+  * Move json_require_hex alongside other json helpers
+  * session_protocol: make the proof version a wire selector, not a stored field
+  * session_protocol: degrade unknown-version proofs instead of dropping the message
+  * json: recognize scoped enums in json_require/json_maybe
+  * formatting
+  * Fix spurious seqno increment when a merge adopts an incoming config
+  * Fix uninitialized requested_unlock_height usage
+  * Follow a 421's redirect for each account a batch rejects
+  * Act on a destination's status only when its response decrypted
+  * Follow a swarm redirect without checking it against our own grouping
+  * Check the pool can now serve a caller before retrying it
+  * Keep following swarm redirects past the limit, and ask for a refresh
+  * Follow a redirect with the nodes of it we know, and refresh for the rest
+  * Report too few usable nodes with a named error code
+  * Actually suspend the QUIC transport, and close without blaming nodes
+  * Abandon a snode pool refresh when the pool is suspended
+  * Give the older snode pool tests the config they were written for
+  * Test that rotating a path drops a struck-out edge node
+  * Check the pool's age on every get_swarm, not only the first per account
+  * Fall back on the C API's swarm pubkey for sub-requests naming no account
+  * Keep repeated swarm redirect logging out of the default log
+  * ci-upload: upload .ddeb debug packages and .buildinfo files
+  * Drop the xz override and use Ubuntu's default zstd .deb compression
+  * Bump session-deps to current dev
+  * Make ENABLE_NETWORKING_SROUTER=OFF link, and default it off
+  * quic_transport: describe the MTU cap, not the change that introduced it
+  * Bump session-router for libquic 1.11.0
+  * Bump session-deps for gnutls's Apple frameworks
+  * Bump session-deps for macOS cross-arch builds
+  * Bump session-deps for libunistring's iconv on Apple
+  * Build the static bundle from one walk of the link closure
+  * Make static-bundle-test link the bundle alone, and build it in CI
+  * Bump version to 1.9.4
+  * Link nlohmann-json publicly to network
+  * Say accurately when a response can arrive after its connection is gone
+
+  [ Samy ]
+  * Validate blinded IDs before matching
+  * Use fixed-size spans for XEd25519 inputs
+  * multi_encrypt: match padding entries to ciphertext size
+  * attachments: validate file encryption inputs
+
+  [ Audric Ackermann ]
+  * pro_backend: fix macOS build of the C response holders
+  * fix: pro proof has no version field at all (#1)
+  * fix: point the Pro access-not-found url at getsession.org/pro-recover
+  * fix: android refund redirect is /refund-android
+  * chore: run static ios first
+
+ -- Jason Rhinelander <jason@session.foundation>  Fri, 09 Oct 2026 13:31:47 -0300
+
 libsession-util (1.6.7-1~ubuntu2610) stonking; urgency=medium
 
   * Stonking deb
