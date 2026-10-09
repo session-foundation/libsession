@@ -230,7 +230,7 @@ void group_info::load(const dict& info_dict) {
     else
         name.clear();
 
-    if (auto seed = maybe_vector(info_dict, "K"); seed && seed->size() == 32) {
+    if (auto seed = maybe_span(info_dict, "K"); seed && seed->size() == 32) {
         std::array<unsigned char, 33> pk;
         pk[0] = 0x03;
         secretkey.resize(64);

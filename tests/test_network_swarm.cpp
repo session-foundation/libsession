@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <session/network/key_types.hpp>
 #include <session/network/service_node.hpp>
+#include <session/network/session_network_types.hpp>
 #include <session/network/swarm.hpp>
 #include <tuple>
 
@@ -197,4 +198,189 @@ TEST_CASE("Swarm", "[network][swarm][get_swarm]") {
     CHECK(get_swarm_id(
                   "05000000000000000000000000000000000000000000000000fffffffffffffffe", swarms) ==
           0);
+}
+
+namespace {
+using json = nlohmann::json;
+
+x25519_pubkey account(char c) {
+    return x25519_pubkey::from_hex(std::string(64, c));
+}
+
+std::vector<ed25519_pubkey> nodes(std::string_view chars) {
+    std::vector<ed25519_pubkey> keys;
+    for (char c : chars)
+        keys.push_back(ed25519_pubkey::from_hex(std::string(64, c)));
+    return keys;
+}
+
+json rejection(std::optional<std::string> echoed, std::string_view node_chars) {
+    auto snodes = json::array();
+    for (char c : node_chars)
+        snodes.push_back({{"pubkey_ed25519", std::string(64, c)}, {"ip", "10.0.0.1"}});
+
+    json body = {{"snodes", std::move(snodes)}, {"swarm", "abc"}};
+    if (echoed)
+        body["pubkey"] = *echoed;
+    return body;
+}
+
+json batch(std::vector<std::pair<int, json>> results) {
+    auto list = json::array();
+    for (auto& [code, body] : results)
+        list.push_back({{"code", code}, {"body", std::move(body)}});
+    return {{"results", std::move(list)}};
+}
+
+response::swarm_rejections rejections(
+        const json& body,
+        int16_t status_code,
+        std::vector<std::optional<x25519_pubkey>> accounts = {}) {
+    return response::find_swarm_rejections(&body, status_code, accounts);
+}
+
+const std::string A = "05" + std::string(64, 'a');
+const std::string B = "03" + std::string(64, 'b');
+}  // namespace
+
+TEST_CASE("Swarm", "[network][swarm][batch_error]") {
+    CHECK(response::find_uniform_batch_error(batch({{421, {}}, {421, {}}}).dump()) == 421);
+    CHECK_FALSE(response::find_uniform_batch_error(batch({{421, {}}, {406, {}}}).dump()));
+    CHECK_FALSE(response::find_uniform_batch_error(batch({{421, {}}, {200, {}}}).dump()));
+    CHECK_FALSE(response::find_uniform_batch_error(batch({}).dump()));
+    CHECK_FALSE(response::find_uniform_batch_error(rejection(A, "12").dump()));
+    CHECK_FALSE(response::find_uniform_batch_error("not json"));
+}
+
+TEST_CASE("Swarm", "[network][swarm][rejections]") {
+    SECTION("A plain 421 is attributed to the request's account") {
+        auto r = rejections(rejection(A, "123"), 421, {account('a')});
+        CHECK_FALSE(r.unattributed);
+        REQUIRE(r.accounts.size() == 1);
+        CHECK(r.accounts.at(account('a')) == nodes("123"));
+    }
+
+    SECTION("An account echoed in testnet form, without a prefix, still matches") {
+        auto r = rejections(rejection(std::string(64, 'a'), "12"), 421, {account('a')});
+        REQUIRE(r.accounts.count(account('a')));
+        CHECK(r.accounts.at(account('a')) == nodes("12"));
+    }
+
+    SECTION("A 421 needn't name its account") {
+        auto r = rejections(
+                batch({{421, rejection(std::nullopt, "12")}, {421, rejection(std::nullopt, "34")}}),
+                421,
+                {account('a'), account('b')});
+        CHECK_FALSE(r.unattributed);
+        REQUIRE(r.accounts.size() == 2);
+        CHECK(r.accounts.at(account('a')) == nodes("12"));
+        CHECK(r.accounts.at(account('b')) == nodes("34"));
+    }
+
+    SECTION("Nothing is found in a response that isn't a 421") {
+        auto r = rejections(json{{"t", 1}}, 200, {account('a')});
+        CHECK(r.accounts.empty());
+        CHECK_FALSE(r.unattributed);
+    }
+
+    SECTION("A batch can reject some accounts and answer others") {
+        auto r = rejections(
+                batch({{421, rejection(A, "12")},
+                       {200, json{{"messages", json::array()}}},
+                       {421, rejection(B, "34")}}),
+                200,
+                {account('a'), account('c'), account('b')});
+        CHECK_FALSE(r.unattributed);
+        REQUIRE(r.accounts.size() == 2);
+        CHECK(r.accounts.at(account('a')) == nodes("12"));
+        CHECK(r.accounts.at(account('b')) == nodes("34"));
+    }
+
+    SECTION("Several rejections of one account are one redirect") {
+        auto r = rejections(
+                batch({{421, rejection(A, "12")}, {421, rejection(A, "12")}}), 421, {account('a')});
+        REQUIRE(r.accounts.size() == 1);
+        CHECK(r.accounts.at(account('a')) == nodes("12"));
+    }
+
+    SECTION("A single account applies to every sub-request") {
+        auto r = rejections(
+                batch({{421, rejection(std::nullopt, "12")}, {421, rejection(std::nullopt, "12")}}),
+                421,
+                {account('a')});
+        REQUIRE(r.accounts.size() == 1);
+        CHECK(r.accounts.at(account('a')) == nodes("12"));
+    }
+
+    SECTION("A sequence that stopped early is still attributed by position") {
+        auto r = rejections(
+                batch({{200, json::object()}, {421, rejection(std::nullopt, "34")}}),
+                200,
+                {account('a'), account('b'), account('c')});
+        REQUIRE(r.accounts.size() == 1);
+        CHECK(r.accounts.at(account('b')) == nodes("34"));
+    }
+
+    // The account a 421 names is the responding node's word; taking it would let any node redirect
+    // any account it likes, not just those it was asked about
+    SECTION("The account a 421 names is never trusted in place of the request's") {
+        auto r = rejections(rejection(A, "12"), 421, {account('b')});
+        CHECK(r.accounts.empty());
+        CHECK(r.unattributed);
+
+        r = rejections(
+                batch({{421, rejection("05" + std::string(64, 'c'), "12")},
+                       {421, rejection(B, "34")}}),
+                421,
+                {account('a'), account('b')});
+        CHECK(r.unattributed);
+        REQUIRE(r.accounts.size() == 1);
+        CHECK(r.accounts.at(account('b')) == nodes("34"));
+
+        CHECK(rejections(rejection(A, "12"), 421).accounts.empty());
+    }
+
+    SECTION("A sub-request with no account leaves its 421 unattributed") {
+        auto r = rejections(
+                batch({{200, json::object()}, {421, rejection(std::nullopt, "12")}}),
+                200,
+                {account('a'), std::nullopt});
+        CHECK(r.accounts.empty());
+        CHECK(r.unattributed);
+    }
+
+    SECTION("A 421 whose body isn't JSON has no redirect") {
+        std::vector<std::optional<x25519_pubkey>> accounts{account('a')};
+        auto r = response::find_swarm_rejections(nullptr, 421, accounts);
+        REQUIRE(r.accounts.size() == 1);
+        CHECK(r.accounts.at(account('a')).empty());
+        CHECK(response::find_swarm_rejections(nullptr, 200, accounts).accounts.empty());
+    }
+}
+
+TEST_CASE("Swarm", "[network][swarm][batch_request_accounts]") {
+    SECTION("A pregenerated batch body gives each sub-request's account") {
+        auto body = json{{"requests",
+                          {{{"method", "retrieve"}, {"params", {{"pubkey", A}}}},
+                           {{"method", "info"}, {"params", json::object()}},
+                           {{"method", "retrieve"}, {"params", {{"pubkey", B}}}}}}}
+                            .dump();
+        auto bytes = std::span{reinterpret_cast<const unsigned char*>(body.data()), body.size()};
+
+        auto accounts = batch_request_accounts("batch", bytes);
+        REQUIRE(accounts);
+        CHECK(*accounts ==
+              std::vector<std::optional<x25519_pubkey>>{account('a'), std::nullopt, account('b')});
+        CHECK(batch_request_accounts("sequence", bytes) == accounts);
+        CHECK_FALSE(batch_request_accounts("retrieve", bytes));
+
+        // A sub-request naming no account takes the one the caller gave for the whole request,
+        // while those that name their own keep it
+        CHECK(batch_request_accounts("batch", bytes, account('c')) ==
+              std::vector<std::optional<x25519_pubkey>>{account('a'), account('c'), account('b')});
+
+        std::string_view junk = "not json";
+        CHECK_FALSE(batch_request_accounts(
+                "batch", {reinterpret_cast<const unsigned char*>(junk.data()), junk.size()}));
+    }
 }

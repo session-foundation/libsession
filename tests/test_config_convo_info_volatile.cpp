@@ -623,12 +623,13 @@ TEST_CASE("Conversation pruning", "[config][conversations][pruning]") {
                 c.unread = true;
 
             if (i % 7 == 0) {
-                c.pro_expiry_unix_ts = std::chrono::sys_time<std::chrono::milliseconds>{
-                        std::chrono::milliseconds{unix_timestamp(i)}};
+                c.pro_expiry_at =
+                        std::chrono::sys_seconds{std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::milliseconds{unix_timestamp(i)})};
 
                 session::array_uc32 hash{};
                 std::fill(hash.begin(), hash.end(), static_cast<uint8_t>(i % 256));
-                c.pro_gen_index_hash = hash;
+                c.pro_revocation_tag = hash;
             }
 
             convos.set(c);
@@ -834,12 +835,12 @@ TEST_CASE("Conversation pro data", "[config][conversations][pro]") {
     c.last_read = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch())
                           .count();
-    c.pro_expiry_unix_ts_ms = 10000;
+    c.pro_expiry_ts = 10000;
 
     session::array_uc32 hash{};
     std::fill(hash.begin(), hash.end(), static_cast<uint8_t>(3));
-    std::memcpy(c.pro_gen_index_hash.data, hash.data(), hash.size());
-    c.has_pro_gen_index_hash = true;
+    std::memcpy(c.pro_revocation_tag.data, hash.data(), hash.size());
+    c.has_pro_revocation_tag = true;
     convo_info_volatile_set_1to1(conf, &c);
 
     // Fake push:
@@ -869,8 +870,8 @@ TEST_CASE("Conversation pro data", "[config][conversations][pro]") {
     CHECK(convo_info_volatile_get_or_construct_1to1(
             conf2, &c2, "051111111111111111111111111111111111111111111111111111111111111111"));
 
-    CHECK(c2.pro_expiry_unix_ts_ms == c.pro_expiry_unix_ts_ms);
-    CHECK(c.has_pro_gen_index_hash);
-    CHECK(c2.has_pro_gen_index_hash);
-    CHECK(oxenc::to_hex(c2.pro_gen_index_hash.data) == oxenc::to_hex(c.pro_gen_index_hash.data));
+    CHECK(c2.pro_expiry_ts == c.pro_expiry_ts);
+    CHECK(c.has_pro_revocation_tag);
+    CHECK(c2.has_pro_revocation_tag);
+    CHECK(oxenc::to_hex(c2.pro_revocation_tag.data) == oxenc::to_hex(c.pro_revocation_tag.data));
 }

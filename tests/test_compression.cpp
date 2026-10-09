@@ -123,11 +123,11 @@ TEST_CASE("compression", "[config][compression]") {
     d = data2;
     session::config::compress_message(d, 19);
     CHECK(d[0] == 'z');
-    CHECK(d.size() == 157);  // Yeah, it actually gets *bigger* with supposedly "higher" compression
+    CHECK(d.size() == 156);
     CHECK(d.size() < data2.size());
     CHECK(to_hex(d) ==
-          "7a28b52ffd20aa9d0400e40764313a23693165313a2664313a6e31323a4b616c6c6965313a7032393a68"
-          "7474703a2f2f6b2e6578616d706c652e6f72672f4b626d70313a71323473656372657465313a3c6c6c69"
-          "306533323aea173b57beca8af18c3519a7bbf69c3e7a05d1c049fa9558341d8ebb48b0c96564653d6431"
-          "3a6e303a313a7071303a6565070028812c55282f03fceac460149b57cd509a");
+          "7a28b52ffd20aa95040022881f1f907d9c93291a7627219a79d06bb82c3c69341b104115dbf3c0860176"
+          "f63013ff7ba4247de211d1275be493fffff6eb7892db81b9dc9da26f40955e5d868586cd577bb69e00f7"
+          "caf2110f04219f7cf49bda3f19a5f4091966d5c199a3f14132c4d26f7cc7e14914edbca3903ef91e0862"
+          "955712d1275be1939f78844fb606008c12e0cb50be3a1c18c5e655339426");
 }

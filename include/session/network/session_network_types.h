@@ -63,6 +63,18 @@ typedef struct {
 
     const char* request_id;  // Optional id for the request to trace through logs, null terminated
 
+    // The account whose swarm this request addresses, as 64 hex chars of its X25519 pubkey — the
+    // same value passed to session_network_get_swarm() to choose the destination node.  Null for a
+    // request aimed at a node rather than about an account (a cache refresh, a clock resync) or at
+    // a server, which no swarm membership applies to.  For a `batch` or `sequence` request each
+    // sub-request's account is read from the body instead, and this is used only if the body
+    // can't be parsed.
+    //
+    // Set it whenever there is one: a storage server rejects a request whose pubkey is outside its
+    // swarm with a 421, and recovering means re-resolving this account's swarm.  Left null, such a
+    // request fails on the first 421 instead of being redirected.
+    const char* swarm_pubkey_hex;
+
 } session_request_params;
 
 typedef struct {
