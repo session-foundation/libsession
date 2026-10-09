@@ -21,7 +21,7 @@ Homepage: https://github.com/oxen-io/libsession-util
 Package: libsession-util-dev
 Section: libdevel
 Architecture: any
-Depends: libsession-util1.6.7 (= ${binary:Version}), ${misc:Depends},
+Depends: libsession-util1.9.4 (= ${binary:Version}), ${misc:Depends},
     liboxenc-dev (>= 1.5.0),
     liboxen-logging-dev (>= 1.2.0),
     liboxen-quic-dev (>= 1.8.0),
@@ -34,7 +34,7 @@ Description: Utility library for the Session messenger (headers)
  This package contains the library headers and other development files needed
  to build software using libsession-util.
 
-Package: libsession-util1.6.7
+Package: libsession-util1.9.4
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: Utility library for the Session messenger (headers)
