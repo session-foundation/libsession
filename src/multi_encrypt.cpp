@@ -163,11 +163,11 @@ std::vector<unsigned char> encrypt_for_multiple_simple(
                     msg_count++;
                 });
 
-        if (int pad_size = pad > 1 && !messages.empty() ? messages.front().size() : 0) {
-            std::vector<unsigned char> junk;
-            junk.resize(pad_size);
+        if (pad > 1 && !messages.empty()) {
+            const auto pad_size = messages.front().size() + encrypt_multiple_message_overhead;
+            std::vector<unsigned char> junk(pad_size);
             for (; msg_count % pad != 0; msg_count++) {
-                randombytes_buf(junk.data(), pad_size);
+                randombytes_buf(junk.data(), junk.size());
                 enc_list.append(to_string(junk));
             }
         }

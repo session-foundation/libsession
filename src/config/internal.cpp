@@ -187,6 +187,14 @@ std::string_view sv_or_empty(const session::config::dict& d, const char* key) {
     return ""sv;
 }
 
+std::optional<std::span<const unsigned char>> maybe_span(
+        const session::config::dict& d, const char* key) {
+    std::optional<std::span<const unsigned char>> ret;
+    if (auto* s = maybe_scalar<std::string>(d, key))
+        ret.emplace(reinterpret_cast<const unsigned char*>(s->data()), s->size());
+    return ret;
+}
+
 std::optional<std::vector<unsigned char>> maybe_vector(
         const session::config::dict& d, const char* key) {
     std::optional<std::vector<unsigned char>> result;

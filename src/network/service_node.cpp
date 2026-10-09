@@ -11,10 +11,6 @@ using namespace oxen::log::literals;
 
 namespace session::network {
 
-session::network::x25519_pubkey service_node::swarm_pubkey() const {
-    return session::network::compute_x25519_pubkey(remote_pubkey);
-}
-
 std::string service_node::to_string() const {
     return remote_pubkey.hex();
 }
@@ -125,9 +121,9 @@ service_node service_node::from_json(nlohmann::json json) {
         if (!quic::parse_int(json["swarm"].get<std::string>(), swarm_id, 16))
             throw std::runtime_error{"Invalid swarm id"};
 
-    uint64_t requested_unlock_height;
-    if (json.contains("requested_unlock_height"))
-        requested_unlock_height = json["requested_unlock_height"].get<uint64_t>();
+    // Swarm responses (the `get_swarm` endpoint and 421 bodies) omit this entirely, and an oxend
+    // node dump omits it for a node with no unlock requested; neither case is distinguishable here
+    auto requested_unlock_height = json.value<int64_t>("requested_unlock_height", -1);
 
     return {ed25519_pubkey::from_bytes(pubkey),
             quic::ipv4{ip},

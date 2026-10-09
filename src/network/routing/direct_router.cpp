@@ -62,7 +62,7 @@ void DirectRouter::suspend() {
     });
 }
 
-void DirectRouter::resume(bool automatically_reconnect) {
+void DirectRouter::resume(bool /*automatically_reconnect*/) {
     // Use 'call_get' to force this to be synchronous
     _loop->call_get([this] {
         if (!_suspended)

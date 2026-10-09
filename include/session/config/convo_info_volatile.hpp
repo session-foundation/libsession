@@ -32,7 +32,7 @@ class val_loader;
 /// 1 - dict of one-to-one conversations.  Each key is the Session ID of the contact (in hex).
 ///     Values are dicts with keys:
 ///     e - contacts pro expiry unix timestamp (in milliseconds)
-///     g - contacts pro gen_index_hash
+///     g - contacts pro revocation_tag
 ///     r - the unix timestamp (in integer milliseconds) of the last-read message.  Always
 ///         included, but will be 0 if no messages are read.
 ///     u - will be present and set to 1 if this conversation is specifically marked unread.
@@ -62,7 +62,7 @@ class val_loader;
 /// b - outgoing blinded message request conversations.  The key is the blinded Session ID without
 ///     the prefix.  Values are dicts with keys:
 ///     e - contacts pro expiry unix timestamp (in milliseconds)
-///     g - contacts pro gen_index_hash
+///     g - contacts pro revocation_tag
 ///     r - the unix timestamp (integer milliseconds) of the last-read message.  Always included,
 ///         but will be 0 if no messages are read.
 ///     u - will be present and set to 1 if this conversation is specifically marked unread.
@@ -86,12 +86,12 @@ namespace convo {
     };
 
     struct pro_base : base {
-        /// Hash of the generation index set by the Session Pro Backend
-        std::optional<array_uc32> pro_gen_index_hash;
+        /// Opaque revocation tag identifying this proof (from the Session Pro backend)
+        std::optional<array_uc32> pro_revocation_tag;
 
-        /// Unix epoch timestamp to which this proof's entitlement to Session Pro features is valid
-        /// to
-        sys_ms pro_expiry_unix_ts{};
+        /// Unix epoch timestamp (seconds) until which this proof's entitlement to Session Pro
+        /// features is valid
+        sys_seconds pro_expiry_at{};
 
       protected:
         using base::base;
