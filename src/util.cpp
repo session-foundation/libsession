@@ -161,24 +161,15 @@ std::optional<std::vector<unsigned char>> zstd_decompress(
     return decompressed;
 }
 
-inline bool is_utf16_low_surrogate(char16_t c) {
-    return c >= 0xDC00 && c <= 0xDFFF;
-}
-
-inline bool is_utf16_high_surrogate(char16_t c) {
-    return c >= 0xD800 && c <= 0xDBFF;
-}
-
-size_t utf16_count_truncated_to_codepoints(
-        std::span<const char16_t> utf16_string, size_t codepoint_len) {
+std::u16string_view utf16_truncate(std::u16string_view in, size_t max_codepoints) {
     // If the requested codepoint length is longer than the UTF-16 string length,
     // we can safely assume the entire string is needed.
-    if (utf16_string.size() <= codepoint_len) {
-        return utf16_string.size();
+    if (in.size() <= max_codepoints) {
+        return in;
     }
 
-    if (codepoint_len == 0) {
-        return 0;
+    if (max_codepoints == 0) {
+        return {};
     }
 
     // Call simdutf to count the codepoint for the entirety of the UTF-16 string.
@@ -190,43 +181,31 @@ size_t utf16_count_truncated_to_codepoints(
     // Hence the overall cost to pay for the optimization:
     // * Truncation not needed: fast simdutf counting.
     // * Truncation needed: fast simdutf counting + slower iteration.
-    auto current_codepoint_len = simdutf::count_utf16(utf16_string.data(), utf16_string.size());
-    if (current_codepoint_len <= codepoint_len) {
-        return utf16_string.size();
+    auto current_codepoint_len = simdutf::count_utf16(in.data(), in.size());
+    if (current_codepoint_len <= max_codepoints) {
+        return in;
     }
 
-    // Fallback: iterate through the UTF-16 string and count codepoints properly
+    // Fallback: iterate through the UTF-16 string and count codepoints properly, taking care not
+    // to split a surrogate pair.
     size_t counted_codepoints = 0;
-    bool expecting_low_surrogate = false;
-    for (size_t i = 0; i < utf16_string.size(); ++i) {
-        if (const char16_t c = utf16_string[i]; is_utf16_high_surrogate(c)) {
-            assert(!expecting_low_surrogate);
+    for (size_t i = 0; i < in.size(); ++i) {
+        // A high surrogate is the leading half of a surrogate pair: skip it so a pair is only
+        // counted (and only ever truncated) at its trailing low surrogate.
+        if (const char16_t c = in[i]; c >= 0xD800 && c <= 0xDBFF)
+            continue;
 
-            // Start of a surrogate pair. Only count the codepoint when we see the low surrogate.
-            expecting_low_surrogate = true;
-        } else if (is_utf16_low_surrogate(c)) {
-            assert(expecting_low_surrogate);
-
-            counted_codepoints++;
-            expecting_low_surrogate = false;
-        } else {
-            // Regular BMP character
-            assert(!expecting_low_surrogate);
-            counted_codepoints++;
-        }
-
-        if (counted_codepoints == codepoint_len) {
-            return i + 1;
-        }
+        if (++counted_codepoints == max_codepoints)
+            return in.substr(0, i + 1);
     }
 
-    // Should not be here, as the case of codepoint_len >= actual codepoint count should have
+    // Should not be here, as the case of max_codepoints >= actual codepoint count should have
     // been handled at the start of the function. As this indicates an invalid UTF-16 string,
-    // we will treat it as UB and return the whole string length.
-    return utf16_string.size();
+    // we will treat it as UB and return the whole string.
+    return in;
 }
 
-size_t utf16_count(std::span<const char16_t> utf16_string) {
+size_t utf16_count(std::u16string_view utf16_string) {
     return simdutf::count_utf16(utf16_string.data(), utf16_string.size());
 }
 
@@ -234,8 +213,10 @@ size_t utf16_count(std::span<const char16_t> utf16_string) {
 
 LIBSESSION_C_API size_t utf16_count_truncated_to_codepoints(
         const uint16_t* utf16_string, size_t utf16_string_len, size_t codepoint_len) {
-    return session::utf16_count_truncated_to_codepoints(
-            {reinterpret_cast<const char16_t*>(utf16_string), utf16_string_len}, codepoint_len);
+    return session::utf16_truncate(
+                   {reinterpret_cast<const char16_t*>(utf16_string), utf16_string_len},
+                   codepoint_len)
+            .size();
 }
 
 LIBSESSION_C_API size_t utf16_count(const uint16_t* utf16_string, size_t utf16_string_len) {

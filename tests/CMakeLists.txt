@@ -41,9 +41,11 @@ set(LIB_SESSION_UTESTS_SOURCES
 )
 
 if(ENABLE_NETWORKING)
+    list(APPEND LIB_SESSION_UTESTS_SOURCES test_network_config.cpp)
     list(APPEND LIB_SESSION_UTESTS_SOURCES test_network_swarm.cpp)
     list(APPEND LIB_SESSION_UTESTS_SOURCES test_onionreq.cpp)
     list(APPEND LIB_SESSION_UTESTS_SOURCES test_onion_request_router.cpp)
+    list(APPEND LIB_SESSION_UTESTS_SOURCES test_quic_transport.cpp)
     list(APPEND LIB_SESSION_UTESTS_SOURCES test_snode_pool.cpp)
 endif()
 
@@ -51,7 +53,7 @@ add_library(test_libs INTERFACE)
 
 target_link_libraries(test_libs INTERFACE
     libsession::config
-    libsodium::sodium-internal
+    sessiondep::libsodium
     nlohmann_json::nlohmann_json
     oxen::logging)
 
@@ -89,10 +91,3 @@ endif()
 
 add_executable(swarm-auth-test EXCLUDE_FROM_ALL swarm-auth-test.cpp)
 target_link_libraries(swarm-auth-test PRIVATE config)
-
-if(STATIC_BUNDLE)
-    add_executable(static-bundle-test static_bundle.cpp)
-    target_include_directories(static-bundle-test PUBLIC ../include)
-    target_link_libraries(static-bundle-test PRIVATE "${PROJECT_BINARY_DIR}/libsession-util.a" oxenc::oxenc quic)
-    add_dependencies(static-bundle-test session-util)
-endif()
