@@ -4,7 +4,9 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "session/attachments.hpp"
@@ -32,9 +34,14 @@ constexpr int16_t ERROR_FAILED_TO_QUEUE_REQUEST = -10008;
 constexpr int16_t ERROR_INVALID_DESTINATION = -10009;
 constexpr int16_t ERROR_FAILED_GENERATE_ONION_PAYLOAD = -10010;
 constexpr int16_t ERROR_FAILED_TO_GET_STREAM = -10011;
+constexpr int16_t ERROR_UNAUTHENTICATED_RESPONSE = -10012;
+constexpr int16_t ERROR_INSUFFICIENT_NODES = -10013;
 constexpr int16_t ERROR_BUILD_TIMEOUT = -10100;
 constexpr int16_t ERROR_REQUEST_CANCELLED = -10200;
 constexpr int16_t ERROR_FILE_SERVER_UNAVAILABLE = -10300;
+// A 421 whose swarm could not be corrected, so re-resolving would return the one that rejected us;
+// distinct from ERROR_MISDIRECTED_REQUEST, which means re-resolving now gives a better answer.
+constexpr int16_t ERROR_SWARM_UNRESOLVED = -10400;
 constexpr int16_t ERROR_UNKNOWN = -11000;
 
 const std::pair<std::string, std::string> content_type_plain_text = {
@@ -199,16 +206,17 @@ struct Request {
     /// Any extra request details which may modify the structure of the request.
     RequestDetails details;
 
-    /// The account whose swarm this request addresses, when it addresses one: the X25519 pubkey of
-    /// a session ID, group ID, etc.  Set it for anything sent to a swarm member *about* that
-    /// account, and leave it unset for a request merely aimed at a node (a snode cache refresh, a
-    /// clock resync), which no swarm membership applies to.
+    /// The accounts this request addresses: one entry per sub-request of a `batch` or `sequence`,
+    /// in order, or a single entry for any other request.  Each is the 32-byte pubkey an account's
+    /// swarm is computed from (a session ID or group ID without its prefix); an entry is empty for
+    /// a sub-request that isn't about an account.  A single entry applies to every sub-request.
+    /// Leave it empty for a request merely aimed at a node (a snode cache refresh, a clock resync).
     ///
-    /// Set it to have a 421's correction applied: the swarm the storage server reports in the
-    /// rejection is written into the cache for *this account*, which cannot be derived from the
-    /// node we happened to ask.  Recovering from the 421 is still the caller's -- see
+    /// Required to recover from a 421: it is what says whose swarm the redirect a 421 carries is
+    /// for.  The account a storage server names in a 421 is only checked against it, never trusted
+    /// in its place.  Network corrects the swarm but does not retry; that is the caller's -- see
     /// `Network::send_request`.
-    std::optional<session::network::x25519_pubkey> swarm_pubkey;
+    std::vector<std::optional<session::network::x25519_pubkey>> swarm_pubkeys;
 
     /// The time the request was created, this is used primarily for determining whether the
     /// `overall_timeout` has been exceeded.
@@ -321,9 +329,61 @@ using network_response_callback_t = std::function<void(
         std::vector<std::pair<std::string, std::string>> headers,
         std::optional<std::string> response)>;
 
+/// The accounts of each sub-request in a pregenerated `batch`/`sequence` body, in the form
+/// `Request::swarm_pubkeys` takes, for a request whose body was built by the caller.  A
+/// sub-request whose params name no account gets `fallback` instead: the account the caller said
+/// the request is for.  Returns nullopt when `endpoint` is neither or the body can't be parsed.
+std::optional<std::vector<std::optional<x25519_pubkey>>> batch_request_accounts(
+        std::string_view endpoint,
+        std::span<const std::byte> body,
+        std::optional<x25519_pubkey> fallback = std::nullopt);
+
 namespace response {
     std::optional<std::pair<int16_t, bool>> parse_text_error(std::string_view body);
     std::optional<int16_t> find_uniform_batch_error(std::string_view body);
+
+    /// As `find_uniform_batch_error`, for a body that has already been parsed.
+    std::optional<int16_t> uniform_batch_error(const nlohmann::json& json);
+
+    /// The status to report for a proxied response that could not be decrypted, whose status
+    /// therefore came from whichever node on the way answered rather than from the destination.
+    /// Statuses that are acted on as the destination's verdict (406, 421, 425) become
+    /// `ERROR_UNAUTHENTICATED_RESPONSE`, since any node on the path could have sent them; anything
+    /// else is returned unchanged.
+    int16_t undecrypted_status(int16_t status);
+
+    /// One result of a `batch`/`sequence` response, or the whole of any other response.
+    struct subresponse {
+        /// The result's own status code; nullopt for a response that isn't a batch, whose status
+        /// is the one it came back with.
+        std::optional<int16_t> code;
+
+        /// The result's body when it is a JSON object.  Points into the parsed response.
+        const nlohmann::json* body = nullptr;
+    };
+
+    /// The sub-responses of a parsed response: one per entry of `results` for a batch or sequence,
+    /// otherwise the response itself as the only one.  The returned bodies point into `json`.
+    std::vector<subresponse> subresponses(const nlohmann::json& json);
+
+    /// The accounts a response's 421s rejected.
+    struct swarm_rejections {
+        /// Each rejected account, with the ed25519 pubkeys of the swarm its 421 redirected it to:
+        /// empty when the 421 named no swarm.  An account with several 421s takes the first.
+        std::unordered_map<x25519_pubkey, std::vector<ed25519_pubkey>> accounts;
+
+        /// Whether a 421 could not be attributed to any account.
+        bool unattributed = false;
+    };
+
+    /// Finds the 421s in a storage server response.  `json` is its parsed body, or null when the
+    /// body isn't JSON.  `status_code` is the response's own status, which is the only status a
+    /// response that isn't a batch has.  `accounts` is the request's `swarm_pubkeys`, which each
+    /// 421 is attributed by; a 421 naming a different account than its position does is ignored.
+    swarm_rejections find_swarm_rejections(
+            const nlohmann::json* json,
+            int16_t status_code,
+            std::span<const std::optional<x25519_pubkey>> accounts);
 }  // namespace response
 
 /// One hop of a route, for showing a user where their traffic goes.  Identity and location, which

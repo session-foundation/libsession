@@ -177,10 +177,21 @@ class Network {
     void _close_connections();
     void _recalculate_status();
     void _update_status(ConnectionStatus new_status);
-    void _update_network_state(const std::string& body);
-    // Writes the swarm a 421 reported into the cache.  Does not retry: choosing another member is
-    // the caller's, since only the caller can know which node it ended up talking to.
-    void _adopt_swarm_from_421(const x25519_pubkey& swarm_pubkey, std::string_view body);
+    void _update_network_state(const nlohmann::json& json);
+
+    // An account's redirect is left empty where there was none to take.
+    response::swarm_rejections _take_swarm_redirects(
+            const Request& request, const nlohmann::json* json, int16_t status_code);
+    void _refresh_if_unredirected(const response::swarm_rejections& rejections);
+
+    // Corrects the swarm a 421 disproved, then reports the 421.  Does not retry: choosing another
+    // member is the caller's, since only the caller can know which node it ended up talking to.
+    void _handle_421(
+            Request original_request,
+            response::swarm_rejections rejections,
+            std::vector<std::pair<std::string, std::string>> headers,
+            std::optional<std::string> body,
+            network_response_callback_t final_callback);
 
     void _resync_clock(
             std::optional<Request> original_request, network_response_callback_t request_callback);
@@ -189,7 +200,7 @@ class Network {
             const uint8_t index,
             const service_node& node,
             const uint8_t total_requests);
-    void _on_clock_resync_complete(const uint8_t total_requests);
+    void _on_clock_resync_complete();
 
     Request _preprocess_request(Request request);
 };

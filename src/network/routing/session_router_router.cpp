@@ -156,7 +156,15 @@ void SessionRouter::_init() {
 
                     if (snode_pool->size() == 0)
                         // The pool outlives us, so this one keeps its weak guard.
-                        snode_pool->refresh_if_needed({}, [weak_self, this] {
+                        snode_pool->refresh_if_needed({}, [weak_self, this](bool refreshed) {
+                            // Setup finishes either way: not finishing leaves the router
+                            // permanently unusable, where finishing with an empty pool just means
+                            // the first request refreshes again
+                            if (!refreshed)
+                                log::warning(
+                                        cat,
+                                        "Finishing router setup without a refreshed snode pool.");
+
                             if (auto self = weak_self.lock())
                                 _jq.call([this] { _finish_setup(); });
                         });
@@ -649,10 +657,18 @@ void SessionRouter::_send_proxy_request(Request request, network_response_callba
                 [weak_self = weak_from_this(),
                  this,
                  req = std::move(request),
-                 cb = std::move(callback)]() {
+                 cb = std::move(callback)](bool refreshed) {
                     auto self = weak_self.lock();
                     if (!self)
                         return;
+
+                    if (!refreshed)
+                        return cb(
+                                false,
+                                false,
+                                ERROR_INSUFFICIENT_NODES,
+                                {content_type_plain_text},
+                                "Failed to refresh the snode pool to find a proxy.");
 
                     auto snode_pool = _snode_pool.lock();
                     if (!snode_pool)
@@ -667,7 +683,7 @@ void SessionRouter::_send_proxy_request(Request request, network_response_callba
                         return cb(
                                 false,
                                 false,
-                                -1,
+                                ERROR_INSUFFICIENT_NODES,
                                 {content_type_plain_text},
                                 "SnodePool refresh failed.");
 
@@ -714,32 +730,35 @@ void SessionRouter::_send_proxy_request(Request request, network_response_callba
             request.time_remaining(),
             request.overall_timeout};
 
-    auto proxy_callback =
-            [parser = std::move(parser), cb = std::move(callback)](
-                    bool success, bool timeout, int16_t status, auto headers, auto response) {
-                try {
-                    if (!success)
-                        throw std::runtime_error{response.value_or("Unknown request failure")};
-                    if (timeout)
-                        throw std::runtime_error{response.value_or("Timed out")};
-                    if (!response)
-                        throw std::runtime_error{"Unexpected empty response"};
+    auto proxy_callback = [parser = std::move(parser), cb = std::move(callback)](
+                                  bool success,
+                                  bool timeout,
+                                  int16_t status,
+                                  auto headers,
+                                  auto response) {
+        try {
+            if (!success)
+                throw std::runtime_error{response.value_or("Unknown request failure")};
+            if (timeout)
+                throw std::runtime_error{response.value_or("Timed out")};
+            if (!response)
+                throw std::runtime_error{"Unexpected empty response"};
 
-                    onionreq::DecryptedResponse decrypted = parser->decrypted_response(*response);
-                    cb(true,
-                       false,
-                       decrypted.status_code,
-                       std::move(decrypted.headers),
-                       std::move(decrypted.body));
-                } catch (const std::exception& e) {
-                    cb(false,
-                       timeout,
-                       status,
-                       std::move(headers),
-                       "Failed to handle proxied request response due to error: {}"_format(
-                               e.what()));
-                }
-            };
+            onionreq::DecryptedResponse decrypted = parser->decrypted_response(*response);
+            cb(true,
+               false,
+               decrypted.status_code,
+               std::move(decrypted.headers),
+               std::move(decrypted.body));
+        } catch (const std::exception& e) {
+            cb(false,
+               timeout,
+               response::undecrypted_status(status),
+               std::move(headers),
+               "Failed to handle proxied request response (status {}) due to error: {}"_format(
+                       status, e.what()));
+        }
+    };
 
     // Now that we have a service_node destination we can send a direct request
     _send_direct_request(std::move(proxy_request), std::move(proxy_callback));

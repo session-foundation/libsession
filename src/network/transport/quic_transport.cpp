@@ -61,7 +61,7 @@ QuicTransport::~QuicTransport() {
 void QuicTransport::suspend() {
     // Use 'call_get' to force this to be synchronous
     _jq.call_get([this] {
-        if (!_suspended)
+        if (_suspended)
             return;
 
         _suspended = true;
@@ -150,34 +150,41 @@ void QuicTransport::_recreate_endpoint() {
 }
 
 void QuicTransport::_close_connections() {
-    // Explicitly close all connections then reset the endpoint
+    // Taken out before the endpoint goes.  Resetting it destroys it on the spot (close_conns()
+    // only defers), and its destructor closes every connection with code 0 through the handler
+    // that fails whatever is pending on it - so left in place, our own close would reach each
+    // pending verification as an error code, which is what gets a node struck.  Answering copies
+    // also keeps a callback that calls back into the transport from changing the maps being walked.
+    auto verifications = std::exchange(_pending_verification_callbacks, {});
+    auto requests = std::exchange(_pending_requests, {});
+
     if (_endpoint)
         _endpoint->close_conns();
     _endpoint.reset();
-
-    // Cancel any pending verifications (they can't succeed once the connection is closed)
-    for (const auto& [pubkey, callbacks] : _pending_verification_callbacks)
-        for (const auto& callback : callbacks)
-            callback(false, -1);
-
-    // Cancel any pending requests (they can't succeed once the connection is closed)
-    for (const auto& [pubkey, pupkey_requests] : _pending_requests)
-        for (const auto& [info, callback] : pupkey_requests)
-            callback(
-                    false,
-                    false,
-                    ERROR_NETWORK_SUSPENDED,
-                    {content_type_plain_text},
-                    "QuickTransport is suspended.");
 
     // Clear all storage of requests, paths and connections so that we are in a fresh state on
     // relaunch
     _active_connection_ids.clear();
     _available_stream_ids.clear();
-    _pending_verification_callbacks.clear();
-    _pending_requests.clear();
-
     _update_status(ConnectionStatus::disconnected);
+
+    // Answered only now the transport is fully closed, so anything a callback asks of it fails
+    // cleanly, without an error code, rather than meeting half-closed state.  A verification gets
+    // no error code either: a close we asked for is no evidence against the node.
+    for (const auto& [pubkey, callbacks] : verifications)
+        for (const auto& callback : callbacks)
+            callback(false, std::nullopt);
+
+    for (const auto& [pubkey, pubkey_requests] : requests)
+        for (const auto& [info, callback] : pubkey_requests)
+            callback(
+                    false,
+                    false,
+                    (_suspended ? ERROR_NETWORK_SUSPENDED : ERROR_CONNECTION_CLOSED),
+                    {content_type_plain_text},
+                    (_suspended ? "QuickTransport is suspended."
+                                : "QuickTransport closed its connections."));
+
     log::info(cat, "Closed all connections.");
 }
 

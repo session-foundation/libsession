@@ -99,7 +99,9 @@ inline network::Request swarm_request(
             std::move(body),
             network::RequestCategory::standard_small,
             SWARM_REQUEST_TIMEOUT};
-    req.swarm_pubkey = swarm_pubkey;
+    // A single entry: every Core request is about one account, including its batches, whose
+    // sub-requests all address the same swarm
+    req.swarm_pubkeys = {swarm_pubkey};
     req.overall_timeout = SWARM_OVERALL_TIMEOUT;
     return req;
 }

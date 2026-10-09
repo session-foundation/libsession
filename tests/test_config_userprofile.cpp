@@ -9,6 +9,7 @@
 #include <session/crypto/ed25519.hpp>
 #include <session/util.hpp>
 #include <string_view>
+#include <thread>
 
 #include "../src/config/internal.hpp"
 #include "utils.hpp"

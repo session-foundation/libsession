@@ -69,6 +69,7 @@ list(APPEND LIB_SESSION_UTESTS_SOURCES
     test_network_swarm.cpp
     test_onionreq.cpp
     test_onion_request_router.cpp
+    test_quic_transport.cpp
     test_snode_pool.cpp
     test_core_network.cpp
     test_poll.cpp

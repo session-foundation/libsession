@@ -25,7 +25,7 @@ class TestOnionRequestRouter {
             std::shared_ptr<OnionRequestRouter> router,
             PathCategory category,
             std::vector<OnionPath> paths) {
-        router->_paths.emplace(category, paths);
+        router->_paths[category] = std::move(paths);
     }
 
     static std::vector<OnionPath> get_paths(
@@ -50,6 +50,20 @@ class TestOnionRequestRouter {
         return 0;
     }
 
+    static void set_cached_edge_nodes(
+            std::shared_ptr<OnionRequestRouter> router, std::vector<cached_edge_node> nodes) {
+        router->_cached_edge_nodes = std::move(nodes);
+    }
+
+    static std::vector<cached_edge_node> cached_edge_nodes(
+            std::shared_ptr<OnionRequestRouter> router) {
+        return router->_cached_edge_nodes;
+    }
+
+    static void drop_struck_cached_edge_nodes(std::shared_ptr<OnionRequestRouter> router) {
+        router->_drop_struck_cached_edge_nodes();
+    }
+
     static void build_path(
             std::shared_ptr<OnionRequestRouter> router,
             PathCategory category,
@@ -62,6 +76,21 @@ class TestOnionRequestRouter {
     static OnionPath* find_valid_path(
             std::shared_ptr<OnionRequestRouter> router, const Request& request) {
         return router->_find_valid_path(request);
+    }
+
+    static void send_on_path(
+            std::shared_ptr<OnionRequestRouter> router,
+            OnionPath& path,
+            Request request,
+            network_response_callback_t callback) {
+        router->_send_on_path(path, std::move(request), std::move(callback));
+    }
+
+    static void rotate_path(
+            std::shared_ptr<OnionRequestRouter> router,
+            const std::string& path_id,
+            PathCategory category) {
+        router->_rotate_path(path_id, category);
     }
 
     static void handle_transport_response(
@@ -148,11 +177,21 @@ namespace {
             SnodePool::record_node_failure(key, permanent);
         }
 
+        // When set, `refresh_if_needed` calls back with it straight away - as the real one does, on
+        // the loop thread, when nothing needs refreshing - instead of never calling back.  Only the
+        // first `max_refresh_callbacks` calls do, so code that asks again on every callback stops
+        // there instead of recursing until the stack gives out.
+        std::optional<bool> refresh_result;
+        int max_refresh_callbacks = 20;
+
         void refresh_if_needed(
                 const std::vector<service_node>& /*in_use_nodes*/,
-                std::function<void()> /*on_refresh_complete*/ = nullptr) override {
+                refresh_callback_t on_refresh_complete = nullptr) override {
             func_called("refresh_if_needed");
-            // Do nothing (don't want to trigger a cache refresh)
+            // Don't trigger a real cache refresh
+            if (refresh_result && on_refresh_complete &&
+                get_call_count("refresh_if_needed") <= max_refresh_callbacks)
+                on_refresh_complete(*refresh_result);
         }
 
         void get_swarm(
@@ -164,8 +203,12 @@ namespace {
             // Do nothing (don't want to trigger a cache refresh)
         }
 
+        // The `count` of each `get_unused_nodes` call, which the mock result doesn't reflect
+        std::vector<size_t> unused_node_counts;
+
         std::vector<service_node> get_unused_nodes(
                 size_t count, const std::vector<service_node>& exclude = {}) override {
+            unused_node_counts.push_back(count);
             if (check_should_ignore_and_log_call("get_unused_nodes"))
                 return {};
 
@@ -199,8 +242,19 @@ namespace {
             func_called("remove_failure_listeners");
         }
 
-        void send_request(Request, network_response_callback_t) override {
+        // Answered the way a node on the path does when it fails a request itself: a status of its
+        // own and a plaintext body, which is nothing the destination encrypted
+        std::optional<std::pair<int16_t, std::string>> plaintext_reply;
+
+        void send_request(Request /*request*/, network_response_callback_t callback) override {
             func_called("send_request");
+            if (plaintext_reply)
+                callback(
+                        false,
+                        false,
+                        plaintext_reply->first,
+                        {content_type_plain_text},
+                        plaintext_reply->second);
         }
     };
 
@@ -211,6 +265,60 @@ namespace {
         std::vector<std::pair<std::string, std::string>> headers;
         std::optional<std::string> response;
     };
+
+    config::SnodePool test_pool_config() {
+        return {.cache_directory = std::nullopt,
+                .fallback_snode_pool_path = std::nullopt,
+                .cache_expiration = std::chrono::minutes{5},
+                .cache_min_lifetime = std::chrono::minutes{5},
+                .enforce_subnet_diversity = false,
+                .retry_delay = network::opt::retry_delay{50ms, 200ms},
+                .netid = opt::netid::Target::testnet,
+                .seed_nodes = {},
+                .cache_min_size = 0,
+                .cache_min_swarm_size = 0,
+                .cache_num_nodes_to_use_for_refresh = 3,
+                .cache_min_num_refresh_presence_to_include_node = 2,
+                .cache_node_strike_threshold = 3};
+    }
+
+    config::OnionRequestRouter test_router_config() {
+        return {.file_server_config = file_server::DEFAULT_CONFIG,
+                .cache_directory = std::nullopt,
+                .edge_node_cache_duration = std::chrono::days{10},
+                .netid = opt::netid::Target::testnet,
+                .seed_nodes = {},
+                .retry_delay = network::opt::retry_delay{50ms, 200ms},
+                .path_length = 3,
+                .path_strike_threshold = 3,
+                .path_build_retry_limit = 10,
+                .path_rotation_frequency = 10min,
+                .node_strike_threshold = 3,
+                .disable_pre_build_paths = true,
+                .single_path_mode = true,
+                .min_path_counts = {{PathCategory::standard, 1}}};
+    }
+
+    service_node test_node(std::string_view pk_hex, uint16_t port) {
+        return service_node{
+                ed25519_pubkey::from_hex(pk_hex),
+                oxen::quic::ipv4{"127.0.0.1"},
+                port,
+                static_cast<uint16_t>(port + 10000),
+                {2, 11, 0},
+                0};
+    }
+
+    network_response_callback_t record_into(std::optional<Result>& result) {
+        return [&result](
+                       bool success,
+                       bool timeout,
+                       int16_t status_code,
+                       std::vector<std::pair<std::string, std::string>> headers,
+                       std::optional<std::string> response) {
+            result = {success, timeout, status_code, headers, response};
+        };
+    }
 }  // namespace
 
 TEST_CASE("Network", "[network][onion_request_router][handle_errors]") {
@@ -827,4 +935,228 @@ TEST_CASE("Network", "[network][onion_request_router][check_request_queue_timeou
     CHECK(result.timeout);
 }
 
+TEST_CASE("Network", "[network][onion_request_router][cached_edge_nodes]") {
+    const auto node_strike_threshold = 3;
+    config::SnodePool pool_config = {
+            .cache_directory = std::nullopt,
+            .fallback_snode_pool_path = std::nullopt,
+            .cache_expiration = std::chrono::minutes{5},
+            .cache_min_lifetime = std::chrono::minutes{5},
+            .enforce_subnet_diversity = false,
+            .retry_delay = network::opt::retry_delay{50ms, 200ms},
+            .netid = opt::netid::Target::testnet,
+            .seed_nodes = {},
+            .cache_min_size = 0,
+            .cache_min_swarm_size = 0,
+            .cache_num_nodes_to_use_for_refresh = 3,
+            .cache_min_num_refresh_presence_to_include_node = 2,
+            .cache_node_strike_threshold = node_strike_threshold};
+    config::OnionRequestRouter config = {
+            file_server::DEFAULT_CONFIG,
+            std::nullopt,
+            std::chrono::days{10},
+            opt::netid::Target::testnet,
+            {},
+            network::opt::retry_delay{50ms, 200ms},
+            3,
+            3,
+            10,
+            10min,
+            node_strike_threshold,
+            true,
+            true,
+            {{PathCategory::standard, 1}}};
+
+    auto ed_pk = "4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7"_hex_b;
+    auto ed_pk2 = "5ea34e72bb044654a6a23675690ef5ffaaf1656b02f93fb76655f9cbdbe89876"_hex_b;
+    auto healthy = service_node{
+            ed25519_pubkey::from_bytes(ed_pk),
+            oxen::quic::ipv4{"127.0.0.1"},
+            20001,
+            30001,
+            {2, 11, 0},
+            0};
+    auto struck = service_node{
+            ed25519_pubkey::from_bytes(ed_pk2),
+            oxen::quic::ipv4{"127.0.0.2"},
+            20002,
+            30002,
+            {2, 11, 0},
+            0};
+
+    auto loop = std::make_shared<oxen::quic::Loop>();
+    auto disk_loop = std::make_shared<oxen::quic::Loop>();
+    auto snode_pool = std::make_shared<TestSnodePool>(pool_config, *loop, *disk_loop);
+    auto transport = std::make_shared<TestTransport>();
+    auto router =
+            std::make_shared<OnionRequestRouter>(config, *loop, *disk_loop, snode_pool, transport);
+
+    auto now = std::chrono::system_clock::now();
+    TestOnionRequestRouter::set_cached_edge_nodes(
+            router, {cached_edge_node{healthy, now}, cached_edge_node{struck, now}});
+
+    // Both are well inside `edge_node_cache_duration`, which is the only thing that used to matter
+    TestOnionRequestRouter::drop_struck_cached_edge_nodes(router);
+    CHECK(TestOnionRequestRouter::cached_edge_nodes(router).size() == 2);
+
+    // A cached edge node is forced as a path's first hop without going through `get_unused_nodes`,
+    // so nothing else would apply the strike filter to it.  Striking it out has to cost it the
+    // cached-edge role outright - skipping it while keeping the entry would hand the role back when
+    // the strikes expire, long after we moved to another edge node.
+    snode_pool->SnodePool::record_node_failure(struck, true);
+    REQUIRE(snode_pool->node_struck_out(struck));
+
+    // Only the cached-edge role is lost; nothing here touches `_snode_cache`, so it stays a node
+    // like any other and `get_unused_nodes` can pick it again when its strikes expire
+    TestOnionRequestRouter::drop_struck_cached_edge_nodes(router);
+    auto remaining = TestOnionRequestRouter::cached_edge_nodes(router);
+    REQUIRE(remaining.size() == 1);
+    CHECK(remaining.front().node == healthy);
+}
+
+TEST_CASE("Network", "[network][onion_request_router][undecrypted_response]") {
+    auto target =
+            test_node("4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7", 20001);
+    auto path_nodes = std::vector<service_node>{
+            test_node("5ea34e72bb044654a6a23675690ef5ffaaf1656b02f93fb76655f9cbdbe89876", 20002),
+            test_node("e17a692033200ae41350df9709754edde7343e2cf2f23e88f993319e0720e5e5", 20003),
+            test_node("7b633fa6fb462b90db6f0f50384190ce7715e31b7aa93d87dbd7e94e33d4251f", 20004)};
+
+    auto loop = std::make_shared<oxen::quic::Loop>();
+    auto disk_loop = std::make_shared<oxen::quic::Loop>();
+    auto snode_pool = std::make_shared<TestSnodePool>(test_pool_config(), *loop, *disk_loop);
+    auto transport = std::make_shared<TestTransport>();
+    auto router = std::make_shared<OnionRequestRouter>(
+            test_router_config(), *loop, *disk_loop, snode_pool, transport);
+
+    // The router is driven on the loop, as its own code is, and checked from here
+    loop->call_get([&] {
+        TestOnionRequestRouter::set_paths(
+                router, PathCategory::standard, {OnionPath{"Test", path_nodes}});
+    });
+
+    auto send_with_reply = [&](int16_t status) {
+        transport->plaintext_reply.emplace(status, "Forged by a node on the path");
+        auto request = Request{
+                "AAAA", target, "retrieve", to_vector("{}"), RequestCategory::standard, 10s};
+
+        bool have_path = false;
+        std::optional<Result> result;
+        loop->call_get([&] {
+            if (auto* path = TestOnionRequestRouter::find_valid_path(router, request)) {
+                have_path = true;
+                TestOnionRequestRouter::send_on_path(router, *path, request, record_into(result));
+            }
+        });
+        REQUIRE(have_path);
+        REQUIRE(result);
+        return *result;
+    };
+
+    // Each of these is acted on as the destination's verdict (a swarm redirect, a clock resync),
+    // which only the destination can give; a node on the path sending one mustn't pass for it
+    for (int16_t status : {ERROR_MISDIRECTED_REQUEST, ERROR_NOT_ACCEPTABLE, ERROR_TOO_EARLY}) {
+        CAPTURE(status);
+        auto result = send_with_reply(status);
+        CHECK_FALSE(result.success);
+        CHECK(result.status_code == ERROR_UNAUTHENTICATED_RESPONSE);
+        CHECK(result.response.value_or("").find("status {}"_format(status)) != std::string::npos);
+    }
+
+    // Anything else a node on the path says about its own failure is reported as it was
+    auto result = send_with_reply(502);
+    CHECK_FALSE(result.success);
+    CHECK(result.status_code == 502);
+}
+
+TEST_CASE("Network", "[network][onion_request_router][build_path_too_few_nodes]") {
+    auto loop = std::make_shared<oxen::quic::Loop>();
+    auto disk_loop = std::make_shared<oxen::quic::Loop>();
+    auto snode_pool = std::make_shared<TestSnodePool>(test_pool_config(), *loop, *disk_loop);
+    auto transport = std::make_shared<TestTransport>();
+    auto router = std::make_shared<OnionRequestRouter>(
+            test_router_config(), *loop, *disk_loop, snode_pool, transport);
+
+    // Run on the loop, as the router's own code is: that also puts it after the router's setup,
+    // which asks for the (empty) pool to be refreshed and mustn't be counted below
+    std::optional<Result> result;
+    loop->call_get([&] {
+        snode_pool->reset_calls();
+
+        auto queue = std::make_shared<detail::TestRequestQueue>(*loop);
+        TestOnionRequestRouter::set_request_queues(router, {{PathCategory::standard, queue}});
+        queue->add(
+                Request{"AAAA",
+                        test_node(
+                                "4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7",
+                                20001),
+                        "retrieve",
+                        to_vector("{}"),
+                        RequestCategory::standard,
+                        10s},
+                record_into(result));
+
+        // A path needs three nodes and the pool can only offer one, while saying nothing needs
+        // refreshing - which is a pool too concentrated in a few subnets to fill a path, say
+        snode_pool->mock_unused_nodes = std::vector{test_node(
+                "5ea34e72bb044654a6a23675690ef5ffaaf1656b02f93fb76655f9cbdbe89876", 20002)};
+        snode_pool->refresh_result = true;
+
+        TestOnionRequestRouter::build_path(router, PathCategory::standard, "AAAA");
+    });
+
+    // Asking for a refresh once and then giving up; without checking that the pool can now fill a
+    // path, every "refreshed" rebuilt straight into another refresh request, and only the mock's
+    // limit stops it
+    CHECK(snode_pool->get_call_count("refresh_if_needed") == 1);
+    REQUIRE(result);
+    CHECK_FALSE(result->success);
+    CHECK(result->status_code == ERROR_INSUFFICIENT_NODES);
+    CHECK(result->response.value_or("").find("too few usable nodes") != std::string::npos);
+}
+
+TEST_CASE("Network", "[network][onion_request_router][rotate_path]") {
+    auto key1 = "4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7"sv;
+    auto key2 = "5ea34e72bb044654a6a23675690ef5ffaaf1656b02f93fb76655f9cbdbe89876"sv;
+    auto key3 = "e17a692033200ae41350df9709754edde7343e2cf2f23e88f993319e0720e5e5"sv;
+    auto key4 = "7b633fa6fb462b90db6f0f50384190ce7715e31b7aa93d87dbd7e94e33d4251f"sv;
+    auto edge = test_node(key1, 20001);
+    auto path_nodes = std::vector{edge, test_node(key2, 20002), test_node(key3, 20003)};
+
+    auto loop = std::make_shared<oxen::quic::Loop>();
+    auto disk_loop = std::make_shared<oxen::quic::Loop>();
+    auto snode_pool = std::make_shared<TestSnodePool>(test_pool_config(), *loop, *disk_loop);
+    auto transport = std::make_shared<TestTransport>();
+    auto config = test_router_config();
+    auto router =
+            std::make_shared<OnionRequestRouter>(config, *loop, *disk_loop, snode_pool, transport);
+    snode_pool->mock_unused_nodes =
+            std::vector{test_node(key2, 20012), test_node(key3, 20013), test_node(key4, 20014)};
+
+    // Rotates a path whose edge node was connected just now, so well inside
+    // `edge_node_cache_duration`, and returns what the rotation asked the pool for.  The first
+    // request says which it chose: a whole new path, or the rest of one that keeps the edge node.
+    auto rotate = [&] {
+        std::vector<size_t> counts;
+        loop->call_get([&] {
+            auto now = std::chrono::system_clock::now();
+            TestOnionRequestRouter::set_paths(
+                    router, PathCategory::standard, {OnionPath{"Test", path_nodes, now, now}});
+            snode_pool->unused_node_counts.clear();
+            TestOnionRequestRouter::rotate_path(router, "Test", PathCategory::standard);
+            counts = snode_pool->unused_node_counts;
+        });
+        return counts;
+    };
+
+    auto kept = rotate();
+    REQUIRE_FALSE(kept.empty());
+    CHECK(kept.front() == config.path_length - 1u);
+
+    // Struck out since we connected to it, the edge node is replaced along with the rest
+    snode_pool->record_node_failure(edge, true);
+    auto replaced = rotate();
+    REQUIRE_FALSE(replaced.empty());
+    CHECK(replaced.front() == config.path_length);
+}
 }  // namespace session::network

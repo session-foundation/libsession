@@ -41,7 +41,10 @@ struct service_node {
     uint16_t omq_port;
     std::array<uint16_t, 3> storage_server_version;
     swarm_id_t swarm_id;
-    uint64_t requested_unlock_height;
+
+    // -1 when we don't know: most sources (the binary pool format, the on-disk cache, swarm
+    // responses) carry no unlock information at all, and 0 would claim they said "not requested".
+    int64_t requested_unlock_height = -1;
 
     oxen::quic::RemoteAddress to_https_address() const {
         return oxen::quic::RemoteAddress{remote_pubkey.view(), ip, https_port};

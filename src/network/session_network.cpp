@@ -1,6 +1,7 @@
 #include "session/network/session_network.hpp"
 
 #include <oxenc/base64.h>
+#include <oxenc/hex.h>
 
 #include <chrono>
 #include <future>
@@ -375,12 +376,14 @@ void Network::suspend() {
     _jq->call_get([this] {
         _suspended = true;
 
+        // The router before the transport, so that it has let go of its path builds and failure
+        // listeners before the transport closes the connections they're attached to
         if (_snode_pool)
             _snode_pool->suspend();
-        if (_transport)
-            _transport->suspend();
         if (_router)
             _router->suspend();
+        if (_transport)
+            _transport->suspend();
 
         _close_connections();
     });
@@ -492,8 +495,30 @@ void Network::get_random_nodes(
             std::vector<service_node> nodes_to_exclude = _router->get_all_used_nodes();
 
             return _snode_pool->refresh_if_needed(
-                    nodes_to_exclude,
-                    [this, count, cb = std::move(cb)] { get_random_nodes(count, cb); });
+                    nodes_to_exclude, [this, count, cb = std::move(cb)](bool refreshed) {
+                        if (!refreshed) {
+                            log::warning(
+                                    cat,
+                                    "Cannot get {} random nodes: the pool could not be refreshed.",
+                                    count);
+                            return cb({});
+                        }
+
+                        // `refreshed` includes nothing having needed refreshing, which calls back
+                        // inline, so asking again of a pool that can't supply `count` would
+                        // re-enter this branch until the stack gives out
+                        auto nodes = _snode_pool->get_unused_nodes(count);
+                        if (nodes.size() < count) {
+                            log::warning(
+                                    cat,
+                                    "Cannot get {} random nodes: the pool has only {} to give.",
+                                    count,
+                                    nodes.size());
+                            return cb({});
+                        }
+
+                        cb(std::move(nodes));
+                    });
         }
         cb(unused_nodes);
     });
@@ -537,19 +562,33 @@ void Network::send_request(Request request, network_response_callback_t callback
             const auto dest_is_snode =
                     std::holds_alternative<service_node>(original_req.destination);
 
+            // Parsed once for everything below, since a retrieve's body can be large
+            std::optional<nlohmann::json> json;
+            if (body)
+                if (auto parsed = nlohmann::json::parse(*body, nullptr, false);
+                    !parsed.is_discarded())
+                    json = std::move(parsed);
+
             // If we got a successful response (with a body) and the request was sent to a
             // service node then we should update the network state based on the response
             // (Note: we don't want to do this for server requests because they could
             // include values in different formats, eg. the "Session Network" API returns
             // `t` in seconds)
-            if (success && body && dest_is_snode)
-                _update_network_state(*body);
+            if (success && json && dest_is_snode)
+                _update_network_state(*json);
 
             int16_t final_status_code = status_code;
 
-            if (body)
-                if (auto uniform_error = response::find_uniform_batch_error(*body))
+            if (json)
+                if (auto uniform_error = response::uniform_batch_error(*json))
                     final_status_code = *uniform_error;
+
+            // Taken from every snode response rather than only a 421 one: a batch can be
+            // rejected for some accounts and answered for others
+            response::swarm_rejections rejections;
+            if (dest_is_snode)
+                rejections =
+                        _take_swarm_redirects(original_req, json ? &*json : nullptr, status_code);
 
             // If we got a 406 from a snode, or a 425 from a server, then the device clock
             // is out of sync so we need to kick off a clock resync request
@@ -559,13 +598,17 @@ void Network::send_request(Request request, network_response_callback_t callback
                 return;
             }
 
-            // A 421 says this node does not hold the account we asked about, and its body
-            // carries the swarm that does.  Take the correction -- it is our cache and the
-            // answer is authoritative -- but do not act on it: which member to ask next,
-            // and whether to ask at all, is the caller's to decide, and only the caller
-            // can know which node it ended up talking to.
-            if (final_status_code == 421 && dest_is_snode && original_req.swarm_pubkey && body)
-                _adopt_swarm_from_421(*original_req.swarm_pubkey, *body);
+            if (final_status_code == ERROR_MISDIRECTED_REQUEST) {
+                _handle_421(
+                        std::move(original_req),
+                        std::move(rejections),
+                        std::move(headers),
+                        std::move(body),
+                        std::move(cb));
+                return;
+            }
+
+            _refresh_if_unredirected(rejections);
 
             // `final_status_code`, not the raw one: a batch whose subrequests all failed
             // the same way arrives here as a transport-level 200, and reporting that
@@ -691,10 +734,13 @@ void Network::download(DownloadRequest request) {
 // MARK: Internal Logic
 
 void Network::_close_connections() {
-    if (_transport)
-        _transport->close_connections();
+    // The router first, for the same reason as in `suspend`: otherwise each edge connection the
+    // transport closes fires a failure listener into a live router, which retires the path and
+    // starts rebuilding it
     if (_router)
         _router->close_connections();
+    if (_transport)
+        _transport->close_connections();
 
     _recalculate_status();
     log::info(cat, "Closed all connections.");
@@ -787,44 +833,22 @@ Request Network::_preprocess_request(Request request) {
     return request;
 }
 
-void Network::_update_network_state(const std::string& body) {
-    // Not every storage server endpoint answers in JSON: `monitor` is handled outside the RPC
-    // dispatch and replies with bt, which carries no clock or fork versions to read anyway.
-    // Recognised rather than parsed and complained about, since a subscription renews on a timer
-    // and would otherwise log a warning every time.
-    if (!body.empty() && (body.front() == 'd' || body.front() == 'l'))
-        return;
-
+void Network::_update_network_state(const nlohmann::json& json) {
     try {
-        auto json = nlohmann::json::parse(body);
         const nlohmann::json* target_json = &json;
 
         // If it was a batch/sequence request then take the one with the highest "t" value as that
         // would have been the one which was returned last
-        if (json.contains("results") && json["results"].is_array()) {
-            log::trace(cat, "Parsing batch response for latest network state.");
+        int64_t max_t = -1;
+        for (const auto& sub : response::subresponses(json)) {
+            if (!sub.body)
+                continue;
 
-            int64_t max_t = -1;
-            const nlohmann::json* latest_body = nullptr;
-
-            for (const auto& result : json["results"]) {
-                if (!result.is_object() || !result.contains("body") || !result["body"].is_object())
-                    continue;
-
-                const auto& result_body = result["body"];
-
-                if (result_body.contains("t") && result_body["t"].is_number()) {
-                    int64_t current_t = result_body["t"].get<int64_t>();
-
-                    if (current_t > max_t) {
-                        max_t = current_t;
-                        latest_body = &result_body;
-                    }
+            if (auto t = sub.body->find("t"); t != sub.body->end() && t->is_number())
+                if (auto current_t = t->get<int64_t>(); current_t > max_t) {
+                    max_t = current_t;
+                    target_json = sub.body;
                 }
-            }
-
-            if (latest_body)
-                target_json = latest_body;
         }
 
         // Update hardfork/softfork versions
@@ -873,46 +897,99 @@ void Network::_update_network_state(const std::string& body) {
 
 // MARK: Specific Error Handling
 
-// Takes the swarm a 421 hands back and writes it into the cache, so that whoever decides to try
-// again resolves against the corrected membership rather than the stale one that misdirected us.
-//
-// Only the cache is touched.  Choosing another member, or giving up, is the caller's: it is the
-// only party that can know which node it ended up talking to, and a substitution made down here
-// is invisible to it.
-void Network::_adopt_swarm_from_421(const x25519_pubkey& swarm_pubkey, std::string_view body) {
-    try {
-        auto json = nlohmann::json::parse(body);
+// A node that rejects a request for an account usually names the swarm it actually belongs to.
+// Taking its word (bounded - see `record_swarm_redirect`) fixes the one mapping we know is wrong,
+// where refreshing has every client of a changed swarm fetch the full node list for it.
+response::swarm_rejections Network::_take_swarm_redirects(
+        const Request& request, const nlohmann::json* json, int16_t status_code) {
+    auto rejections = response::find_swarm_rejections(json, status_code, request.swarm_pubkeys);
 
-        // A batch collapses to a uniform 421, in which case the swarm sits inside the first
-        // subrequest's body rather than at the top level.
-        if (auto results = json.find("results");
-            results != json.end() && results->is_array() && !results->empty())
-            if (auto b = results->front().find("body"); b != results->front().end())
-                json = *b;
+    for (auto& [account, keys] : rejections.accounts)
+        if (!keys.empty() && !_snode_pool->record_swarm_redirect(account, keys))
+            keys.clear();
 
-        auto snodes = json.find("snodes");
-        if (snodes == json.end() || !snodes->is_array() || snodes->empty())
-            return;
+    return rejections;
+}
 
-        std::vector<service_node> nodes;
-        nodes.reserve(snodes->size());
-        for (const auto& n : *snodes)
-            nodes.push_back(service_node::from_json(n));
+// With no usable redirect the pool itself is the only thing that can put a rejection right, and
+// one refresh re-resolves every account at once
+void Network::_refresh_if_unredirected(const response::swarm_rejections& rejections) {
+    for (const auto& [account, keys] : rejections.accounts)
+        if (keys.empty())
+            return _snode_pool->invalidate_swarm(account);
+}
 
-        swarm::swarm_id_t swarm_id = swarm::INVALID_SWARM_ID;
-        if (auto s = json.find("swarm"); s != json.end() && s->is_string())
-            swarm_id = std::stoull(s->get<std::string>(), nullptr, 16);
+// The caller retries a 421 by re-resolving the account's swarm, so the 421 is reported only once
+// that would give a different answer: straight away when a redirect was taken, and after the
+// refresh when one has to run.  A rejection nothing can correct is reported as
+// ERROR_SWARM_UNRESOLVED instead, because re-resolving it would return the swarm that just
+// rejected us.
+void Network::_handle_421(
+        Request original_request,
+        response::swarm_rejections rejections,
+        std::vector<std::pair<std::string, std::string>> headers,
+        std::optional<std::string> body,
+        network_response_callback_t final_callback) {
+    // Only a node's rejection says anything about a swarm
+    if (!std::holds_alternative<service_node>(original_request.destination))
+        return final_callback(
+                false, false, ERROR_MISDIRECTED_REQUEST, std::move(headers), std::move(body));
 
+    if (rejections.accounts.empty()) {
+        log::warning(
+                cat,
+                "Request {} received 421 but names no account to re-resolve.",
+                original_request.request_id);
+        return final_callback(
+                false,
+                false,
+                ERROR_SWARM_UNRESOLVED,
+                {content_type_plain_text},
+                "421 Misdirected Request for a request with no swarm");
+    }
+
+    // A retry goes to a single swarm, which a batch spanning several accounts doesn't have.  Their
+    // redirects are already taken, so the next request for each goes to the right place.
+    if (rejections.accounts.size() > 1 || rejections.unattributed) {
         log::info(
                 cat,
-                "Adopting the {}-node swarm a 421 reported for {}",
-                nodes.size(),
-                swarm_pubkey.hex());
-
-        _snode_pool->set_swarm(swarm_pubkey, swarm_id, std::move(nodes));
-    } catch (const std::exception& e) {
-        log::warning(cat, "Could not read the swarm out of a 421 response: {}", e.what());
+                "Request {} received 421s for {} accounts.",
+                original_request.request_id,
+                rejections.accounts.size());
+        _refresh_if_unredirected(rejections);
+        return final_callback(
+                false, false, ERROR_MISDIRECTED_REQUEST, std::move(headers), std::move(body));
     }
+
+    auto [swarm_pubkey, redirect] = *rejections.accounts.begin();
+
+    if (!redirect.empty())
+        return final_callback(
+                false, false, ERROR_MISDIRECTED_REQUEST, std::move(headers), std::move(body));
+
+    log::info(
+            cat,
+            "Request {} received 421 with no usable redirect; re-resolving the swarm of {}.",
+            original_request.request_id,
+            swarm_pubkey.hex());
+
+    _snode_pool->invalidate_swarm(
+            swarm_pubkey,
+            [cb = std::move(final_callback), headers = std::move(headers), body = std::move(body)](
+                    bool swarm_resolved) mutable {
+                // Without a re-resolve there is nothing better than the mapping the 421 disproved
+                // - a redirect naming any node we know would have been taken instead.  The
+                // refresh has been asked for, and the account's next rejection asks again.
+                if (!swarm_resolved)
+                    return cb(
+                            false,
+                            false,
+                            ERROR_SWARM_UNRESOLVED,
+                            {content_type_plain_text},
+                            "421 Misdirected Request, and the swarm could not be re-resolved");
+
+                cb(false, false, ERROR_MISDIRECTED_REQUEST, std::move(headers), std::move(body));
+            });
 }
 
 void Network::_resync_clock(
@@ -968,7 +1045,20 @@ void Network::_resync_clock(
 
     // Refresh the snode pool if needed to ensure we have the most up-to-date cache
     std::vector<service_node> nodes_to_exclude = _router->get_all_used_nodes();
-    _snode_pool->refresh_if_needed(std::move(nodes_to_exclude), [this, request_id] {
+    _snode_pool->refresh_if_needed(std::move(nodes_to_exclude), [this, request_id](bool refreshed) {
+        // `_current_clock_resync_id` was set before this call, so giving up without clearing it
+        // blocks every later resync attempt for the life of the process and strands everything
+        // queued behind it.  Completing with no results takes the existing "resync finished,
+        // successful or not" path, which does both and leaves the offset we already had alone -
+        // an old offset beats none, and this says nothing about whether it was right.
+        if (!refreshed) {
+            log::warning(
+                    cat,
+                    "[Request {}] Abandoning clock resync: the snode pool could not be refreshed.",
+                    request_id);
+            return _on_clock_resync_complete();
+        }
+
         // Pick the random nodes we want to use for retrying (these won't change for this resync
         // attempt)
         auto resync_nodes =
@@ -1075,11 +1165,11 @@ void Network::_launch_next_clock_out_of_sync_request(
                 // If we've received all the results then we need to process them and complete the
                 // resync
                 if (_clock_resync_results.size() >= total_requests)
-                    _on_clock_resync_complete(total_requests);
+                    _on_clock_resync_complete();
             });
 }
 
-void Network::_on_clock_resync_complete(const uint8_t /*total_requests*/) {
+void Network::_on_clock_resync_complete() {
 
     auto raw_results = std::move(_clock_resync_results);
     auto refresh_id = std::move(*_current_clock_resync_id);
@@ -1690,8 +1780,17 @@ LIBSESSION_C_API void session_network_send_request(
                 std::nullopt,
                 request_id};
 
+        std::optional<x25519_pubkey> swarm_pubkey;
         if (params->swarm_pubkey_hex)
-            request.swarm_pubkey = x25519_pubkey::from_hex({params->swarm_pubkey_hex, 64});
+            swarm_pubkey = x25519_pubkey::from_hex({params->swarm_pubkey_hex, 64});
+
+        std::optional<std::vector<std::optional<x25519_pubkey>>> batch_accounts;
+        if (request.body)
+            batch_accounts = batch_request_accounts(request.endpoint, *request.body, swarm_pubkey);
+        if (batch_accounts)
+            request.swarm_pubkeys = std::move(*batch_accounts);
+        else if (swarm_pubkey)
+            request.swarm_pubkeys = {*swarm_pubkey};
 
         auto cpp_callback = [c_cb = callback, c_ctx = ctx](
                                     bool success,

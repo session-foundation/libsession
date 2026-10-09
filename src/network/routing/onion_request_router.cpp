@@ -333,7 +333,12 @@ OnionRequestRouter::OnionRequestRouter(
 
         if (snode_pool->size() == 0)
             // The pool outlives us, so this one keeps a weak guard rather than a bare `this`.
-            snode_pool->refresh_if_needed({}, [weak_self = weak_from_this(), this] {
+            snode_pool->refresh_if_needed({}, [weak_self = weak_from_this(), this](bool refreshed) {
+                // Setup finishes either way: not finishing leaves the router permanently unusable,
+                // where finishing with an empty pool just means the first request refreshes again
+                if (!refreshed)
+                    log::warning(cat, "Finishing router setup without a refreshed snode pool.");
+
                 if (auto self = weak_self.lock())
                     _jq.call([this] { _finish_setup(); });
             });
@@ -667,9 +672,37 @@ void OnionRequestRouter::_finish_setup() {
     }
 }
 
+// A cached edge node is handed to `_build_path` as a forced first hop, so it is the one node in a
+// path that never passes the strike filter `get_unused_nodes` applies to the rest, and the only
+// thing that dropped it was `edge_node_cache_duration` (10 days).
+//
+// Being struck out costs it the cached-edge-node role, not its place in the pool: it stays a node
+// like any other and `get_unused_nodes` can pick it again once its strikes expire.  Keeping the
+// entry and merely skipping it would hand the role back at that expiry, by which point we have been
+// running on a different edge node for two days - that is a second change of first hop, not a
+// return to a stable one.
+void OnionRequestRouter::_drop_struck_cached_edge_nodes() {
+    auto snode_pool = _snode_pool.lock();
+
+    if (!snode_pool)
+        return;
+
+    std::erase_if(_cached_edge_nodes, [&snode_pool](const auto& cached) {
+        if (!snode_pool->node_struck_out(cached.node))
+            return false;
+
+        log::debug(
+                cat,
+                "Dropping cached edge node {}, it has been struck out.",
+                cached.node.to_string());
+        return true;
+    });
+}
+
 void OnionRequestRouter::_pre_build_paths_if_needed() {
     if (!_config.disable_pre_build_paths) {
         log::info(cat, "Pre-building initial paths.");
+        _drop_struck_cached_edge_nodes();
         std::vector<cached_edge_node> edge_nodes = _cached_edge_nodes;
 
         if (_config.single_path_mode) {
@@ -1223,14 +1256,60 @@ void OnionRequestRouter::_build_path(
 
         snode_pool->refresh_if_needed(
                 nodes_to_exclude,
-                [weak_self = weak_from_this(),
-                 this,
-                 category,
-                 initiating_req_id,
-                 nodes_to_exclude]() {
+                [weak_self = weak_from_this(), this, category, initiating_req_id, nodes_to_exclude](
+                        bool refreshed) {
                     auto self = weak_self.lock();
                     if (!self)
                         return;
+
+                    // Rebuilding lands back in this same branch unless the pool can now fill a
+                    // path, and `refreshed` includes nothing having needed refreshing, which calls
+                    // back inline - so rebuilding without checking first recurses until the stack
+                    // gives out
+                    std::optional<std::string_view> cannot_build;
+                    if (!refreshed)
+                        cannot_build = "the snode pool could not be refreshed";
+                    else if (auto pool = _snode_pool.lock();
+                             !pool ||
+                             pool->get_unused_nodes(_config.path_length, nodes_to_exclude).size() <
+                                     _config.path_length)
+                        cannot_build = "the snode pool has too few usable nodes";
+
+                    if (cannot_build) {
+                        log::error(
+                                cat,
+                                "[Request {}]: Cannot build a path, {}.",
+                                initiating_req_id.value_or("internal"),
+                                *cannot_build);
+                        _update_status();
+
+                        auto queue_it = _request_queues.find(category);
+                        if (queue_it == _request_queues.end()) {
+                            log::critical(
+                                    cat,
+                                    "No request queue for category '{}'.",
+                                    to_string(category, _config.single_path_mode));
+                            return;
+                        }
+
+                        if (!queue_it->second->is_empty()) {
+                            auto to_fail = queue_it->second->pop_all();
+                            log::error(
+                                    cat,
+                                    "Failing {} queued requests for '{}' paths; {}.",
+                                    to_fail.size(),
+                                    to_string(category, _config.single_path_mode),
+                                    *cannot_build);
+
+                            for (const auto& [req, cb] : to_fail)
+                                cb(false,
+                                   false,
+                                   ERROR_INSUFFICIENT_NODES,
+                                   {content_type_plain_text},
+                                   "Cannot build a path: {}."_format(*cannot_build));
+                        }
+                        return;
+                    }
 
                     log::info(
                             cat,
@@ -1636,51 +1715,49 @@ void OnionRequestRouter::_send_on_path(
         return;
     }
 
-    auto decryption_callback = [weak_self = weak_from_this(),
-                                this,
-                                parser = std::move(parser),
-                                path_id = path.id,
-                                original_request = std::move(request),
-                                cb = std::move(callback)](
-                                       bool success,
-                                       bool timeout,
-                                       int16_t status,
-                                       auto headers,
-                                       auto response) {
-        auto self = weak_self.lock();
-        if (!self)
-            return;
+    auto decryption_callback =
+            [weak_self = weak_from_this(),
+             this,
+             parser = std::move(parser),
+             path_id = path.id,
+             original_request = std::move(request),
+             cb = std::move(callback)](
+                    bool success, bool timeout, int16_t status, auto headers, auto response) {
+                auto self = weak_self.lock();
+                if (!self)
+                    return;
 
-        try {
-            if (!success)
-                throw std::runtime_error{response.value_or("Unknown request failure")};
-            if (timeout)
-                throw std::runtime_error{response.value_or("Timed out")};
-            if (!response)
-                throw std::runtime_error{"Unexpected empty response"};
+                try {
+                    if (!success)
+                        throw std::runtime_error{response.value_or("Unknown request failure")};
+                    if (timeout)
+                        throw std::runtime_error{response.value_or("Timed out")};
+                    if (!response)
+                        throw std::runtime_error{"Unexpected empty response"};
 
-            onionreq::DecryptedResponse decrypted = parser->decrypted_response(*response);
-            _handle_transport_response(
-                    path_id,
-                    std::move(original_request),
-                    true,
-                    false,
-                    decrypted.status_code,
-                    std::move(decrypted.headers),
-                    std::move(decrypted.body),
-                    std::move(cb));
-        } catch (const std::exception& e) {
-            _handle_transport_response(
-                    path_id,
-                    std::move(original_request),
-                    false,
-                    timeout,
-                    status,
-                    std::move(headers),
-                    std::move("Failed to handle onion response due to error: {}"_format(e.what())),
-                    std::move(cb));
-        }
-    };
+                    onionreq::DecryptedResponse decrypted = parser->decrypted_response(*response);
+                    _handle_transport_response(
+                            path_id,
+                            std::move(original_request),
+                            true,
+                            false,
+                            decrypted.status_code,
+                            std::move(decrypted.headers),
+                            std::move(decrypted.body),
+                            std::move(cb));
+                } catch (const std::exception& e) {
+                    _handle_transport_response(
+                            path_id,
+                            std::move(original_request),
+                            false,
+                            timeout,
+                            response::undecrypted_status(status),
+                            std::move(headers),
+                            "Failed to handle onion response (status {}) due to error: {}"_format(
+                                    status, e.what()),
+                            std::move(cb));
+                }
+            };
 
     transport->send_request(std::move(onion_request), std::move(decryption_callback));
 }
@@ -2198,13 +2275,14 @@ void OnionRequestRouter::_rotate_path(const std::string& path_id, PathCategory c
     }
 
     // Get enough nodes for the path (if the edge node has been used for longer than the cache
-    // duration then we should create an entirely new path, otherwise we should try to reuse the
-    // edge node)
+    // duration, or has been struck out since we connected to it, then we should create an entirely
+    // new path, otherwise we should try to reuse the edge node)
     auto now = std::chrono::system_clock::now();
     auto rotate_at = (std::chrono::steady_clock::now() + _config.path_rotation_frequency);
     std::vector<service_node> rotated_path_nodes;
 
-    if (now > path.edge_first_connected_at + _config.edge_node_cache_duration)
+    if (now > path.edge_first_connected_at + _config.edge_node_cache_duration ||
+        snode_pool->node_struck_out(edge_node))
         rotated_path_nodes = snode_pool->get_unused_nodes(_config.path_length, nodes_to_exclude);
     else {
         rotated_path_nodes =
