@@ -64,7 +64,7 @@ struct Config {
     // Quic Transport Options
     std::chrono::milliseconds quic_handshake_timeout{3s};
     std::chrono::seconds quic_keep_alive{10s};
-    bool quic_disable_mtu_discovery = false;
+    std::optional<size_t> quic_max_udp_payload;
 
     template <typename... Opt>
         requires(sizeof...(Opt) > 0 && (opt::is_option<std::decay_t<Opt>> && ...))
@@ -115,6 +115,7 @@ struct Config {
     // Quic transport options
     void handle_config_opt(opt::quic_handshake_timeout qht);
     void handle_config_opt(opt::quic_keep_alive qka);
+    void handle_config_opt(opt::quic_max_udp_payload qmup);
     void handle_config_opt(opt::quic_disable_mtu_discovery qdmd);
 
     // Onion request router options

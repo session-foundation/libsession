@@ -236,7 +236,7 @@ LIBSESSION_C_API int groups_info_set_description(config_object* conf, const char
 ///   the struct name, this is the group's profile pic).
 LIBSESSION_C_API user_profile_pic groups_info_get_pic(const config_object* conf) {
     user_profile_pic p;
-    if (auto pic = unbox<groups::Info>(conf)->get_profile_pic(); pic) {
+    if (auto pic = unbox<groups::Info>(conf)->get_profile_pic()) {
         copy_c_str(p.url, pic.url);
         std::memcpy(p.key, pic.key.data(), 32);
     } else {

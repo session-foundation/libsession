@@ -1,4 +1,5 @@
 #include <fmt/core.h>
+#include <oxenc/bt_serialize.h>
 #include <sodium/crypto_aead_xchacha20poly1305.h>
 #include <sodium/crypto_sign_ed25519.h>
 
@@ -246,6 +247,61 @@ TEST_CASE("Multi-recipient encryption, simpler interface", "[encrypt][multi][sim
                                session::to_span(x_keys[0].first),
                                session::to_span(x_keys[0].second),
                                "test suite"));
+
+    auto padded = session::encrypt_for_multiple_simple(
+            msgs[0],
+            session::to_view_vector(std::next(recipients.begin()), std::prev(recipients.end())),
+            session::to_span(x_keys[0].first),
+            session::to_span(x_keys[0].second),
+            "test suite",
+            nonce,
+            4);
+
+    oxenc::bt_dict_consumer padded_dict{padded};
+    auto padded_list = padded_dict.require<oxenc::bt_list_consumer>("e");
+    std::vector<size_t> padded_sizes;
+    while (!padded_list.is_finished())
+        padded_sizes.push_back(padded_list.consume<std::span<const unsigned char>>().size());
+
+    CHECK(padded_sizes ==
+          std::vector<size_t>(4, msgs[0].size() + crypto_aead_xchacha20poly1305_ietf_ABYTES));
+
+    auto padded_message = session::decrypt_for_multiple_simple(
+            padded,
+            session::to_span(x_keys[3].first),
+            session::to_span(x_keys[3].second),
+            session::to_span(x_keys[0].second),
+            "test suite");
+    REQUIRE(padded_message);
+    CHECK(session::to_string(*padded_message) == msgs[0]);
+
+    auto empty_padded = session::encrypt_for_multiple_simple(
+            std::string_view{},
+            session::to_view_vector(
+                    std::next(recipients.begin()), std::next(recipients.begin(), 2)),
+            session::to_span(x_keys[0].first),
+            session::to_span(x_keys[0].second),
+            "test suite",
+            nonce,
+            4);
+
+    oxenc::bt_dict_consumer empty_padded_dict{empty_padded};
+    auto empty_padded_list = empty_padded_dict.require<oxenc::bt_list_consumer>("e");
+    std::vector<size_t> empty_padded_sizes;
+    while (!empty_padded_list.is_finished())
+        empty_padded_sizes.push_back(
+                empty_padded_list.consume<std::span<const unsigned char>>().size());
+
+    CHECK(empty_padded_sizes == std::vector<size_t>(4, crypto_aead_xchacha20poly1305_ietf_ABYTES));
+
+    auto empty_message = session::decrypt_for_multiple_simple(
+            empty_padded,
+            session::to_span(x_keys[1].first),
+            session::to_span(x_keys[1].second),
+            session::to_span(x_keys[0].second),
+            "test suite");
+    REQUIRE(empty_message);
+    CHECK(empty_message->empty());
 
     auto m1 = session::decrypt_for_multiple_simple(
             encrypted,

@@ -609,9 +609,19 @@ std::unordered_set<std::string> ConfigBase::_merge(
             // seqno increment.
             /* do nothing */
         } else {
-            _config = std::move(new_conf);
             assert(((old_seqno == 0 && mine.empty()) || !superconf_is_mine) &&
                    *superconf < all_hashes.size());
+            if (_state == ConfigState::Dirty) {
+                // Because we were dirty, new_conf was built as a MutableConfigMessage, which
+                // unconditionally increments the seqno past the adopted config's own value.  But we
+                // are adopting an incoming, already-stored message as-is, so we must land on *its*
+                // seqno/hash (exactly as a non-dirty merge would); re-parse it to get an
+                // unincremented copy.
+                _config = std::make_unique<ConfigMessage>(
+                        all_confs[*superconf], _config->verifier, _config->signer, config_lags());
+            } else {
+                _config = std::move(new_conf);
+            }
             set_state(ConfigState::Clean);
             _curr_hashes.clear();
             auto& hashes = all_hashes[*superconf];

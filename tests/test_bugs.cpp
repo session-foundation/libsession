@@ -188,7 +188,9 @@ TEST_CASE("Merge config matching local changse", "[config][merge_matching_dirty]
                         "0511111111111111111111111111111111111111111111111111111111111111{:02}", i),
                 fmt::format("barney{}", i));
         auto [seqno_i, data_i, obs_i] = c1.push();
-        REQUIRE(seqno_i == i);
+        // One behind i because the first merge above adopted c2's identical config at c2's own
+        // seqno rather than consuming a new one.
+        REQUIRE(seqno_i == i - 1);
         c1.confirm_pushed(seqno_i, {"fakehash" + std::to_string(i)});
         CHECK_FALSE(c1.needs_push());
         CHECK_FALSE(c1.is_dirty());
@@ -212,4 +214,83 @@ TEST_CASE("Merge config matching local changse", "[config][merge_matching_dirty]
     CHECK(c1.needs_push());                 // there are still changes after the merge
     CHECK(c1.is_dirty());
     CHECK_FALSE(c1.is_clean());
+}
+
+// When we are dirty and merge an incoming config that makes the identical change, we adopt the
+// incoming message as-is: same data, same seqno, standing behind its storage hash.  There was a bug
+// where the adoption consumed an extra seqno that no stored message occupies, so that the peer's
+// *next* ordinary change (correctly landing on the value we had burned) looked like a conflict:
+// merging it produced a pointless conflict-resolution push instead of a clean adoption.
+TEST_CASE("Merge matching local changes adopts without consuming a seqno", "[config][merge]") {
+    const auto seed = "0123456789abcdef0123456789abcdef00000000000000000000000000000000"_hexbytes;
+    std::array<unsigned char, 32> ed_pk;
+    std::array<unsigned char, 64> ed_sk;
+    crypto_sign_ed25519_seed_keypair(
+            ed_pk.data(), ed_sk.data(), reinterpret_cast<const unsigned char*>(seed.data()));
+
+    session::config::Contacts c1{session::to_span(seed), std::nullopt};
+    c1.set_name("050000000000000000000000000000000000000000000000000000000000000000", "alfonso");
+    auto [seqno1, data1, obs1] = c1.push();
+    REQUIRE(seqno1 == 1);
+    c1.confirm_pushed(seqno1, {"fakehash1"});
+
+    auto dump1 = c1.dump();
+    session::config::Contacts c2{session::to_span(seed), dump1};
+
+    // Both devices make the same change; c2 gets its push in first.
+    c1.set_name("051111111111111111111111111111111111111111111111111111111111111111", "barney");
+    c2.set_name("051111111111111111111111111111111111111111111111111111111111111111", "barney");
+
+    auto [seqno2, data2, obs2] = c2.push();
+    REQUIRE(seqno2 == 2);
+    c2.confirm_pushed(seqno2, {"fakehash2"});
+
+    REQUIRE(c1.is_dirty());
+    auto r = c1.merge(std::vector<std::pair<std::string, std::span<const unsigned char>>>{
+            {{"fakehash2"s, session::to_span(data2[0])}}});
+    CHECK(r == std::unordered_set{{"fakehash2"s}});
+    CHECK(c1.is_clean());
+    CHECK_FALSE(c1.needs_push());
+    CHECK(c1.curr_hashes() == std::unordered_set{{"fakehash2"s}});
+
+    // c2, still on seqno 2, makes an ordinary change of its own; c1 must accept it as a clean
+    // adoption at seqno 3, not as a conflict with a phantom seqno 3 of c1's.
+    c2.set_name("052222222222222222222222222222222222222222222222222222222222222222", "carl");
+    auto [seqno3, data3, obs3] = c2.push();
+    REQUIRE(seqno3 == 3);
+    c2.confirm_pushed(seqno3, {"fakehash3"});
+
+    r = c1.merge(std::vector<std::pair<std::string, std::span<const unsigned char>>>{
+            {{"fakehash3"s, session::to_span(data3[0])}}});
+    CHECK(r == std::unordered_set{{"fakehash3"s}});
+    CHECK(c1.is_clean());
+    CHECK_FALSE(c1.needs_push());
+    CHECK(c1.curr_hashes() == std::unordered_set{{"fakehash3"s}});
+    CHECK(c1.get("052222222222222222222222222222222222222222222222222222222222222222")
+                  .value()
+                  .name == "carl");
+
+    // A new change by c1 must consume seqno 4, agreeing with c2's numbering, and obsolete exactly
+    // the messages both devices know about.
+    c1.set_name("053333333333333333333333333333333333333333333333333333333333333333", "dora");
+    auto [seqno4, data4, obs4] = c1.push();
+    CHECK(seqno4 == 4);
+    CHECK(as_set(obs4) == make_set("fakehash1"s, "fakehash2"s, "fakehash3"s));
+
+    // Same identical-change situation, but the peer had already pushed a further change on top by
+    // the time we merge: both messages arrive together and we adopt the newest at its own seqno.
+    session::config::Contacts c3{session::to_span(seed), dump1};
+    c3.set_name("051111111111111111111111111111111111111111111111111111111111111111", "barney");
+    REQUIRE(c3.is_dirty());
+    r = c3.merge(std::vector<std::pair<std::string, std::span<const unsigned char>>>{
+            {{"fakehash2"s, session::to_span(data2[0])},
+             {"fakehash3"s, session::to_span(data3[0])}}});
+    CHECK(r == std::unordered_set{{"fakehash2"s, "fakehash3"s}});
+    CHECK(c3.is_clean());
+    CHECK_FALSE(c3.needs_push());
+    CHECK(c3.curr_hashes() == std::unordered_set{{"fakehash3"s}});
+
+    c3.set_name("054444444444444444444444444444444444444444444444444444444444444444", "edgar");
+    auto [seqno5, data5, obs5] = c3.push();
+    CHECK(seqno5 == 4);
 }

@@ -10,7 +10,9 @@
 #include "session/blinding.hpp"
 #include "session/network/backends/backend_util.hpp"
 #include "session/network/backends/session_file_server.h"
+#include "session/network/key_types.hpp"
 #include "session/random.hpp"
+#include "session/util.hpp"
 
 #if defined(__APPLE__) || !defined(__cpp_lib_chrono) || __cpp_lib_chrono < 201907L || \
         (defined(_LIBCPP_VERSION) && _LIBCPP_VERSION < 190000)
@@ -30,7 +32,14 @@ const config::FileServer DEFAULT_CONFIG = {
         .scheme = "http",
         .host = "filev2.getsession.org",
         .port = 80,
-        .pubkey_hex = "da21e1d886c6fbaea313f75298bd64aab03a97ce985b46bb2dad9f2089c8ee59",
+        // ED25519. `p=` in a download url carries the Ed form on every client, and the X25519 form
+        // for onion requests is derived from it.
+        //
+        // NOT the file server's X25519-only key (`da21e1d886c6...ee59`), which cannot be used here:
+        // it has no Ed private key and cannot be given one, since deriving Ed from X would mean
+        // reversing a hash. A file server has to publish a real Ed keypair to be addressable this
+        // way.
+        .pubkey_hex = "b8eef9821445ae16e2e97ef8aa6fe782fd11ad5253cd6723b281341dba22e371",
         .max_file_size = 10'000'000};
 
 constexpr std::string_view HEADER_CONTENT_TYPE = "Content-Type";
@@ -73,7 +82,24 @@ std::optional<DownloadInfo> parse_download_url(std::string_view url) {
         return std::nullopt;
 
     info.scheme = std::string{match->base.substr(0, scheme_end)};
-    info.host = match->base.substr(scheme_end + 3);
+
+    // `to_request` builds a `ServerDestination` from host and port SEPARATELY, so a port left
+    // inside the host reaches the network layer as a valid-looking hostname pointing nowhere.
+    auto authority = match->base.substr(scheme_end + 3);
+    auto port_sep = authority.rfind(':');
+
+    if (port_sep != std::string_view::npos) {
+        // An IPv6 literal is full of colons, so the last one separates a port only when a number
+        // follows it. `parse_int` must consume the whole string, which is what lets `[::1]` keep
+        // its colons while `[::1]:8000` gives up just the port.
+        uint16_t parsed_port = 0;
+        if (quic::parse_int(authority.substr(port_sep + 1), parsed_port) && parsed_port != 0) {
+            info.port = parsed_port;
+            authority = authority.substr(0, port_sep);
+        }
+    }
+
+    info.host = std::string{authority};
     info.wants_stream_decryption = false;
 
     // Parse fragments if present (p=... and/or d)
@@ -98,13 +124,26 @@ std::optional<DownloadInfo> parse_download_url(std::string_view url) {
     return info;
 }
 
+// The port a url does not need to state, because the scheme already implies it.
+static uint16_t default_port_for_scheme(std::string_view scheme) {
+    return (scheme == "https" ? 443 : 80);
+}
+
 std::string generate_download_url(std::string_view file_id, const config::FileServer& config) {
     const auto has_custom_pubkey = (config.pubkey_hex != file_server::DEFAULT_CONFIG.pubkey_hex);
 
+    // Omitted when the scheme already implies it, so urls for the default file server are
+    // byte-identical to those any other client produces for it.
+    const auto port_suffix =
+            (config.port == default_port_for_scheme(config.scheme)
+                     ? ""
+                     : fmt::format(":{}", config.port));
+
     auto buf = fmt::format(
-            "{}://{}/{}",
+            "{}://{}{}/{}",
             config.scheme,
             config.host,
+            port_suffix,
             fmt::format(file_server::ENDPOINT_FILE_INDIVIDUAL, file_id));
 
     if (config.use_stream_encryption || has_custom_pubkey) {
@@ -176,7 +215,8 @@ Request to_request(
             ServerDestination{
                     config.scheme,
                     config.host,
-                    x25519_pubkey::from_hex(config.pubkey_hex),
+                    compute_x25519_pubkey(
+                            to_span<unsigned char>(oxenc::from_hex(config.pubkey_hex))),
                     config.port,
                     std::move(headers),
                     "POST"},
@@ -203,13 +243,17 @@ Request to_request(
             (download_info->custom_pubkey_hex.has_value() ? *download_info->custom_pubkey_hex
                                                           : config.pubkey_hex);
 
+    // The url's port, not the local config's: the file lives on the SENDER's file server, which the
+    // recipient may never have heard of.
+    uint16_t port = download_info->port.value_or(config.port);
+
     return Request{
             download_id,
             ServerDestination{
                     std::move(scheme),
                     std::move(host),
-                    x25519_pubkey::from_hex(std::move(pubkey_hex)),
-                    config.port,
+                    compute_x25519_pubkey(to_span<unsigned char>(oxenc::from_hex(pubkey_hex))),
+                    port,
                     std::nullopt,
                     "GET"},
             fmt::format("{}/{}", file_server::ENDPOINT_FILE, file_id),
@@ -290,7 +334,8 @@ Request extend_ttl(
             ServerDestination{
                     config.scheme,
                     config.host,
-                    x25519_pubkey::from_hex(config.pubkey_hex),
+                    compute_x25519_pubkey(
+                            to_span<unsigned char>(oxenc::from_hex(config.pubkey_hex))),
                     config.port,
                     std::move(headers),
                     "POST"},
@@ -318,7 +363,8 @@ Request get_client_version(
     auto blinded_keys = blind_version_key_pair(to_span(seckey.view()));
     auto timestamp = epoch_seconds(std::chrono::system_clock::now());
     auto signature = blind_version_sign(to_span(seckey.view()), platform, timestamp);
-    auto pubkey = x25519_pubkey::from_hex(DEFAULT_CONFIG.pubkey_hex);
+    auto pubkey = compute_x25519_pubkey(
+            to_span<unsigned char>(oxenc::from_hex(DEFAULT_CONFIG.pubkey_hex)));
     std::string blinded_pk_hex;
     blinded_pk_hex.reserve(66);
     blinded_pk_hex += "07";
@@ -369,6 +415,7 @@ LIBSESSION_C_API bool session_file_server_parse_download_url(
 
     copy(out->scheme, info->scheme);
     copy(out->host, info->host);
+    out->port = info->port.value_or(0);  // 0 means the scheme's default
     copy(out->file_id, info->file_id);
     copy(out->custom_pubkey_hex, info->custom_pubkey_hex.value_or(""));
     out->wants_stream_decryption = info->wants_stream_decryption;
@@ -379,6 +426,7 @@ LIBSESSION_C_API bool session_file_server_generate_download_url(
         const char* file_id,
         const char* scheme,
         const char* host,
+        uint16_t port,
         const char* pubkey_hex,
         bool use_stream_encryption,
         char* out_url,
@@ -391,6 +439,8 @@ LIBSESSION_C_API bool session_file_server_generate_download_url(
         config.scheme = scheme;
     if (host)
         config.host = host;
+    if (port != 0)
+        config.port = port;
     if (pubkey_hex)
         config.pubkey_hex = pubkey_hex;
     config.use_stream_encryption = use_stream_encryption;

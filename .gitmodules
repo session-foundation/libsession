@@ -1,24 +1,18 @@
-[submodule "external/libsodium-internal"]
-    path = external/libsodium-internal
-    url = https://github.com/session-foundation/libsodium-internal.git
 [submodule "tests/Catch2"]
 	path = tests/Catch2
 	url = https://github.com/catchorg/Catch2
 [submodule "external/ios-cmake"]
 	path = external/ios-cmake
 	url = https://github.com/leetal/ios-cmake
-[submodule "external/zstd"]
-	path = external/zstd
-	url = https://github.com/facebook/zstd.git
 [submodule "external/protobuf"]
 	path = external/protobuf
 	url = https://github.com/protocolbuffers/protobuf.git
 [submodule "external/session-router"]
 	path = external/session-router
 	url = https://github.com/session-foundation/session-router.git
-[submodule "external/simdutf"]
-	path = external/simdutf
-	url = https://github.com/simdutf/simdutf.git
 [submodule "external/date"]
 	path = external/date
 	url = https://github.com/HowardHinnant/date.git
+[submodule "cmake/session-deps"]
+	path = cmake/session-deps
+	url = https://github.com/session-foundation/session-deps.git

@@ -23,6 +23,7 @@ extern const config::FileServer DEFAULT_CONFIG;
 struct DownloadInfo {
     std::string scheme;
     std::string host;
+    std::optional<uint16_t> port;  // Set only when the url stated one explicitly
     std::string file_id;
     std::optional<std::string> custom_pubkey_hex;  // If 'p' fragment present
     bool wants_stream_decryption;                  // If 'd' fragment present

@@ -247,6 +247,26 @@ TEST_CASE(
     CHECK(!!(decr == make_data(DATA_SIZE)));
 }
 
+TEST_CASE("Attachment file encryption validates its inputs", "[attachments][files][encrypt]") {
+    auto seed = "5123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_hex_b;
+    temp_data_file f{0};
+
+    CHECK_THROWS_MATCHES(
+            attachment::encrypt(
+                    std::span{seed}.first<31>(), f.path, attachment::Domain::ATTACHMENT),
+            std::invalid_argument,
+            Message("attachment::encrypt requires a 32-byte uploader seed"));
+
+    std::filesystem::resize_file(f.path, attachment::MAX_REGULAR_SIZE + 1);
+    CHECK_THROWS_MATCHES(
+            attachment::encrypt(seed, f.path, attachment::Domain::ATTACHMENT),
+            std::invalid_argument,
+            Message("data to encrypt is too large"));
+
+    auto [enc, key] = attachment::encrypt(seed, f.path, attachment::Domain::ATTACHMENT, true);
+    CHECK(attachment::decrypt(enc, key).size() == attachment::MAX_REGULAR_SIZE + 1);
+}
+
 static std::vector<std::byte> slurp_file(const std::filesystem::path& filename) {
     std::ifstream in;
     in.exceptions(std::ios::failbit | std::ios::badbit);
