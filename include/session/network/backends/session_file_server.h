@@ -14,6 +14,7 @@ extern "C" {
 typedef struct file_server_parsed_download_url {
     char scheme[8];              // "http" or "https" + null
     char host[254];              // 253 max valid DNS length + null
+    uint16_t port;               // 0 if the url stated none, meaning the scheme's default
     char file_id[65];            // id + null terminator
     char custom_pubkey_hex[65];  // 64 hex chars + null terminator, empty string if not present
     bool wants_stream_decryption;
@@ -41,6 +42,8 @@ LIBSESSION_EXPORT bool session_file_server_parse_download_url(
 /// - `scheme` -- [in] the scheme for the target file server, uses the default file server scheme if
 /// null.
 /// - `host` -- [in] the host for the target file server, uses the default file server host if null.
+/// - `port` -- [in] the port for the target file server, uses the default file server port if 0.
+/// Only written into the url when the scheme does not already imply it.
 /// - `pubkey_hex` -- [in] the pubkey for the target file server (in hex), uses the default file
 /// server pubkey if null.
 /// - `use_stream_encryption` -- [in] flag indicating whether the file should use stream encryption.
@@ -54,6 +57,7 @@ LIBSESSION_EXPORT bool session_file_server_generate_download_url(
         const char* file_id,
         const char* scheme,
         const char* host,
+        uint16_t port,
         const char* pubkey_hex,
         bool use_stream_encryption,
         char* out_url,

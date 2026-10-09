@@ -115,8 +115,18 @@ class Network : public std::enable_shared_from_this<Network> {
     void _close_connections();
     void _recalculate_status();
     void _update_status(ConnectionStatus new_status);
-    void _update_network_state(const std::string& body);
-    void _handle_421_retry(Request original_request, network_response_callback_t final_callback);
+    void _update_network_state(const nlohmann::json& json);
+
+    // An account's redirect is left empty where there was none to take.
+    response::swarm_rejections _take_swarm_redirects(
+            const Request& request, const nlohmann::json* json, int16_t status_code);
+    void _refresh_if_unredirected(const response::swarm_rejections& rejections);
+    void _handle_421_retry(
+            Request original_request,
+            response::swarm_rejections rejections,
+            std::vector<std::pair<std::string, std::string>> headers,
+            std::optional<std::string> body,
+            network_response_callback_t final_callback);
 
     void _resync_clock(
             std::optional<Request> original_request, network_response_callback_t request_callback);
@@ -125,7 +135,7 @@ class Network : public std::enable_shared_from_this<Network> {
             const uint8_t index,
             const service_node& node,
             const uint8_t total_requests);
-    void _on_clock_resync_complete(const uint8_t total_requests);
+    void _on_clock_resync_complete();
 
     Request _preprocess_request(Request request);
 };
