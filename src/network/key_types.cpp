@@ -39,6 +39,11 @@ std::string ed25519_pubkey::snode_address() const {
     return addr;
 }
 
+std::string ed25519_pubkey::short_string() const {
+    // 5 bytes is exactly 8 base32z characters, so this is a prefix of snode_address()
+    return oxenc::to_base32z(begin(), begin() + 5);
+}
+
 legacy_pubkey legacy_seckey::pubkey() const {
     legacy_pubkey pk;
     ed25519::scalarmult_base_noclamp(pk, *this);

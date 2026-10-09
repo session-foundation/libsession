@@ -261,9 +261,9 @@ std::string OnionPath::to_string() const {
             nodes.begin(),
             nodes.end(),
             std::back_inserter(node_descriptions),
-            [](const service_node& node) { return node.to_string(); });
+            [](const service_node& node) { return node.remote_pubkey.short_string(); });
 
-    return "{}"_format(fmt::join(node_descriptions, ", "));
+    return "{}"_format(fmt::join(node_descriptions, "⟷"));
 }
 
 cached_edge_node cached_edge_node::from_disk(std::string_view str) {
@@ -1249,7 +1249,7 @@ void OnionRequestRouter::_build_path(
             "[Request {} Path {}]: Testing connectivity to edge node {}.",
             req_id_log,
             path_id,
-            edge_node.to_string());
+            edge_node.remote_pubkey.short_string());
 
     auto transport = _transport.lock();
     if (!transport) {
@@ -1307,7 +1307,7 @@ void OnionRequestRouter::_on_edge_connectivity_response(
                 "path build.",
                 req_id_log,
                 path_id,
-                edge_node.to_string());
+                edge_node.remote_pubkey.short_string());
 
         // The "handshake timeout" error already records a node failure, so don't record another
         if (error_code && *error_code != static_cast<uint64_t>(NGTCP2_ERR_HANDSHAKE_TIMEOUT))
@@ -1805,7 +1805,7 @@ void OnionRequestRouter::_handle_transport_response(
                                         "attempting repair.",
                                         original_request.request_id,
                                         path.id,
-                                        nodes_to_repair[0].hex());
+                                        nodes_to_repair[0].short_string());
                             } else {
                                 log::debug(
                                         cat,
@@ -1966,7 +1966,7 @@ void OnionRequestRouter::_handle_path_failure(
                             cat,
                             "[Path {}]: Skipping penalty for node {} (already penalized).",
                             path.id,
-                            node_key.hex());
+                            node_key.short_string());
                     continue;
                 }
 
@@ -1975,7 +1975,7 @@ void OnionRequestRouter::_handle_path_failure(
                         cat,
                         "[Path {}]: Penalized path node {} due to path failure.",
                         path.id,
-                        node_key.hex());
+                        node_key.short_string());
             }
 
         // Remove failure listeners for the path
@@ -2052,7 +2052,7 @@ void OnionRequestRouter::_try_repair_path(
                     cat,
                     "[Path {}]: Edge node {} failed, dropping path.",
                     path.id,
-                    bad_node_pubkey.hex());
+                    bad_node_pubkey.short_string());
             path.strike_count = _config.path_strike_threshold;
             return;
         }
@@ -2061,7 +2061,7 @@ void OnionRequestRouter::_try_repair_path(
                 cat,
                 "[Path {}]: Attempting to repair path by replacing node {}.",
                 path.id,
-                bad_node_pubkey.hex());
+                bad_node_pubkey.short_string());
 
         auto snode_pool = _snode_pool.lock();
         if (!snode_pool) {
@@ -2085,8 +2085,8 @@ void OnionRequestRouter::_try_repair_path(
                     cat,
                     "[Path {}]: Repaired path by replacing node {} with {}.",
                     path.id,
-                    bad_node_it->to_string(),
-                    replacements[0].to_string());
+                    bad_node_it->remote_pubkey.short_string(),
+                    replacements[0].remote_pubkey.short_string());
             *bad_node_it = replacements[0];
         } else {
             log::warning(
