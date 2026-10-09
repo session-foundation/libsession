@@ -113,6 +113,7 @@ target_link_libraries(crypto
     session::secure_buffer
     PRIVATE
     sessiondep::libsodium
+    sessiondep::libzstd
     # AES-CBC for legacy attachment decryption, which libsodium has no equivalent of: it exposes
     # AES only as GCM, and only where the hardware supports it.
     sessiondep::nettle
