@@ -35,6 +35,14 @@ TEST_CASE("Download url parsing", "[backend][session_open_group_server]") {
     CHECK(parsed_download_url->file_id == 123);
     CHECK(parsed_download_url->wants_stream_decryption);
 
+    // A valueless `d=` is NOT the stream-encryption fragment; see the equivalent case in
+    // test_backend_session_file_server.cpp for why a client can end up writing it.
+    parsed_download_url =
+            open_group_server::parse_download_url("https://example.com/room/test/file/123/#d="sv);
+    REQUIRE(parsed_download_url.has_value());
+    CHECK(parsed_download_url->file_id == 123);
+    CHECK_FALSE(parsed_download_url->wants_stream_decryption);
+
     // Maintains the room casing
     parsed_download_url =
             open_group_server::parse_download_url("https://example.com/room/TeST/file/123"sv);

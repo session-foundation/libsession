@@ -51,7 +51,7 @@ QuicTransport::~QuicTransport() {
 void QuicTransport::suspend() {
     // Use 'call_get' to force this to be synchronous
     _loop->call_get([this] {
-        if (!_suspended)
+        if (_suspended)
             return;
 
         _suspended = true;
@@ -60,7 +60,7 @@ void QuicTransport::suspend() {
     });
 }
 
-void QuicTransport::resume(bool automatically_reconnect) {
+void QuicTransport::resume(bool /*automatically_reconnect*/) {
     // Use 'call_get' to force this to be synchronous
     _loop->call_get([this] {
         // Recreate the endpoint before updating the `_suspended` flag to avoid the chance that
@@ -85,7 +85,7 @@ void QuicTransport::set_node_failure_reporter(node_failure_reporter_t reporter) 
 
 void QuicTransport::verify_connectivity(
         service_node node,
-        std::chrono::milliseconds timeout,
+        std::chrono::milliseconds /*timeout*/,
         const std::string& request_id,
         const RequestCategory category,
         std::function<void(bool success, std::optional<uint64_t> error_code)> callback) {
@@ -145,42 +145,53 @@ void QuicTransport::send_request(Request request, network_response_callback_t ca
 // MARK: Internal Logic
 
 void QuicTransport::_recreate_endpoint() {
+    // The optional must CONTAIN the option to have any effect: libquic's optional-taking
+    // handle_ep_opt overload does nothing when the optional is empty, so a default-constructed
+    // std::optional<max_udp_payload>{} silently leaves discovery uncapped.
     _endpoint = quic::Endpoint::endpoint(
             *_loop,
             quic::Address{},
-            (_config.disable_mtu_discovery ? std::optional<quic::opt::disable_mtu_discovery>{}
-                                           : std::nullopt));
+            (_config.max_udp_payload
+                     ? std::make_optional<quic::opt::max_udp_payload>(*_config.max_udp_payload)
+                     : std::nullopt));
 }
 
 void QuicTransport::_close_connections() {
-    // Explicitly close all connections then reset the endpoint
+    // Taken out before the endpoint goes.  Resetting it destroys it on the spot (close_conns()
+    // only defers), and its destructor closes every connection with code 0 through the handler
+    // that fails whatever is pending on it - so left in place, our own close would reach each
+    // pending verification as an error code, which is what gets a node struck.  Answering copies
+    // also keeps a callback that calls back into the transport from changing the maps being walked.
+    auto verifications = std::exchange(_pending_verification_callbacks, {});
+    auto requests = std::exchange(_pending_requests, {});
+
     if (_endpoint)
         _endpoint->close_conns();
     _endpoint.reset();
-
-    // Cancel any pending verifications (they can't succeed once the connection is closed)
-    for (const auto& [pubkey, callbacks] : _pending_verification_callbacks)
-        for (const auto& callback : callbacks)
-            callback(false, -1);
-
-    // Cancel any pending requests (they can't succeed once the connection is closed)
-    for (const auto& [pubkey, pupkey_requests] : _pending_requests)
-        for (const auto& [info, callback] : pupkey_requests)
-            callback(
-                    false,
-                    false,
-                    ERROR_NETWORK_SUSPENDED,
-                    {content_type_plain_text},
-                    "QuickTransport is suspended.");
 
     // Clear all storage of requests, paths and connections so that we are in a fresh state on
     // relaunch
     _active_connection_ids.clear();
     _available_stream_ids.clear();
-    _pending_verification_callbacks.clear();
-    _pending_requests.clear();
-
     _update_status(ConnectionStatus::disconnected);
+
+    // Answered only now the transport is fully closed, so anything a callback asks of it fails
+    // cleanly, without an error code, rather than meeting half-closed state.  A verification gets
+    // no error code either: a close we asked for is no evidence against the node.
+    for (const auto& [pubkey, callbacks] : verifications)
+        for (const auto& callback : callbacks)
+            callback(false, std::nullopt);
+
+    for (const auto& [pubkey, pubkey_requests] : requests)
+        for (const auto& [info, callback] : pubkey_requests)
+            callback(
+                    false,
+                    false,
+                    (_suspended ? ERROR_NETWORK_SUSPENDED : ERROR_CONNECTION_CLOSED),
+                    {content_type_plain_text},
+                    (_suspended ? "QuickTransport is suspended."
+                                : "QuickTransport closed its connections."));
+
     log::info(cat, "Closed all connections.");
 }
 
@@ -285,7 +296,7 @@ void QuicTransport::_send_request_internal(Request request, network_response_cal
 void QuicTransport::_establish_connection(
         const oxen::quic::RemoteAddress& address,
         const std::string& initiating_req_id,
-        const RequestCategory category) {
+        const RequestCategory /*category*/) {
     const auto address_pubkey_hex = oxenc::to_hex(address.view_remote_key());
 
     try {
@@ -365,13 +376,12 @@ void QuicTransport::_establish_connection(
                         self->_fail_connection(
                                 address_pubkey_hex,
                                 initiating_req_id,
-                                conn.reference_id(),
                                 error_code,
-                                std::nullopt);
+                                std::nullopt,
+                                conn.reference_id());
                 });
     } catch (const std::exception& e) {
-        _fail_connection(
-                address_pubkey_hex, initiating_req_id, std::nullopt, std::nullopt, e.what());
+        _fail_connection(address_pubkey_hex, initiating_req_id, std::nullopt, e.what());
     }
 }
 
@@ -504,13 +514,20 @@ void QuicTransport::_send_on_connection(
                 // Since the request completed it's round-trip if it isn't the "reserverd" stream
                 // (not used for general requests) then we can either add it back to the pool, or
                 // close it if there are more that the active stream price limit
+                //
+                // The connection can be gone by the time this runs, e.g. if the stream outlived it
+                // (libquic then fails the request from ~sent_request).  Then there is nothing to
+                // return to the pool or close, and any ids pooled for it are dead too.
                 if (stream_id != 0 && _endpoint) {
-                    auto conn = _endpoint->get_conn(conn_id);
-
-                    if (conn && conn->get_streams_available() <= ACTIVE_STREAM_PRUNE_LIMIT)
-                        _available_stream_ids[conn_id].insert(stream_id);
-                    else if (auto stream = conn->get_stream<oxen::quic::BTRequestStream>(stream_id))
-                        stream->close();
+                    if (auto conn = _endpoint->get_conn(conn_id)) {
+                        if (conn->get_streams_available() <= ACTIVE_STREAM_PRUNE_LIMIT)
+                            _available_stream_ids[conn_id].insert(stream_id);
+                        else if (
+                                auto stream =
+                                        conn->get_stream<oxen::quic::BTRequestStream>(stream_id))
+                            stream->close();
+                    } else
+                        _available_stream_ids.erase(conn_id);
                 }
 
                 if (resp.timed_out) {
@@ -555,9 +572,9 @@ void QuicTransport::_send_on_connection(
 void QuicTransport::_fail_connection(
         const std::string& address_pubkey_hex,
         const std::string& initiating_req_id,
-        std::optional<oxen::quic::ConnectionID> conn_id,
         std::optional<uint64_t> error_code,
-        std::optional<std::string> custom_error) {
+        std::optional<std::string> custom_error,
+        std::optional<oxen::quic::ConnectionID> conn_id) {
     if (error_code == NGTCP2_NO_ERROR)
         log::info(
                 cat,
@@ -600,8 +617,16 @@ void QuicTransport::_fail_connection(
                 address_pubkey_hex,
                 custom_error.value_or("Unknown error"));
 
-    // Clear the connection and stream ids
-    if (auto id = _active_connection_ids.extract(address_pubkey_hex))
+    // Clear the connection and stream ids.  When the closed connection is known, only its own
+    // state goes: a newer connection to the same node can be established before an old one's close
+    // arrives, and clearing by pubkey alone would drop the new connection and orphan the old one's
+    // stream ids.
+    if (conn_id) {
+        _available_stream_ids.erase(*conn_id);
+        if (auto it = _active_connection_ids.find(address_pubkey_hex);
+            it != _active_connection_ids.end() && it->second == *conn_id)
+            _active_connection_ids.erase(it);
+    } else if (auto id = _active_connection_ids.extract(address_pubkey_hex))
         _available_stream_ids.erase(id.mapped());
 
     // Process any waiting verification requests

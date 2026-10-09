@@ -740,19 +740,12 @@ DecryptGroupMessage decrypt_group_message(
 
     oxenc::bt_dict_consumer dict{to_string_view(plain)};
 
-    if (!dict.skip_until(""))
-        throw std::runtime_error{"group message version tag (\"\") is missing"};
-    if (auto v = dict.consume_integer<int>(); v != 1)
+    if (auto v = dict.require<int>(""); v != 1)
         throw std::runtime_error{
                 "group message version tag (" + std::to_string(v) +
                 ") is not compatible (we support v1)"};
 
-    if (!dict.skip_until("a"))
-        throw std::runtime_error{"missing message author pubkey"};
-    auto ed_pk = to_span(dict.consume_string_view());
-    if (ed_pk.size() != 32)
-        throw std::runtime_error{
-                "message author pubkey size (" + std::to_string(ed_pk.size()) + ") is invalid"};
+    auto ed_pk = dict.require_span<unsigned char, 32>("a");
 
     std::array<unsigned char, 32> x_pk;
     if (0 != crypto_sign_ed25519_pk_to_curve25519(x_pk.data(), ed_pk.data()))
@@ -764,50 +757,44 @@ DecryptGroupMessage decrypt_group_message(
     session_id += "05";
     oxenc::to_hex(x_pk.begin(), x_pk.end(), std::back_inserter(session_id));
 
-    std::span<const unsigned char> raw_data;
-    if (dict.skip_until("d")) {
-        raw_data = to_span(dict.consume_string_view());
-        if (raw_data.empty())
-            throw std::runtime_error{"uncompressed message data (\"d\") cannot be empty"};
-    }
+    auto plain_data = dict.maybe<std::span<const unsigned char>>("d");
+    if (plain_data && plain_data->empty())
+        throw std::runtime_error{"uncompressed message data (\"d\") cannot be empty"};
 
-    if (!dict.skip_until("s"))
-        throw std::runtime_error{"message signature is missing"};
-    auto ed_sig = to_span(dict.consume_string_view());
-    if (ed_sig.size() != 64)
-        throw std::runtime_error{
-                "message signature size (" + std::to_string(ed_sig.size()) + ") is invalid"};
+    auto ed_sig = dict.require_span<unsigned char, 64>("s");
 
     bool compressed = false;
-    if (dict.skip_until("z")) {
-        if (!raw_data.empty())
+    auto comp_data = dict.maybe<std::span<const unsigned char>>("z");
+    if (comp_data) {
+        if (comp_data->empty())
+            throw std::runtime_error{"compressed message data (z) cannot be empty"};
+        if (plain_data)
             throw std::runtime_error{
                     "message signature cannot contain both compressed (z) and uncompressed (d) "
                     "data"};
-        raw_data = to_span(dict.consume_string_view());
-        if (raw_data.empty())
-            throw std::runtime_error{"compressed message data (\"z\") cannot be empty"};
 
         compressed = true;
-    } else if (raw_data.empty())
+    } else if (!plain_data)
         throw std::runtime_error{"message must contain compressed (z) or uncompressed (d) data"};
+
+    auto raw_data = comp_data ? *comp_data : *plain_data;
 
     // The value we verify is the raw data *followed by* the group Ed25519 pubkey.  (See the comment
     // in encrypt_message).
-    std::vector<unsigned char> to_verify(raw_data.size() + group_ed25519_pubkey.size());
-    std::memcpy(to_verify.data(), raw_data.data(), raw_data.size());
-    std::memcpy(
-            to_verify.data() + raw_data.size(),
-            group_ed25519_pubkey.data(),
-            group_ed25519_pubkey.size());
+    std::vector<unsigned char> to_verify;
+    to_verify.reserve(raw_data.size() + group_ed25519_pubkey.size());
+
+    to_verify.insert(to_verify.end(), raw_data.begin(), raw_data.end());
+    to_verify.insert(to_verify.end(), group_ed25519_pubkey.begin(), group_ed25519_pubkey.end());
+
     if (0 != crypto_sign_ed25519_verify_detached(
                      ed_sig.data(), to_verify.data(), to_verify.size(), ed_pk.data()))
         throw std::runtime_error{"message signature failed validation"};
 
     if (compressed) {
-        if (auto decomp = zstd_decompress(raw_data, GROUPS_MAX_PLAINTEXT_MESSAGE_SIZE)) {
+        if (auto decomp = zstd_decompress(raw_data, GROUPS_MAX_PLAINTEXT_MESSAGE_SIZE))
             data = std::move(*decomp);
-        } else
+        else
             throw std::runtime_error{"message decompression failed"};
     } else
         data.assign(raw_data.begin(), raw_data.end());
@@ -1087,7 +1074,6 @@ LIBSESSION_C_API session_encrypt_group_message session_encrypt_for_group(
         const unsigned char* user_ed25519_privkey,
         size_t user_ed25519_privkey_len,
         const unsigned char* group_ed25519_pubkey,
-        size_t group_ed25519_pubkey_len,
         const unsigned char* group_enc_key,
         size_t group_enc_key_len,
         const unsigned char* plaintext,
@@ -1100,7 +1086,7 @@ LIBSESSION_C_API session_encrypt_group_message session_encrypt_for_group(
     try {
         std::vector<unsigned char> result_cpp = encrypt_for_group(
                 {user_ed25519_privkey, user_ed25519_privkey_len},
-                {group_ed25519_pubkey, group_ed25519_pubkey_len},
+                {group_ed25519_pubkey, crypto_sign_ed25519_PUBLICKEYBYTES},
                 {group_enc_key, group_enc_key_len},
                 {plaintext, plaintext_len},
                 compress,
@@ -1200,7 +1186,6 @@ LIBSESSION_C_API session_decrypt_group_message_result session_decrypt_group_mess
         const span_u8* decrypt_ed25519_privkey_list,
         size_t decrypt_ed25519_privkey_len,
         const unsigned char* group_ed25519_pubkey,
-        size_t group_ed25519_pubkey_len,
         const unsigned char* ciphertext,
         size_t ciphertext_len,
         char* error,
@@ -1214,7 +1199,7 @@ LIBSESSION_C_API session_decrypt_group_message_result session_decrypt_group_mess
         try {
             result_cpp = decrypt_group_message(
                     {&key, 1},
-                    {group_ed25519_pubkey, group_ed25519_pubkey_len},
+                    {group_ed25519_pubkey, crypto_sign_ed25519_PUBLICKEYBYTES},
                     {ciphertext, ciphertext_len});
             result = {
                     .success = true,

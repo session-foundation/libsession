@@ -18,6 +18,12 @@ if(WARNINGS_AS_ERRORS)
     endif()
 endif()
 
+# -Wunused-parameter isn't in the default warning set (we don't pass -Wextra), so enable it
+# explicitly. WARNINGS_AS_ERRORS's -Werror (above) then promotes it to an error.
+if(WARN_UNUSED_PARAMETERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(common INTERFACE -Wunused-parameter)
+endif()
+
 
 set(export_targets)
 macro(add_libsession_util_library name)
@@ -28,8 +34,6 @@ macro(add_libsession_util_library name)
         PROPERTIES
         OUTPUT_NAME session-${name}
         SOVERSION ${LIBSESSION_LIBVERSION})
-
-    libsession_static_bundle(${name})
 
     list(APPEND export_targets ${name})
 endmacro()
@@ -54,6 +58,7 @@ add_libsession_util_library(crypto
     session_protocol.cpp
     sodium_array.cpp
     xed25519.cpp
+    xed25519-tweetnacl.cpp
     pro_backend.cpp
     types.cpp
 )
@@ -85,15 +90,16 @@ target_link_libraries(util
     PUBLIC
     common
     oxen::logging
-    libzstd::static
-    simdutf
+    PRIVATE
+    sessiondep::libzstd
+    sessiondep::simdutf
 )
 
 target_link_libraries(crypto
     PUBLIC
     util
     PRIVATE
-    libsodium::sodium-internal
+    sessiondep::libsodium
     nlohmann_json::nlohmann_json
     libsession::protos
 )
@@ -103,17 +109,11 @@ target_link_libraries(config
     crypto
     libsession::protos
     PRIVATE
-    libsodium::sodium-internal
+    sessiondep::libsodium
 )
 
 if(ENABLE_NETWORKING)
-    # libevent
-    if(NOT TARGET libevent::core)
-        add_library(libevent_core INTERFACE)
-        pkg_check_modules(LIBEVENT_core libevent_core>=2.1 IMPORTED_TARGET REQUIRED)
-        target_link_libraries(libevent_core INTERFACE PkgConfig::LIBEVENT_core)
-        add_library(libevent::core ALIAS libevent_core)
-    endif()
+    session_dep(libevent_core 2.1)
 
     add_libsession_util_library(network
         onionreq/builder.cpp
@@ -139,20 +139,21 @@ if(ENABLE_NETWORKING)
     target_link_libraries(network
         PUBLIC
         crypto
-        quic
-        PRIVATE
+        oxen::quic
         nlohmann_json::nlohmann_json
-        libsodium::sodium-internal
-        nettle::nettle
+        PRIVATE
+        sessiondep::libsodium
+        sessiondep::nettle
         date::date
-        libevent::core
+        sessiondep::libevent_core
     )
 
     if(ENABLE_NETWORKING_SROUTER)
         target_sources(network
             PRIVATE
             network/routing/session_router_router.cpp)
-        target_link_libraries(network PUBLIC session-router::libsessionrouter)
+        target_link_libraries(network PUBLIC session-router::core)
+        target_compile_definitions(network PRIVATE ENABLE_NETWORKING_SROUTER)
     endif()
 
     if (BUILD_STATIC_DEPS)
@@ -202,7 +203,6 @@ else()
     endif()
 endif()
 add_library(version STATIC version.c)
-libsession_static_bundle(version)
 target_include_directories(version PRIVATE ../include)
 target_link_libraries(common INTERFACE version)
 
@@ -210,11 +210,6 @@ target_link_libraries(common INTERFACE version)
 foreach(tgt ${export_targets})
     add_library("libsession::${tgt}" ALIAS "${tgt}")
 endforeach()
-export(
-    TARGETS ${export_targets} common version
-    NAMESPACE libsession::
-    APPEND FILE libsessionTargets.cmake
-)
 
 list(APPEND libsession_export_targets ${export_targets})
 set(libsession_export_targets "${libsession_export_targets}" PARENT_SCOPE)

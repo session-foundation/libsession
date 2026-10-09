@@ -15,7 +15,7 @@ class ITransport {
     virtual void close_connections() = 0;
 
     virtual ConnectionStatus get_status() const = 0;
-    virtual void set_node_failure_reporter(node_failure_reporter_t reporter) {}
+    virtual void set_node_failure_reporter(node_failure_reporter_t /*reporter*/) {}
     virtual void verify_connectivity(
             service_node node,
             std::chrono::milliseconds timeout,

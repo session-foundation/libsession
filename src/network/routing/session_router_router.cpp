@@ -131,10 +131,18 @@ void SessionRouter::_init() {
                         return;
 
                     if (snode_pool->size() == 0)
-                        snode_pool->refresh_if_needed({}, [weak_self, this] {
+                        snode_pool->refresh_if_needed({}, [weak_self, this](bool refreshed) {
                             auto self = weak_self.lock();
                             if (!self)
                                 return;
+
+                            // Setup finishes either way: not finishing leaves the router
+                            // permanently unusable, where finishing with an empty pool just means
+                            // the first request refreshes again
+                            if (!refreshed)
+                                log::warning(
+                                        cat,
+                                        "Finishing router setup without a refreshed snode pool.");
 
                             _loop->call([weak_self] {
                                 if (auto self = weak_self.lock())
@@ -186,7 +194,7 @@ void SessionRouter::suspend() {
     });
 }
 
-void SessionRouter::resume(bool automatically_reconnect) {
+void SessionRouter::resume(bool /*automatically_reconnect*/) {
     // Use 'call_get' to force this to be synchronous
     _loop->call_get([this] {
         if (!_suspended)
@@ -294,6 +302,10 @@ void SessionRouter::_close_connections() {
     // Clear all storage of requests, paths and connections so that we are in a fresh state on
     // relaunch
     _active_tunnels.clear();
+    {
+        std::lock_guard lock{_tunnel_claims_mutex};
+        _tunnel_claims.clear();
+    }
     _pending_requests.clear();
     _update_status(ConnectionStatus::disconnected);
     log::info(cat, "Closed all connections.");
@@ -458,10 +470,18 @@ void SessionRouter::_send_proxy_request(Request request, network_response_callba
                 [weak_self = weak_from_this(),
                  this,
                  req = std::move(request),
-                 cb = std::move(callback)]() {
+                 cb = std::move(callback)](bool refreshed) {
                     auto self = weak_self.lock();
                     if (!self)
                         return;
+
+                    if (!refreshed)
+                        return cb(
+                                false,
+                                false,
+                                ERROR_INSUFFICIENT_NODES,
+                                {content_type_plain_text},
+                                "Failed to refresh the snode pool to find a proxy.");
 
                     auto snode_pool = _snode_pool.lock();
                     if (!snode_pool)
@@ -476,7 +496,7 @@ void SessionRouter::_send_proxy_request(Request request, network_response_callba
                         return cb(
                                 false,
                                 false,
-                                -1,
+                                ERROR_INSUFFICIENT_NODES,
                                 {content_type_plain_text},
                                 "SnodePool refresh failed.");
 
@@ -523,32 +543,35 @@ void SessionRouter::_send_proxy_request(Request request, network_response_callba
             request.time_remaining(),
             request.overall_timeout};
 
-    auto proxy_callback =
-            [parser = std::move(parser), cb = std::move(callback)](
-                    bool success, bool timeout, int16_t status, auto headers, auto response) {
-                try {
-                    if (!success)
-                        throw std::runtime_error{response.value_or("Unknown request failure")};
-                    if (timeout)
-                        throw std::runtime_error{response.value_or("Timed out")};
-                    if (!response)
-                        throw std::runtime_error{"Unexpected empty response"};
+    auto proxy_callback = [parser = std::move(parser), cb = std::move(callback)](
+                                  bool success,
+                                  bool timeout,
+                                  int16_t status,
+                                  auto headers,
+                                  auto response) {
+        try {
+            if (!success)
+                throw std::runtime_error{response.value_or("Unknown request failure")};
+            if (timeout)
+                throw std::runtime_error{response.value_or("Timed out")};
+            if (!response)
+                throw std::runtime_error{"Unexpected empty response"};
 
-                    onionreq::DecryptedResponse decrypted = parser->decrypted_response(*response);
-                    cb(true,
-                       false,
-                       decrypted.status_code,
-                       std::move(decrypted.headers),
-                       std::move(decrypted.body));
-                } catch (const std::exception& e) {
-                    cb(false,
-                       timeout,
-                       status,
-                       std::move(headers),
-                       "Failed to handle proxied request response due to error: {}"_format(
-                               e.what()));
-                }
-            };
+            onionreq::DecryptedResponse decrypted = parser->decrypted_response(*response);
+            cb(true,
+               false,
+               decrypted.status_code,
+               std::move(decrypted.headers),
+               std::move(decrypted.body));
+        } catch (const std::exception& e) {
+            cb(false,
+               timeout,
+               response::undecrypted_status(status),
+               std::move(headers),
+               "Failed to handle proxied request response (status {}) due to error: {}"_format(
+                       status, e.what()));
+        }
+    };
 
     // Now that we have a service_node destination we can send a direct request
     _send_direct_request(std::move(proxy_request), std::move(proxy_callback));
@@ -836,7 +859,7 @@ void SessionRouter::_establish_tunnel(
             "[Request {}] Establishing new tunnel to {}.",
             initiating_req_id,
             address_pubkey_hex);
-    srouter->establish_udp(
+    auto claim = srouter->establish_udp(
             srouter_address,
             test_port,
             [weak_self = weak_from_this(), this, address_pubkey_hex, initiating_req_id](
@@ -869,18 +892,26 @@ void SessionRouter::_establish_tunnel(
                         _send_via_tunnel(info, std::move(req), std::move(cb));
                 }
             },
-            [weak_self = weak_from_this(), this, address_pubkey_hex, initiating_req_id]() mutable {
+            [weak_self = weak_from_this(), this, address_pubkey_hex, initiating_req_id](
+                    router::tunnel_failure reason) mutable {
                 auto self = weak_self.lock();
                 if (!self)
                     return;
 
                 log::info(
                         cat,
-                        "[Request {}] Unable to establish session router UDP connection to {}.",
+                        "[Request {}] Unable to establish session router UDP connection to {} "
+                        "({}).",
                         initiating_req_id,
-                        address_pubkey_hex);
+                        address_pubkey_hex,
+                        reason == router::tunnel_failure::unreachable ? "no relay contact"
+                                                                      : "timed out");
 
                 _active_tunnels.erase(address_pubkey_hex);
+                {
+                    std::lock_guard lock{_tunnel_claims_mutex};
+                    _tunnel_claims.erase(address_pubkey_hex);
+                }
 
                 // Fail all the pending requests for this connection
                 if (auto it = _pending_requests.find(address_pubkey_hex);
@@ -905,6 +936,13 @@ void SessionRouter::_establish_tunnel(
                 if (_active_tunnels.empty())
                     _update_status(ConnectionStatus::disconnected);
             });
+
+    // Keep the tunnel open for as long as we hold the node's entry.  If the failure callback has
+    // already run on session-router's thread this leaves a claim behind for a tunnel that failed,
+    // which is harmless: a later request to the same node replaces it.
+    std::lock_guard lock{_tunnel_claims_mutex};
+    _tunnel_claims.insert_or_assign(
+            address_pubkey_hex, std::make_shared<router::udp_tunnel>(std::move(claim)));
 }
 
 void SessionRouter::_send_via_tunnel(
