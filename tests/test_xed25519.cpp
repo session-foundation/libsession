@@ -3,6 +3,7 @@
 #include <sodium/crypto_sign_ed25519.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <stdexcept>
 
 #include "session/util.hpp"
 #include "session/xed25519.h"
@@ -57,11 +58,11 @@ TEST_CASE("XEd25519 pubkey conversion", "[xed25519][pubkey]") {
     REQUIRE(rc == 0);
     REQUIRE(view_hex(xpk2) == view_hex(xpub2));
 
-    auto xed1 = session::xed25519::pubkey(session::to_span(xpub1));
+    auto xed1 = session::xed25519::pubkey(xpub1);
     REQUIRE(view_hex(xed1) == oxenc::to_hex(pub1));
 
     // This one fails because the original Ed pubkey is negative
-    auto xed2 = session::xed25519::pubkey(session::to_span(xpub2));
+    auto xed2 = session::xed25519::pubkey(xpub2);
     REQUIRE(view_hex(xed2) != oxenc::to_hex(pub2));
     // After making the xed negative we should be okay:
     xed2[31] |= 0x80;
@@ -83,12 +84,12 @@ TEST_CASE("XEd25519 signing", "[xed25519][sign]") {
 
     const auto msg = session::to_span("hello world");
 
-    auto xed_sig1 = session::xed25519::sign(session::to_span(xsk1), msg);
+    auto xed_sig1 = session::xed25519::sign(xsk1, msg);
 
     rc = crypto_sign_ed25519_verify_detached(xed_sig1.data(), msg.data(), msg.size(), pub1.data());
     REQUIRE(rc == 0);
 
-    auto xed_sig2 = session::xed25519::sign(session::to_span(xsk2), msg);
+    auto xed_sig2 = session::xed25519::sign(xsk2, msg);
 
     // This one will fail, because Xed signing always uses the positive but our actual pub2 is the
     // negative:
@@ -112,24 +113,48 @@ TEST_CASE("XEd25519 verification", "[xed25519][verify]") {
 
     const auto msg = session::to_span("hello world");
 
-    auto xed_sig1 = session::xed25519::sign(session::to_span(xsk1), msg);
-    auto xed_sig2 = session::xed25519::sign(session::to_span(xsk2), msg);
+    auto xed_sig1 = session::xed25519::sign(xsk1, msg);
+    auto xed_sig2 = session::xed25519::sign(xsk2, msg);
 
-    REQUIRE(session::xed25519::verify(session::to_span(xed_sig1), session::to_span(xpub1), msg));
-    REQUIRE(session::xed25519::verify(session::to_span(xed_sig2), session::to_span(xpub2), msg));
+    REQUIRE(session::xed25519::verify(xed_sig1, xpub1, msg));
+    REQUIRE(session::xed25519::verify(xed_sig2, xpub2, msg));
 
     // Unlike regular Ed25519, XEd25519 uses randomness in the signature, so signing the same value
     // a second should give us a different signature:
-    auto xed_sig1b = session::xed25519::sign(session::to_span(xsk1), msg);
+    auto xed_sig1b = session::xed25519::sign(xsk1, msg);
     REQUIRE(view_hex(xed_sig1b) != view_hex(xed_sig1));
 }
 
+TEST_CASE("XEd25519 string overloads reject invalid input sizes", "[xed25519]") {
+    std::string short_key(31, '\0');
+    std::string key(32, '\0');
+    std::string long_key(33, '\0');
+    std::string short_signature(63, '\0');
+    std::string signature(64, '\0');
+    std::string long_signature(65, '\0');
+
+    CHECK_THROWS_AS(session::xed25519::sign(short_key, "hello world"), std::invalid_argument);
+    CHECK_THROWS_AS(session::xed25519::sign(long_key, "hello world"), std::invalid_argument);
+
+    CHECK_THROWS_AS(
+            session::xed25519::verify(short_signature, key, "hello world"), std::invalid_argument);
+    CHECK_THROWS_AS(
+            session::xed25519::verify(long_signature, key, "hello world"), std::invalid_argument);
+    CHECK_THROWS_AS(
+            session::xed25519::verify(signature, short_key, "hello world"), std::invalid_argument);
+    CHECK_THROWS_AS(
+            session::xed25519::verify(signature, long_key, "hello world"), std::invalid_argument);
+
+    CHECK_THROWS_AS(session::xed25519::pubkey(short_key), std::invalid_argument);
+    CHECK_THROWS_AS(session::xed25519::pubkey(long_key), std::invalid_argument);
+}
+
 TEST_CASE("XEd25519 pubkey conversion (C wrapper)", "[xed25519][pubkey][c]") {
-    auto xed1 = session::xed25519::pubkey(session::to_span(xpub1));
+    auto xed1 = session::xed25519::pubkey(xpub1);
     REQUIRE(view_hex(xed1) == oxenc::to_hex(pub1));
 
     // This one fails because the original Ed pubkey is negative
-    auto xed2 = session::xed25519::pubkey(session::to_span(xpub2));
+    auto xed2 = session::xed25519::pubkey(xpub2);
     REQUIRE(view_hex(xed2) != oxenc::to_hex(pub2));
     // After making the xed negative we should be okay:
     xed2[31] |= 0x80;

@@ -222,6 +222,10 @@ if [ "${SHOULD_CREATE_FRAMEWORK}" == "SHOULD_CREATE_FRAMEWORK" ]; then
     # The 'module.modulemap' is needed for XCode to be able to find the headers
     modmap="${OUTPUT_DIR}/module.modulemap"
     echo "module SessionUtil {" >"$modmap"
+    # libunistring (via gnutls -> libidn2) calls iconv, which session-deps takes from the system on
+    # Apple rather than bundling.  An SPM binary target can't declare linker flags, so autolink it
+    # from the module instead.
+    echo "  link \"iconv\"" >>"$modmap"
     echo "  module capi {" >>"$modmap"
     for x in $(cd include && find session -name '*.h'); do
         echo "    header \"$x\"" >>"$modmap"

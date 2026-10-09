@@ -1,3 +1,4 @@
+#include <oxenc/hex.h>
 #include <session/blinding.h>
 #include <sodium/crypto_sign_ed25519.h>
 
@@ -19,41 +20,40 @@ struct SerialisedProtobufContentWithProForTesting {
     std::vector<uint8_t> plaintext_padded;
     array_uc64 sig_over_plaintext_with_user_pro_key;
     array_uc64 sig_over_plaintext_padded_with_user_pro_key;
-    array_uc32 pro_proof_hash;
     bytes64 sig_over_plaintext_with_user_pro_key_c;
-    bytes32 pro_proof_hash_c;
 };
 
 static SerialisedProtobufContentWithProForTesting build_protobuf_content_with_session_pro(
         std::string_view data_body,
         const array_uc64& user_rotating_privkey,
         const array_uc64& pro_backend_privkey,
-        std::chrono::sys_seconds content_unix_ts,
-        std::chrono::sys_seconds pro_expiry_unix_ts,
+        std::chrono::sys_seconds content_at,
+        std::chrono::sys_seconds pro_expiry_at,
         session_protocol_pro_message_bitset msg_bitset,
-        session_protocol_pro_profile_bitset profile_bitset) {
+        session_protocol_pro_profile_bitset profile_bitset,
+        bool omit_proof = false) {
     SerialisedProtobufContentWithProForTesting result = {};
 
     // Create protobuf `Content.dataMessage`
     SessionProtos::Content content = {};
-    content.set_sigtimestamp(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     content_unix_ts.time_since_epoch())
-                                     .count());
+    content.set_sigtimestamp(
+            std::chrono::duration_cast<std::chrono::milliseconds>(content_at.time_since_epoch())
+                    .count());
 
     SessionProtos::DataMessage* data = content.mutable_datamessage();
     data->set_body(std::string(data_body));
 
     // Generate a dummy proof
     crypto_sign_ed25519_sk_to_pk(result.proof.rotating_pubkey.data(), user_rotating_privkey.data());
-    result.proof.expiry_unix_ts = pro_expiry_unix_ts;
+    result.proof.expiry_at = pro_expiry_at;
 
-    // Sign the proof by the dummy "Session Pro Backend" key
-    result.pro_proof_hash = result.proof.hash();
+    // Sign the proof by the dummy "Session Pro Backend" key (Ed25519 over the message directly)
+    auto proof_msg = result.proof.signed_message();
     crypto_sign_ed25519_detached(
             result.proof.sig.data(),
             nullptr,
-            result.pro_proof_hash.data(),
-            result.pro_proof_hash.size(),
+            proof_msg.data(),
+            proof_msg.size(),
             pro_backend_privkey.data());
 
     // Create protobuf `Content.proMessage`
@@ -62,16 +62,20 @@ static SerialisedProtobufContentWithProForTesting build_protobuf_content_with_se
     pro->set_msgbitset(msg_bitset.data);
 
     // Create protobuf `Content.proMessage.proof`
-    SessionProtos::ProProof* proto_proof = pro->mutable_proof();
-    proto_proof->set_version(result.proof.version);
-    proto_proof->set_genindexhash(
-            result.proof.gen_index_hash.data(), result.proof.gen_index_hash.size());
-    proto_proof->set_rotatingpublickey(
-            result.proof.rotating_pubkey.data(), result.proof.rotating_pubkey.size());
-    proto_proof->set_expiryunixts(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                          result.proof.expiry_unix_ts.time_since_epoch())
-                                          .count());
-    proto_proof->set_sig(result.proof.sig.data(), result.proof.sig.size());
+    //
+    // `omit_proof` leaves it out entirely, which is what a proof this client cannot read looks like
+    // from here: a new proof format arrives as its own field rather than as a version bump on this
+    // one, so an old client simply finds no `proof`. Everything below (serialise, pad, sign) is
+    // deliberately shared with the normal case -- the message itself is unchanged.
+    if (!omit_proof) {
+        SessionProtos::ProProof* proto_proof = pro->mutable_proof();
+        proto_proof->set_revocationtag(
+                result.proof.revocation_tag.data(), result.proof.revocation_tag.size());
+        proto_proof->set_rotatingpublickey(
+                result.proof.rotating_pubkey.data(), result.proof.rotating_pubkey.size());
+        proto_proof->set_expiryunixts(session::epoch_seconds(result.proof.expiry_at));
+        proto_proof->set_sig(result.proof.sig.data(), result.proof.sig.size());
+    }
 
     // Generate the plaintext
     result.plaintext = content.SerializeAsString();
@@ -99,68 +103,50 @@ static SerialisedProtobufContentWithProForTesting build_protobuf_content_with_se
             result.sig_over_plaintext_with_user_pro_key_c.data,
             result.sig_over_plaintext_with_user_pro_key.data(),
             sizeof(result.sig_over_plaintext_with_user_pro_key_c.data));
-    std::memcpy(
-            result.pro_proof_hash_c.data,
-            result.pro_proof_hash.data(),
-            sizeof(result.pro_proof_hash_c.data));
     return result;
 }
 
 TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
 
     // Do tests that require no setup
-    SECTION("Ensure get pro fetaures detects large message") {
-        // Try a message below the size threshold
+    SECTION("Ensure get pro features detects large message") {
+        // Below the size threshold
         {
-            auto msg = std::string(SESSION_PROTOCOL_PRO_STANDARD_CHARACTER_LIMIT, 'a');
             session_protocol_pro_features_for_msg pro_msg =
-                    session_protocol_pro_features_for_utf8(msg.data(), msg.size());
+                    session_protocol_pro_features_for_message(
+                            SESSION_PROTOCOL_STANDARD_CHARACTER_LIMIT);
             REQUIRE(pro_msg.status == SESSION_PROTOCOL_PRO_FEATURES_FOR_MSG_STATUS_SUCCESS);
             REQUIRE(pro_msg.bitset.data == 0);
-            REQUIRE(pro_msg.codepoint_count == msg.size());
         }
 
-        // Try an invalid message
+        // Exceeding the standard size threshold
         {
-            std::string_view msg = "\xFF";
             session_protocol_pro_features_for_msg pro_msg =
-                    session_protocol_pro_features_for_utf8(msg.data(), msg.size());
-            REQUIRE(pro_msg.status ==
-                    SESSION_PROTOCOL_PRO_FEATURES_FOR_MSG_STATUS_UTF_DECODING_ERROR);
-            REQUIRE(pro_msg.error.size);
-        }
-
-        // Try a message exceeding the standard size threshold
-        {
-            auto msg = std::string(SESSION_PROTOCOL_PRO_STANDARD_CHARACTER_LIMIT + 1, 'a');
-            session_protocol_pro_features_for_msg pro_msg =
-                    session_protocol_pro_features_for_utf8(msg.data(), msg.size());
+                    session_protocol_pro_features_for_message(
+                            SESSION_PROTOCOL_STANDARD_CHARACTER_LIMIT + 1);
             REQUIRE(pro_msg.status == SESSION_PROTOCOL_PRO_FEATURES_FOR_MSG_STATUS_SUCCESS);
             REQUIRE(session_protocol_pro_message_bitset_is_set(
                     pro_msg.bitset, SESSION_PROTOCOL_PRO_MESSAGE_FEATURES_10K_CHARACTER_LIMIT));
-            REQUIRE(pro_msg.codepoint_count == msg.size());
         }
 
-        // Try a message at the max size threshold
+        // At the max size threshold
         {
-            auto msg = std::string(SESSION_PROTOCOL_PRO_HIGHER_CHARACTER_LIMIT, 'a');
             session_protocol_pro_features_for_msg pro_msg =
-                    session_protocol_pro_features_for_utf8(msg.data(), msg.size());
+                    session_protocol_pro_features_for_message(
+                            SESSION_PROTOCOL_PRO_HIGHER_CHARACTER_LIMIT);
             REQUIRE(pro_msg.status == SESSION_PROTOCOL_PRO_FEATURES_FOR_MSG_STATUS_SUCCESS);
             REQUIRE(session_protocol_pro_message_bitset_is_set(
                     pro_msg.bitset, SESSION_PROTOCOL_PRO_MESSAGE_FEATURES_10K_CHARACTER_LIMIT));
-            REQUIRE(pro_msg.codepoint_count == msg.size());
         }
 
-        // Try a message at the (max size + 1) threshold
+        // Over the max size threshold
         {
-            auto msg = std::string(SESSION_PROTOCOL_PRO_HIGHER_CHARACTER_LIMIT + 1, 'a');
             session_protocol_pro_features_for_msg pro_msg =
-                    session_protocol_pro_features_for_utf8(msg.data(), msg.size());
+                    session_protocol_pro_features_for_message(
+                            SESSION_PROTOCOL_PRO_HIGHER_CHARACTER_LIMIT + 1);
             REQUIRE(pro_msg.status ==
                     SESSION_PROTOCOL_PRO_FEATURES_FOR_MSG_STATUS_EXCEEDS_CHARACTER_LIMIT);
             REQUIRE(pro_msg.bitset.data == 0);
-            REQUIRE(pro_msg.codepoint_count == msg.size());
         }
     }
 
@@ -286,17 +272,15 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
 
         // Verify pro
         ProProof nil_proof = {};
-        array_uc32 nil_hash = nil_proof.hash();
-        bytes32 decrypt_result_pro_hash =
-                session_protocol_pro_proof_hash(&decrypt_result.pro.proof);
         REQUIRE(decrypt_result.pro.status ==
                 SESSION_PROTOCOL_PRO_STATUS_NIL);  // Pro was not attached
         REQUIRE(decrypt_result.pro.msg_bitset.data == 0);
         REQUIRE(decrypt_result.pro.profile_bitset.data == 0);
+        // No proof was attached, so the decoded proof is empty (matches a default-constructed one).
         REQUIRE(std::memcmp(
-                        decrypt_result_pro_hash.data,
-                        nil_hash.data(),
-                        sizeof(decrypt_result_pro_hash.data)) == 0);
+                        decrypt_result.pro.proof.sig.data,
+                        nil_proof.sig.data(),
+                        sizeof(decrypt_result.pro.proof.sig.data)) == 0);
 
         // Verify it is decryptable
         SessionProtos::Content decrypt_content = {};
@@ -315,8 +299,8 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
                     /*data_body*/ data_body,
                     /*user_rotating_privkey*/ user_pro_ed_sk,
                     /*pro_backend_privkey*/ pro_backend_ed_sk,
-                    /*content_unix_ts=*/timestamp_s,
-                    /*pro_expiry_unix_ts*/ timestamp_s,
+                    /*content_at=*/timestamp_s,
+                    /*pro_expiry_at*/ timestamp_s,
                     /*msg_bitset*/ {},
                     /*profile_bitset*/ {});
 
@@ -406,9 +390,12 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
         // Verify pro
         REQUIRE(decrypt_result.pro.status ==
                 SESSION_PROTOCOL_PRO_STATUS_VALID);  // Pro was attached
-        bytes32 hash = session_protocol_pro_proof_hash(&decrypt_result.pro.proof);
-        REQUIRE(std::memcmp(hash.data, protobuf_content.pro_proof_hash.data(), sizeof(hash.data)) ==
-                0);
+        // The proof survived the encode/decode round-trip: its authenticating signature is
+        // unchanged (Ed25519 is deterministic over the canonical message).
+        REQUIRE(std::memcmp(
+                        decrypt_result.pro.proof.sig.data,
+                        protobuf_content.proof.sig.data(),
+                        sizeof(decrypt_result.pro.proof.sig.data)) == 0);
         REQUIRE(decrypt_result.pro.msg_bitset.data == 0);      // No features requested
         REQUIRE(decrypt_result.pro.profile_bitset.data == 0);  // No features requested
 
@@ -422,12 +409,68 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
         session_protocol_decode_envelope_free(&decrypt_result);
     }
 
+    SECTION("A proof we cannot read degrades to non-pro, not a dropped message") {
+        // Same message, but with no proof this client can read -- what a future proof format looks
+        // like from here, since a new format is a new field rather than a version bump.
+        SerialisedProtobufContentWithProForTesting future_content =
+                build_protobuf_content_with_session_pro(
+                        /*data_body*/ data_body,
+                        /*user_rotating_privkey*/ user_pro_ed_sk,
+                        /*pro_backend_privkey*/ pro_backend_ed_sk,
+                        /*content_at=*/timestamp_s,
+                        /*pro_expiry_at*/ timestamp_s,
+                        /*msg_bitset*/ {},
+                        /*profile_bitset*/ {},
+                        /*omit_proof*/ true);
+
+        session_protocol_encoded_for_destination encrypt_result = session_protocol_encode_for_1o1(
+                future_content.plaintext.data(),
+                future_content.plaintext.size(),
+                keys.ed_sk0.data(),
+                keys.ed_sk0.size(),
+                base_dest.sent_timestamp_ms,
+                &base_dest.recipient_pubkey,
+                user_pro_ed_sk.data(),
+                user_pro_ed_sk.size(),
+                error,
+                sizeof(error));
+        REQUIRE(encrypt_result.error_len_incl_null_terminator == 0);
+
+        span_u8 key = {keys.ed_sk1.data(), keys.ed_sk1.size()};
+        session_protocol_decode_envelope_keys decrypt_keys = {};
+        decrypt_keys.decrypt_keys = &key;
+        decrypt_keys.decrypt_keys_len = 1;
+        session_protocol_decoded_envelope decrypt_result = session_protocol_decode_envelope(
+                &decrypt_keys,
+                encrypt_result.ciphertext.data,
+                encrypt_result.ciphertext.size,
+                pro_backend_ed_pk.data(),
+                pro_backend_ed_pk.size(),
+                error,
+                sizeof(error));
+        // The message is delivered rather than silently swallowed by the unreadable proof...
+        REQUIRE(decrypt_result.success);
+        REQUIRE(decrypt_result.error_len_incl_null_terminator == 0);
+        session_protocol_encode_for_destination_free(&encrypt_result);
+
+        // ...but with nothing to evaluate the proof is flagged invalid, i.e. non-pro.
+        REQUIRE(decrypt_result.pro.status == SESSION_PROTOCOL_PRO_STATUS_INVALID);
+
+        // The underlying message content survives intact.
+        SessionProtos::Content decrypt_content = {};
+        REQUIRE(decrypt_content.ParseFromArray(
+                decrypt_result.content_plaintext.data, decrypt_result.content_plaintext.size));
+        REQUIRE(decrypt_content.has_datamessage());
+        REQUIRE(decrypt_content.datamessage().body() == data_body);
+        session_protocol_decode_envelope_free(&decrypt_result);
+    }
+
     SECTION("Encrypt/decrypt for contact in default namespace with Pro + features") {
         std::string large_message;
-        large_message.resize(SESSION_PROTOCOL_PRO_STANDARD_CHARACTER_LIMIT + 1);
+        large_message.resize(SESSION_PROTOCOL_STANDARD_CHARACTER_LIMIT + 1);
 
         session_protocol_pro_features_for_msg pro_msg =
-                session_protocol_pro_features_for_utf8(large_message.data(), large_message.size());
+                session_protocol_pro_features_for_message(large_message.size());
         REQUIRE(session_protocol_pro_message_bitset_is_set(
                 pro_msg.bitset, SESSION_PROTOCOL_PRO_MESSAGE_FEATURES_10K_CHARACTER_LIMIT));
 
@@ -440,8 +483,8 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
                         /*data_body*/ large_message,
                         /*user_rotating_privkey*/ user_pro_ed_sk,
                         /*pro_backend_privkey*/ pro_backend_ed_sk,
-                        /*content_unix_ts*/ timestamp_s,
-                        /*pro_expiry_unix_ts*/ timestamp_s,
+                        /*content_at*/ timestamp_s,
+                        /*pro_expiry_at*/ timestamp_s,
                         /*msg_bitset*/ pro_msg.bitset,
                         /*proilfe_bitset*/ profile_bitset);
 
@@ -482,9 +525,12 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
         // Verify pro
         REQUIRE(decrypt_result.pro.status ==
                 SESSION_PROTOCOL_PRO_STATUS_VALID);  // Pro was attached
-        bytes32 hash = session_protocol_pro_proof_hash(&decrypt_result.pro.proof);
-        REQUIRE(std::memcmp(hash.data, protobuf_content.pro_proof_hash.data(), sizeof(hash.data)) ==
-                0);
+        // The proof survived the encode/decode round-trip: its authenticating signature is
+        // unchanged (Ed25519 is deterministic over the canonical message).
+        REQUIRE(std::memcmp(
+                        decrypt_result.pro.proof.sig.data,
+                        protobuf_content.proof.sig.data(),
+                        sizeof(decrypt_result.pro.proof.sig.data)) == 0);
         REQUIRE(session_protocol_pro_profile_bitset_is_set(
                 decrypt_result.pro.profile_bitset,
                 SESSION_PROTOCOL_PRO_PROFILE_FEATURES_PRO_BADGE));
@@ -624,10 +670,12 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
             // Verify pro
             REQUIRE(decrypt_result.pro.status ==
                     SESSION_PROTOCOL_PRO_STATUS_VALID);  // Pro was attached
-            bytes32 hash = session_protocol_pro_proof_hash(&decrypt_result.pro.proof);
+            // The proof survived the encode/decode round-trip: its authenticating signature is
+            // unchanged (Ed25519 is deterministic over the canonical message).
             REQUIRE(std::memcmp(
-                            hash.data, protobuf_content.pro_proof_hash.data(), sizeof(hash.data)) ==
-                    0);
+                            decrypt_result.pro.proof.sig.data,
+                            protobuf_content.proof.sig.data(),
+                            sizeof(decrypt_result.pro.proof.sig.data)) == 0);
             REQUIRE(decrypt_result.pro.msg_bitset.data == 0);      // No features requested
             REQUIRE(decrypt_result.pro.profile_bitset.data == 0);  // No features requested
 
@@ -647,7 +695,7 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
             // user's "Session Pro" key into `sig_over_plaintext_with_user_pro_key`
             std::chrono::milliseconds bad_timestamp_ms =
                     std::chrono::duration_cast<std::chrono::milliseconds>(
-                            protobuf_content.proof.expiry_unix_ts.time_since_epoch()) +
+                            protobuf_content.proof.expiry_at.time_since_epoch()) +
                     std::chrono::seconds(1);
 
             SerialisedProtobufContentWithProForTesting bad_protobuf_content =
@@ -655,11 +703,11 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
                             /*data_body*/ data_body,
                             /*user_rotating_privkey*/ user_pro_ed_sk,
                             /*pro_backend_privkey*/ pro_backend_ed_sk,
-                            /*content_unix_ts=*/
+                            /*content_at=*/
                             std::chrono::sys_seconds(
                                     std::chrono::duration_cast<std::chrono::seconds>(
                                             bad_timestamp_ms)),
-                            /*pro_expiry_unix_ts*/ timestamp_s,
+                            /*pro_expiry_at*/ timestamp_s,
                             /*msg_bitset*/ {},
                             /*profile_bitset*/ {});
 
@@ -768,7 +816,7 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
         session_protocol_decoded_community_message decoded = session_protocol_decode_for_community(
                 encoded.ciphertext.data,
                 encoded.ciphertext.size,
-                timestamp_ms.time_since_epoch().count(),
+                timestamp_s.time_since_epoch().count(),
                 pro_backend_ed_pk.data(),
                 pro_backend_ed_pk.size(),
                 error,
@@ -791,7 +839,7 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
         session_protocol_decoded_community_message decoded = session_protocol_decode_for_community(
                 encoded.ciphertext.data,
                 encoded.ciphertext.size,
-                timestamp_ms.time_since_epoch().count(),
+                timestamp_s.time_since_epoch().count(),
                 pro_backend_ed_pk.data(),
                 pro_backend_ed_pk.size(),
                 error,
@@ -812,7 +860,7 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
         session_protocol_decoded_community_message decoded = session_protocol_decode_for_community(
                 envelope_plaintext.data(),
                 envelope_plaintext.size(),
-                timestamp_ms.time_since_epoch().count(),
+                timestamp_s.time_since_epoch().count(),
                 pro_backend_ed_pk.data(),
                 pro_backend_ed_pk.size(),
                 error,
@@ -836,7 +884,7 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
         session_protocol_decoded_community_message decoded = session_protocol_decode_for_community(
                 envelope_plaintext.data(),
                 envelope_plaintext.size(),
-                timestamp_ms.time_since_epoch().count(),
+                timestamp_s.time_since_epoch().count(),
                 pro_backend_ed_pk.data(),
                 pro_backend_ed_pk.size(),
                 error,
@@ -883,7 +931,6 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
                         protobuf_content.plaintext.size(),
                         keys.ed_sk0.data(),
                         keys.ed_sk0.size(),
-                        timestamp_ms.time_since_epoch().count(),
                         &recipient_pubkey,
                         &community_pubkey,
                         nullptr,
@@ -902,7 +949,7 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
         session_protocol_decoded_community_message decoded = session_protocol_decode_for_community(
                 decrypted_cipher.data(),
                 decrypted_cipher.size(),
-                timestamp_ms.time_since_epoch().count(),
+                timestamp_s.time_since_epoch().count(),
                 pro_backend_ed_pk.data(),
                 pro_backend_ed_pk.size(),
                 error,
@@ -910,4 +957,26 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
         scope_exit decoded_free{[&]() { session_protocol_decode_for_community_free(&decoded); }};
         REQUIRE(!decoded.has_pro);
     }
+}
+
+TEST_CASE("Pro rotating-seed derivation", "[session-protocol][pro][pro_kat]") {
+    // Deterministic BLAKE2b of the Pro master seed and the floored rotation period, so every device
+    // derives the same seed for the same period. Vectors computed independently (Python
+    // hashlib.blake2b, person="ProRotatingSeed_", input = seed || decimal-ASCII(period_start)).
+    auto master = "0101010101010101010101010101010101010101010101010101010101010101"_hexbytes;
+    auto seed_hex = [&](int64_t unix_ts) {
+        auto s = ProProof::rotating_seed(
+                master, std::chrono::sys_seconds{std::chrono::seconds{unix_ts}});
+        return oxenc::to_hex(s.begin(), s.end());
+    };
+
+    // KAT: 1700000000 floors to period start 1699488000; the next period starts at 1700092800.
+    CHECK(seed_hex(1700000000) ==
+          "e617ee563883b95a736a4e375e581f578150346046b08fdb58d07f6a317c2ff7");
+    CHECK(seed_hex(1700604800) ==
+          "01887cd6b6827c3b335c5ab677ce831a6b253016e3d23646639188036d97bd91");
+
+    // Idempotent within a rotation period (any ts in the same 7-day window), distinct across them.
+    CHECK(seed_hex(1700000000 + 3600) == seed_hex(1700000000));
+    CHECK(seed_hex(1700604800) != seed_hex(1700000000));
 }

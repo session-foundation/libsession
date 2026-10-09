@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -142,6 +143,7 @@ inline std::chrono::sys_seconds sysclock_now_s() {
     return sysclock_now<std::chrono::seconds>();
 }
 using sys_ms = std::chrono::sys_time<std::chrono::milliseconds>;
+using sys_seconds = std::chrono::sys_seconds;
 // Shortcut for sysclock_now<std::chrono::sys_time<std::chrono::milliseconds>>();
 inline sys_ms sysclock_now_ms() {
     return sysclock_now<std::chrono::milliseconds>();
@@ -300,8 +302,8 @@ std::tuple<std::string, std::string, std::optional<uint16_t>, std::optional<std:
 /// example, é (LATIN SMALL LETTER E, COMBINING ACUTE ACCENT) could get chopped between the e and
 /// the accent modifier, and end up as just "e" in the truncated string.
 ///
-inline std::string utf8_truncate(std::string val, size_t n) {
-    if (val.size() <= n)
+inline std::string utf8_truncate(std::string val, size_t max_bytes) {
+    if (val.size() <= max_bytes)
         return val;
     // The *first* char in a utf8 sequence is either:
     // 0b0....... -- single byte encoding, for values up to 0x7f (ascii)
@@ -318,21 +320,19 @@ inline std::string utf8_truncate(std::string val, size_t n) {
     // To prevent slicing, then, we just have to ensure the the first byte after the slice point is
     // *not* a continuation byte (and therefore is either a plain ascii character codepoint, or is
     // the start of a multi-character codepoint).
-    while (n > 0 && (val[n] & 0b1100'0000) == 0b1000'0000)
-        --n;
+    while (max_bytes > 0 && (val[max_bytes] & 0b1100'0000) == 0b1000'0000)
+        --max_bytes;
 
-    val.resize(n);
+    val.resize(max_bytes);
     return val;
 }
 
-/// Truncates an utf-16 encoded string to at most `codepoint_len` codepoints long, taking care to
-/// not truncate in the middle of a surrogate pair. Notes that if the input string contains invalid
-/// UTF-16 sequences (e.g. unpaired surrogates) the behavior here is undefined.
-size_t utf16_count_truncated_to_codepoints(
-        std::span<const char16_t> utf16_string, size_t codepoint_len);
+/// Truncates a UTF-16 encoded string view and returns that same string view truncated to be no more
+/// than `max_codepoints` codepoints long.
+std::u16string_view utf16_truncate(std::u16string_view in, size_t max_codepoints);
 
 /// Returns the number of unicode codepoints in a utf-16 encoded string.
-size_t utf16_count(std::span<const char16_t> utf16_string);
+size_t utf16_count(std::u16string_view utf16_string);
 
 // Helper function to transform a timestamp provided in seconds, milliseconds or microseconds to
 // seconds

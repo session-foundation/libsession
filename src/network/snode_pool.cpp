@@ -8,6 +8,7 @@
 #include <concepts>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
 #include <oxen/quic.hpp>
@@ -42,6 +43,25 @@ namespace {
 
     const std::chrono::seconds STRIKE_EXPIRY = 48h;
     const std::chrono::seconds SAVE_THROTTLE = 5min;
+
+    // A swarm rejection is evidence against the pool snapshot the swarm was derived from, so it is
+    // only worth acting on once that snapshot is old enough for a refresh to plausibly return
+    // something different.
+    const std::chrono::seconds EVIDENCE_REFRESH_MIN_POOL_AGE = 1min;
+
+    // A rejection arriving *after* we already refreshed on one is the refresh telling us it didn't
+    // help - the network hasn't settled, or the node is lying - so each successive one waits twice
+    // as long, up to `cache_expiration`.  A single 3-node refresh per minute sustained indefinitely
+    // is not an acceptable resting state for a client on a bad connection, and without this it is
+    // exactly what a persistent rejection source would produce.
+    const std::chrono::seconds EVIDENCE_REFRESH_BASE_BACKOFF = 1min;
+
+    // An account redirected more than this many times within one pool generation is being bounced
+    // between nodes that disagree, or its swarm has moved on too far for our pool to keep up.  A
+    // redirect is still the best information we have, so past it each one is still followed, and
+    // also asks for the refresh that can settle it.  Legitimate rearrangements count too (nothing
+    // resets this short of a refresh), hence the headroom.
+    constexpr uint8_t SWARM_REDIRECTS_BEFORE_REFRESH = 8;
 }  // namespace
 
 SnodePool::SnodePool(
@@ -339,6 +359,10 @@ void SnodePool::_refresh_snode_cache(std::optional<std::string> request_id_opt) 
     _loop->call([this, request_id_opt] {
         if (_suspended) {
             log::info(cat, "Ignoring refresh as pool is suspended.");
+
+            // Anything queued against a refresh we are declining to start has nothing left to wait
+            // for: suspending abandons any refresh in progress, so none can answer it later
+            _run_pending_refresh_callbacks(false);
             return;
         }
 
@@ -416,6 +440,7 @@ void SnodePool::_refresh_snode_cache(std::optional<std::string> request_id_opt) 
                     (use_seed_nodes ? "No seed nodes are configured!"
                                     : "Found no nodes and decided not to use seed nodes!"));
             _current_snode_cache_refresh_id.reset();
+            _run_pending_refresh_callbacks(false);
             return;
         }
 
@@ -438,7 +463,9 @@ void SnodePool::_launch_next_refresh_request(
                  refreshing_from_seed_nodes,
                  use_direct_fetcher,
                  total_requests] {
-        if (!_current_snode_cache_refresh_id)
+        // A retry scheduled for a refresh that has since been abandoned or replaced mustn't touch
+        // the one in its place - its candidates in particular
+        if (_current_snode_cache_refresh_id != request_id)
             return;
 
         const auto target_request_id = "{}-{}"_format(request_id, index);
@@ -496,7 +523,7 @@ void SnodePool::_launch_next_refresh_request(
                             // possible that the node is offline so don't both including it in the
                             // initial cache (if we get a successful connection and refresh the
                             // cache then it would be added back at that point)
-                            if (snode.requested_unlock_height &&
+                            if (snode.requested_unlock_height > 0 &&
                                 snode.requested_unlock_height <= expected_current_height) {
                                 unlocked_count++;
                                 continue;
@@ -544,12 +571,17 @@ void SnodePool::_launch_next_refresh_request(
                     "trying again in {}ms.",
                     target_request_id,
                     delay.count());
-            _loop->call_later(delay, [weak_self = weak_from_this(), this] {
+            _loop->call_later(delay, [weak_self = weak_from_this(), this, request_id] {
                 // We need to wait until after the `call_later` to reset the `refresh_id` (and clear
                 // previous results) as if we don't then additional refreshes could be triggered
                 // during the delay
                 auto self = weak_self.lock();
                 if (!self)
+                    return;
+
+                // Abandoned (by a suspend) or replaced during the delay: resetting the id would
+                // wipe out whichever refresh has it now, and there is nothing of ours to restart
+                if (_current_snode_cache_refresh_id != request_id)
                     return;
 
                 _current_snode_cache_refresh_id.reset();
@@ -570,6 +602,7 @@ void SnodePool::_launch_next_refresh_request(
                     cat, "[Request {}] No fetcher available, aborting refresh.", target_request_id);
             _current_snode_cache_refresh_id.reset();
             _refresh_candidate_nodes.clear();
+            _run_pending_refresh_callbacks(false);
             return;
         }
 
@@ -602,7 +635,7 @@ void SnodePool::_launch_next_refresh_request(
                         bool success,
                         bool timeout,
                         int16_t status_code,
-                        std::vector<std::pair<std::string, std::string>> headers,
+                        std::vector<std::pair<std::string, std::string>> /*headers*/,
                         std::optional<std::string> response) {
                     // If the refresh was cancelled or completed while we were in-flight, do nothing
                     if (!_current_snode_cache_refresh_id ||
@@ -713,6 +746,46 @@ void SnodePool::_on_refresh_complete(
                  refreshing_from_seed_nodes,
                  use_direct_fetcher,
                  total_requests] {
+        // Throw away everything we received and start the requests again after a backoff
+        auto discard_and_retry = [weak_self = weak_from_this(),
+                                  refresh_id,
+                                  refreshing_from_seed_nodes,
+                                  use_direct_fetcher,
+                                  total_requests](std::string_view reason) {
+            auto self = weak_self.lock();
+
+            if (!self)
+                return;
+
+            self->_snode_refresh_results.clear();
+            self->_snode_cache_refresh_failure_count++;
+            auto delay =
+                    self->_config.retry_delay.exponential(self->_snode_cache_refresh_failure_count);
+
+            log::error(
+                    cat,
+                    "[Request {}] Discarding responses and retrying after {}ms due to {}.",
+                    refresh_id,
+                    delay.count(),
+                    reason);
+            self->_loop->call_later(
+                    delay,
+                    [weak_self,
+                     refresh_id,
+                     refreshing_from_seed_nodes,
+                     use_direct_fetcher,
+                     total_requests] {
+                        if (auto self = weak_self.lock())
+                            for (uint8_t i = 0; i < total_requests; ++i)
+                                self->_launch_next_refresh_request(
+                                        refresh_id,
+                                        i,
+                                        refreshing_from_seed_nodes,
+                                        use_direct_fetcher,
+                                        total_requests);
+                    });
+        };
+
         // Sort the vectors (so make it easier to find the intersection)
         std::vector<std::vector<service_node>> processed_nodes;
         processed_nodes.reserve(raw_results.size());
@@ -744,34 +817,7 @@ void SnodePool::_on_refresh_complete(
                 std::ranges::stable_sort(nodes);
                 processed_nodes.emplace_back(std::move(nodes));
             } catch (const std::exception& e) {
-                _snode_refresh_results.clear();
-                _snode_cache_refresh_failure_count++;
-                auto delay = _config.retry_delay.exponential(_snode_cache_refresh_failure_count);
-
-                log::error(
-                        cat,
-                        "[Request {}] Discarding responses and retrying after {}ms due to invalid "
-                        "response #{}: {}.",
-                        refresh_id,
-                        delay.count(),
-                        (i + 1),
-                        e.what());
-                _loop->call_later(
-                        delay,
-                        [weak_self = weak_from_this(),
-                         refresh_id,
-                         refreshing_from_seed_nodes,
-                         use_direct_fetcher,
-                         total_requests] {
-                            if (auto self = weak_self.lock())
-                                for (uint8_t i = 0; i < total_requests; ++i)
-                                    self->_launch_next_refresh_request(
-                                            refresh_id,
-                                            i,
-                                            refreshing_from_seed_nodes,
-                                            use_direct_fetcher,
-                                            total_requests);
-                        });
+                discard_and_retry("invalid response #{}: {}"_format((i + 1), e.what()));
                 return;
             }
         }
@@ -831,13 +877,26 @@ void SnodePool::_on_refresh_complete(
             }
         }
 
+        // Only replace the cache if the refresh actually came back with a usable pool.  A refresh
+        // can legitimately succeed and still produce too few nodes (most easily when the multi-
+        // request intersection finds little in common), and overwriting a good cache with that
+        // leaves us with nothing to route through until the next refresh completes.  Treat it as a
+        // failed refresh and retry instead, keeping whatever cache we already have.
+        if (nodes.empty() || nodes.size() < _config.cache_min_size) {
+            discard_and_retry("a refreshed cache of only {} nodes (need {})"_format(
+                    nodes.size(), _config.cache_min_size));
+            return;
+        }
+
         // Update the cache with the combined nodes
         _update_cache(refresh_id, std::move(nodes));
     });
 }
 
 void SnodePool::_update_cache(std::string refresh_id, std::vector<service_node> nodes) {
-    _loop->call([this, refresh_id, &nodes] {
+    // Use 'call_get' to force this to be synchronous; a plain 'call' would queue when we aren't
+    // already on the loop thread, and the captured `nodes` reference would dangle
+    _loop->call_get([this, refresh_id, &nodes] {
         // Shuffle the nodes so we don't have a specific order
         std::ranges::shuffle(nodes, csrng);
         log::info(
@@ -851,6 +910,11 @@ void SnodePool::_update_cache(std::string refresh_id, std::vector<service_node> 
         _snode_cache = std::move(nodes);
         _all_swarms = swarm::generate_swarms(_snode_cache);
         _swarm_cache.clear();
+
+        // The pool these redirects were correcting has been replaced, so they have outlived what
+        // they were for.  Keeping them would let one node's claim outlast the ground truth that
+        // would have overruled it.
+        _swarm_overrides.clear();
         _last_snode_cache_update = std::chrono::system_clock::now();
 
         // Reset all failure and refresh-in-progress state
@@ -863,23 +927,35 @@ void SnodePool::_update_cache(std::string refresh_id, std::vector<service_node> 
             SnodePool::_perform_cache_write(path, cache);
         });
 
-        // Trigger any callbacks
-        if (!_after_snode_cache_refresh.empty()) {
-            log::debug(
-                    cat, "Executing {} post-refresh callbacks.", _after_snode_cache_refresh.size());
-
-            for (const auto& cb : _after_snode_cache_refresh) {
-                try {
-                    cb();
-                } catch (const std::exception& e) {
-                    log::error(cat, "Exception thrown in a post-refresh callback: {}", e.what());
-                }
-            }
-
-            // Clear the callbacks
-            _after_snode_cache_refresh.clear();
-        }
+        _run_pending_refresh_callbacks(true);
     });
+}
+
+void SnodePool::_run_pending_refresh_callbacks(bool refreshed) {
+    if (_after_snode_cache_refresh.empty())
+        return;
+
+    // These must be moved out of the member before being run: a callback can re-enter the pool and
+    // register another post-refresh callback (`get_swarm` does exactly that if the cache is still
+    // empty), which would reallocate the vector we're iterating and leave us calling through a
+    // freed `std::function`. Anything registered while we're here accumulates in the now-empty
+    // member and runs after the next refresh instead of being silently discarded.
+    auto callbacks = std::move(_after_snode_cache_refresh);
+    _after_snode_cache_refresh.clear();  // A moved-from vector is valid but unspecified
+
+    log::debug(
+            cat,
+            "Executing {} post-refresh callbacks ({}).",
+            callbacks.size(),
+            (refreshed ? "refreshed" : "refresh did not happen"));
+
+    for (const auto& cb : callbacks) {
+        try {
+            cb(refreshed);
+        } catch (const std::exception& e) {
+            log::error(cat, "Exception thrown in a post-refresh callback: {}", e.what());
+        }
+    }
 }
 
 // MARK: Public Functions
@@ -888,6 +964,22 @@ void SnodePool::suspend() {
     // Use 'call_get' to force this to be synchronous
     _loop->call_get([this] {
         _suspended = true;
+
+        // A refresh in progress can only fail from here on, since every fetch is refused while
+        // suspended, so it is abandoned rather than left to work its way through the candidates,
+        // and whatever waits on it is answered now.  The failures it built up are dropped too:
+        // they say nothing about the network we resume on.
+        if (_current_snode_cache_refresh_id) {
+            log::info(
+                    cat,
+                    "[Request {}] Abandoning cache refresh for suspension.",
+                    *_current_snode_cache_refresh_id);
+            _current_snode_cache_refresh_id.reset();
+            _refresh_candidate_nodes.clear();
+            _snode_refresh_results.clear();
+            _snode_cache_refresh_failure_count = 0;
+            _run_pending_refresh_callbacks(false);
+        }
 
         // Force a strike write immediately if we had one scheduled
         if (_strikes_flush_scheduled)
@@ -927,9 +1019,29 @@ void SnodePool::clear_cache() {
         _snode_cache = {};
         _all_swarms = {};
         _swarm_cache = {};
+        _swarm_overrides = {};
 
         _disk_loop->call([path = _snode_cache_file_path] { SnodePool::_clear_disk_cache(path); });
     });
+}
+
+size_t SnodePool::_active_strike_count(const ed25519_pubkey& key) const {
+    auto it = _snode_strikes.find(key);
+
+    if (it == _snode_strikes.end())
+        return 0;
+
+    auto threshold = sysclock_now_s() - STRIKE_EXPIRY;
+
+    return std::ranges::count_if(it->second, [threshold](auto t) { return t > threshold; });
+}
+
+bool SnodePool::_node_struck_out(const ed25519_pubkey& key) const {
+    auto strikes = _active_strike_count(key);
+
+    // The `strikes > 0` is what keeps a threshold of 0 meaning "drop a node on its first strike";
+    // comparing straight against 0 also drops every node that has never failed at all
+    return (strikes > 0 && strikes >= _config.cache_node_strike_threshold);
 }
 
 void SnodePool::record_node_failure(const service_node& node, bool permanent) {
@@ -939,18 +1051,17 @@ void SnodePool::record_node_failure(const service_node& node, bool permanent) {
 void SnodePool::record_node_failure(const ed25519_pubkey& key, bool permanent) {
     _loop->call([this, key, permanent] {
         auto now = sysclock_now_s();
+        auto& stamps = _snode_strikes[key];
+        std::erase_if(stamps, [threshold = now - STRIKE_EXPIRY](auto t) { return t <= threshold; });
 
-        if (permanent)
-            for (int i = 0; i < _config.cache_node_strike_threshold; ++i)
-                _snode_strikes[key].push_back(now);
-        else
-            _snode_strikes[key].push_back(now);
+        // A permanent failure has to strike the node out whatever the threshold is - looping up to
+        // a threshold of 0 records nothing and leaves the node in rotation
+        auto strikes = (permanent ? std::max<uint16_t>(1, _config.cache_node_strike_threshold) : 1);
 
-        log::trace(
-                cat,
-                "Recorded strike for node {}, total: {}",
-                key.hex(),
-                _snode_strikes[key].size());
+        for (uint16_t i = 0; i < strikes; ++i)
+            stamps.push_back(now);
+
+        log::trace(cat, "Recorded strike for node {}, total: {}", key.hex(), stamps.size());
 
         // Throttle persisting the strikes to disk to at most every X minutes
         if (!_strikes_flush_scheduled && !_suspended) {
@@ -978,22 +1089,16 @@ uint16_t SnodePool::node_strike_count(const service_node& node) {
 }
 
 uint16_t SnodePool::node_strike_count(const ed25519_pubkey& key) {
-    return _loop->call_get([this, &key] {
-        auto it = _snode_strikes.find(key);
-        if (it == _snode_strikes.end())
-            return uint16_t{0};
+    return _loop->call_get(
+            [this, &key] { return static_cast<uint16_t>(_active_strike_count(key)); });
+}
 
-        const auto& stamps = it->second;
+bool SnodePool::node_struck_out(const service_node& node) {
+    return node_struck_out(node.remote_pubkey);
+}
 
-        const auto threshold = sysclock_now_s() - STRIKE_EXPIRY;
-
-        uint16_t count = 0;
-        for (auto t : stamps)
-            if (t > threshold)
-                count++;
-
-        return count;
-    });
+bool SnodePool::node_struck_out(const ed25519_pubkey& key) {
+    return _loop->call_get([this, &key] { return _node_struck_out(key); });
 }
 
 void SnodePool::clear_node_strikes() {
@@ -1009,10 +1114,13 @@ void SnodePool::clear_node_strikes() {
 }
 
 void SnodePool::refresh_if_needed(
-        const std::vector<service_node>& in_use_nodes, std::function<void()> on_refresh_complete) {
+        const std::vector<service_node>& in_use_nodes, refresh_callback_t on_refresh_complete) {
     _loop->call([this, in_use_nodes, cb = std::move(on_refresh_complete)] {
         if (_suspended) {
             log::info(cat, "Ignoring refresh as pool is suspended.");
+
+            if (cb)
+                cb(false);
             return;
         }
 
@@ -1037,9 +1145,7 @@ void SnodePool::refresh_if_needed(
                     in_use_keys.insert(node.remote_pubkey);
 
                 for (const auto& node : _snode_cache) {
-                    auto it = _snode_strikes.find(node.remote_pubkey);
-                    if (it != _snode_strikes.end() &&
-                        it->second.size() >= _config.cache_node_strike_threshold)
+                    if (_node_struck_out(node.remote_pubkey))
                         continue;
 
                     // If the caller considers the node as already in use then it wouldn't be
@@ -1078,7 +1184,159 @@ void SnodePool::refresh_if_needed(
             } else
                 _refresh_snode_cache();
         else if (!already_running && cb)
-            cb();
+            // Nothing needed refreshing, which is the answer the caller wanted rather than a
+            // failure to get one
+            cb(true);
+    });
+}
+
+void SnodePool::invalidate_swarm(x25519_pubkey swarm_pubkey, refresh_callback_t on_complete) {
+    _loop->call([this, swarm_pubkey, cb = std::move(on_complete)]() mutable {
+        if (_suspended) {
+            log::info(cat, "Ignoring swarm invalidation as pool is suspended.");
+
+            if (cb)
+                cb(false);
+            return;
+        }
+
+        // The swarm cache only ever memoises `swarm::get_swarm(pubkey, _all_swarms)`, and
+        // `_all_swarms` is generated from the pool, so dropping the single entry would recompute
+        // the same rejected answer.  What the rejection actually disproves is the pool snapshot,
+        // and a refresh is the only thing that replaces it - clearing the swarm cache as it goes.
+        auto now = std::chrono::system_clock::now();
+
+        if (!_current_snode_cache_refresh_id) {
+            // The backoff is deliberately global rather than per-swarm: a refresh replaces the pool
+            // every swarm is derived from, so a rejection for one swarm is exactly as unhelpful to
+            // act on right after a refresh as a second rejection for the swarm that prompted it
+            auto pool_age = now - _last_snode_cache_update;
+            auto since_last = now - _last_evidence_refresh;
+
+            // Quiet for twice the interval we were holding means whatever caused the last run is
+            // over, so the next incident starts from the base delay rather than inheriting it
+            if (since_last > 2 * _evidence_refresh_backoff)
+                _evidence_refresh_backoff = 0s;
+
+            if (pool_age < EVIDENCE_REFRESH_MIN_POOL_AGE || since_last < _evidence_refresh_backoff)
+                log::debug(
+                        cat,
+                        "Swarm {} was rejected, but the pool is {}s old and the last refresh on a "
+                        "rejection was {}s ago (backoff {}s); leaving it alone.",
+                        swarm_pubkey.hex(),
+                        std::chrono::duration_cast<std::chrono::seconds>(pool_age).count(),
+                        std::chrono::duration_cast<std::chrono::seconds>(since_last).count(),
+                        _evidence_refresh_backoff.count());
+            else {
+                _evidence_refresh_backoff = std::min(
+                        std::chrono::seconds{_config.cache_expiration},
+                        (_evidence_refresh_backoff == 0s ? EVIDENCE_REFRESH_BASE_BACKOFF
+                                                         : _evidence_refresh_backoff * 2));
+                _last_evidence_refresh = now;
+
+                log::info(
+                        cat,
+                        "Swarm {} was rejected by a node we had in it, refreshing the pool (next "
+                        "rejection-driven refresh no sooner than {}s from now).",
+                        swarm_pubkey.hex(),
+                        _evidence_refresh_backoff.count());
+                _refresh_snode_cache();
+            }
+        }
+
+        if (!cb)
+            return;
+
+        // `_refresh_snode_cache` runs inline here (we are on the loop thread) and can decline to
+        // start, so it is the refresh id - not the call above - that says whether there is anything
+        // to wait for.  A callback queued against a refresh that never started never runs, and on
+        // this path that would strand the request that triggered the rejection.
+        if (_current_snode_cache_refresh_id)
+            _after_snode_cache_refresh.push_back(std::move(cb));
+        else
+            // No refresh started, so the caller is holding the same swarm answer it came in with
+            cb(false);
+    });
+}
+
+bool SnodePool::record_swarm_redirect(
+        x25519_pubkey swarm_pubkey, const std::vector<ed25519_pubkey>& swarm_node_keys) {
+    return _loop->call_get([this, swarm_pubkey, &swarm_node_keys] {
+        if (_snode_cache.empty() || _all_swarms.empty())
+            return false;
+
+        // Resolving the names against our own pool is what makes a redirect safe to act on: the
+        // responding node chooses which registered nodes we end up talking to, but it cannot invent
+        // a node or point us at an address of its own choosing, because we never read the contact
+        // details it sent
+        std::unordered_set<ed25519_pubkey> named{swarm_node_keys.begin(), swarm_node_keys.end()};
+        std::vector<service_node> resolved;
+
+        for (const auto& node : _snode_cache)
+            if (named.count(node.remote_pubkey))
+                resolved.push_back(node);
+
+        if (resolved.empty()) {
+            log::debug(
+                    cat,
+                    "Ignoring redirect for {}: none of the {} named nodes are in our pool.",
+                    swarm_pubkey.hex(),
+                    swarm_node_keys.size());
+            return false;
+        }
+
+        // Too few of the named nodes resolved to call the result a swarm: either our pool is too
+        // old to know the rest, or the redirect isn't describing one.  Only a refresh settles
+        // which, and the nodes we do have still beat the swarm that just rejected us, so they are
+        // followed meanwhile.  Deliberately not also requiring that some names were unknown - a
+        // redirect naming one node we do know is the shape with no stale pool to explain it.
+        const bool too_few_resolved = resolved.size() < _config.cache_min_swarm_size;
+
+        auto& [nodes, redirects] = _swarm_overrides[swarm_pubkey];
+        nodes = std::move(resolved);
+
+        // Saturating, because counting carries on past the limit for as long as the refresh it
+        // asks for is throttled, and wrapping would stop it asking
+        if (redirects < std::numeric_limits<decltype(redirects)>::max())
+            ++redirects;
+
+        log::debug(
+                cat,
+                "Redirected to a swarm of {} nodes for {} (redirect {} since the pool was "
+                "refreshed).",
+                nodes.size(),
+                swarm_pubkey.hex(),
+                redirects);
+
+        if (too_few_resolved) {
+            log::warning(
+                    cat,
+                    "Asking for a refresh for {}: only {} of the {} nodes its redirect named are "
+                    "ones we know.",
+                    swarm_pubkey.hex(),
+                    nodes.size(),
+                    named.size());
+            invalidate_swarm(swarm_pubkey);
+        } else if (redirects > SWARM_REDIRECTS_BEFORE_REFRESH) {
+            // Past the limit every redirect asks again, for as long as the refresh stays
+            // throttled, so only crossing it is worth a warning
+            if (redirects == SWARM_REDIRECTS_BEFORE_REFRESH + 1)
+                log::warning(
+                        cat,
+                        "Asking for a refresh for {}: {} redirects since the pool was refreshed.",
+                        swarm_pubkey.hex(),
+                        redirects);
+            else
+                log::debug(
+                        cat,
+                        "Asking again for a refresh for {}: {} redirects since the pool was "
+                        "refreshed.",
+                        swarm_pubkey.hex(),
+                        redirects);
+            invalidate_swarm(swarm_pubkey);
+        }
+
+        return true;
     });
 }
 
@@ -1127,9 +1385,7 @@ std::vector<service_node> SnodePool::get_unused_nodes(
                 continue;
 
             // Skip nodes with too many failures
-            auto it = _snode_strikes.find(node.remote_pubkey);
-            if (it != _snode_strikes.end() &&
-                it->second.size() >= _config.cache_node_strike_threshold)
+            if (_node_struck_out(node.remote_pubkey))
                 continue;
 
             // Skip nodes whos IP addresses are in the exclusion list
@@ -1159,14 +1415,21 @@ void SnodePool::get_swarm(
     log::trace(cat, "{} called for {}.", __PRETTY_FUNCTION__, swarm_pubkey.hex());
 
     _loop->call([this, swarm_pubkey, ignore_strike_count, cb = std::move(callback)] {
+        // Trigger a non-blocking background refresh if the data is stale.  Up here so that it runs
+        // for every call: answers from an override or the swarm cache below return early, and
+        // they are most of them.
+        _loop->call_soon([weak_self = weak_from_this()] {
+            if (auto self = weak_self.lock())
+                self->refresh_if_needed({});
+        });
+
         auto filter_by_strikes =
                 [this](std::vector<service_node> nodes) -> std::vector<service_node> {
             // Shuffle everything to start with
             std::ranges::shuffle(nodes, csrng);
 
             auto get_strike_count = [this](const service_node& node) -> size_t {
-                auto it = _snode_strikes.find(node.remote_pubkey);
-                return (it != _snode_strikes.end() ? it->second.size() : 0);
+                return _active_strike_count(node.remote_pubkey);
             };
 
             // Partition into below-threshold and above-thresold.  This keeps the shuffled order of
@@ -1193,6 +1456,17 @@ void SnodePool::get_swarm(
             return nodes;
         };
 
+        // A node that rejected a request for this account told us where it belongs, which beats
+        // anything we can work out from a pool we now know is behind.  There is no swarm id to give
+        // back - a redirect names members, not an id - and nothing downstream reads it.
+        if (auto it = _swarm_overrides.find(swarm_pubkey); it != _swarm_overrides.end()) {
+            const auto& swarm_nodes = it->second.first;
+
+            return cb(
+                    swarm::INVALID_SWARM_ID,
+                    (ignore_strike_count ? swarm_nodes : filter_by_strikes(swarm_nodes)));
+        }
+
         // Check the in-memory swarm cache first
         if (auto it = _swarm_cache.find(swarm_pubkey); it != _swarm_cache.end()) {
             const auto& swarm_nodes = it->second.second;
@@ -1209,7 +1483,12 @@ void SnodePool::get_swarm(
 
             // Queue this entire function call to be re-run after the refresh.
             _after_snode_cache_refresh.push_back(
-                    [this, swarm_pubkey, ignore_strike_count, cb = std::move(cb)]() {
+                    [this, swarm_pubkey, ignore_strike_count, cb = std::move(cb)](bool refreshed) {
+                        // Re-deferring when the refresh never happened would just queue against the
+                        // next one that doesn't either; there is no swarm to give back
+                        if (!refreshed)
+                            return cb(swarm::INVALID_SWARM_ID, {});
+
                         this->get_swarm(swarm_pubkey, ignore_strike_count, std::move(cb));
                     });
 
@@ -1219,12 +1498,6 @@ void SnodePool::get_swarm(
 
             return;
         }
-
-        // Trigger a non-blocking background refresh if the data is stale
-        _loop->call_soon([weak_self = weak_from_this()] {
-            if (auto self = weak_self.lock())
-                self->refresh_if_needed({});
-        });
 
         // Perform the swarm calculation using our local copy of the data
         auto swarm = swarm::get_swarm(swarm_pubkey, _all_swarms);

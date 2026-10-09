@@ -375,29 +375,155 @@ LIBSESSION_EXPORT void user_profile_set_pro_badge(config_object* conf, bool enab
 /// - `enabled` -- Flag which specifies whether the users display picture is animated or not.
 LIBSESSION_EXPORT void user_profile_set_animated_avatar(config_object* conf, bool enabled);
 
-/// API: user_profile/user_profile_get_pro_access_expiry_ms
+/// API: user_profile/user_profile_get_pro_access_expiry
 ///
 /// Retrieves the Session Pro access expiry unix timestamp if it has been set, this should generally
-/// be the expiry value returned from /get_pro_details.
+/// be the expiry value returned from /get_pro_status.
 ///
 /// Inputs:
 /// - `conf` -- [in] Pointer to the config object
 ///
 /// Outputs:
-/// - `uint64_t` - The unix timestamp in milliseconds that the users pro access will expire, or 0 if
+/// - `int64_t` - The unix timestamp in seconds that the users pro access will expire, or 0 if
 /// unset.
-LIBSESSION_EXPORT uint64_t user_profile_get_pro_access_expiry_ms(const config_object* conf);
+LIBSESSION_EXPORT int64_t user_profile_get_pro_access_expiry(const config_object* conf);
 
-/// API: user_profile/user_profile_set_pro_access_expiry_ms
+/// API: user_profile/user_profile_set_pro_access_expiry
 ///
 /// Updates the Session Pro access expiry unix timestamp.
 ///
 /// Inputs:
 /// - `conf` -- [in] Pointer to the config object
-/// - `access_expiry_ts_ms` -- The timestamp that the users Session Pro access will expire, or 0 to
-/// remove the value.
-LIBSESSION_EXPORT void user_profile_set_pro_access_expiry_ms(
-        config_object* conf, uint64_t access_expiry_ts_ms);
+/// - `access_expiry_ts` -- The timestamp (unix epoch seconds) that the users Session Pro access
+/// will expire, or 0 to remove the value.
+LIBSESSION_EXPORT void user_profile_set_pro_access_expiry(
+        config_object* conf, int64_t access_expiry_ts);
+
+/// API: user_profile/user_profile_get_pro_auto_renewing
+///
+/// Returns whether the account's current Session Pro subscription is auto-renewing. Backend-derived
+/// (the `auto_renewing` field on /get_pro_status); set alongside the access expiry.
+///
+/// Inputs:
+/// - `conf` -- [in] Pointer to the config object
+///
+/// Outputs:
+/// - `int` -- 1 if the subscription is known to be auto-renewing, otherwise 0 (terminal, unknown,
+///   or not Pro).
+LIBSESSION_EXPORT int user_profile_get_pro_auto_renewing(const config_object* conf);
+
+/// API: user_profile/user_profile_set_pro_auto_renewing
+///
+/// Records whether the current Session Pro subscription is auto-renewing: nonzero stores the flag,
+/// 0 clears it (which is also how it is cleared when the subscription lapses).
+///
+/// Inputs:
+/// - `conf` -- [in] Pointer to the config object
+/// - `auto_renewing` -- [in] nonzero if auto-renewing, 0 to clear
+///
+/// Outputs:
+/// - `void`
+LIBSESSION_EXPORT void user_profile_set_pro_auto_renewing(config_object* conf, int auto_renewing);
+
+/// API: user_profile/user_profile_get_pro_grace_period
+///
+/// Returns the account's grace period in seconds (`get_pro_status.grace_period_duration`), or 0 if
+/// none is stored. Backend-derived and synced alongside the access expiry, so any linked device can
+/// compute when coverage actually ends: `access_expiry + grace_period`. The access expiry is the
+/// payment-due date -- the instant the term was paid through -- and `[E, E + G)` is the window
+/// where the payment is overdue but service continues.
+///
+/// There is deliberately no companion presence check: the backend sends 0 whenever the
+/// subscription is not auto-renewing, so "unset" and "zero" describe the same account and both give
+/// `expiry + 0 == expiry`.
+///
+/// Inputs:
+/// - `conf` -- [in] Pointer to the config object
+///
+/// Outputs:
+/// - `int64_t` -- the grace period in seconds, or 0 if unset.
+LIBSESSION_EXPORT int64_t user_profile_get_pro_grace_period(const config_object* conf);
+
+/// API: user_profile/user_profile_set_pro_grace_period
+///
+/// Sets the account's grace period, in seconds. Set alongside `user_profile_set_pro_access_expiry`
+/// from each `get_pro_status` response; 0 (or negative) clears it.
+///
+/// Inputs:
+/// - `conf` -- [in] Pointer to the config object
+/// - `grace_seconds` -- [in] the grace period in seconds, or 0 to clear
+///
+/// Outputs:
+/// - `void`
+LIBSESSION_EXPORT void user_profile_set_pro_grace_period(
+        config_object* conf, int64_t grace_seconds);
+
+/// API: user_profile/user_profile_get_refund_requested
+///
+/// Retrieves the timestamp at which the user requested a refund of their current Session Pro
+/// subscription.  This state is synced across the user's devices via config (not the Pro backend).
+/// A stored value more than a week in the past is ignored (returns 0).
+///
+/// Inputs:
+/// - `conf` -- [in] Pointer to the config object
+///
+/// Outputs:
+/// - `int64_t` - the unix timestamp (seconds) at which a refund was requested, or 0 if no refund
+/// has been requested (or the stored value is stale).
+LIBSESSION_EXPORT int64_t user_profile_get_refund_requested(const config_object* conf);
+
+/// API: user_profile/user_profile_set_refund_requested
+///
+/// Records (or clears) that the user has requested a refund of their current Session Pro
+/// subscription, propagating it to the user's other devices via config sync.  The client should
+/// clear it (passing 0) when a new subscription begins.
+///
+/// Inputs:
+/// - `conf` -- [in] Pointer to the config object
+/// - `refund_ts` -- the timestamp (unix epoch seconds) at which the refund was requested, or 0 to
+/// clear the refund-requested state.
+LIBSESSION_EXPORT void user_profile_set_refund_requested(config_object* conf, int64_t refund_ts);
+
+/// API: user_profile/user_profile_get_pro_prepaid
+///
+/// Retrieves the timestamp at which a Session Pro purchase was initiated (the "purchase in flight"
+/// marker), synced across the user's devices. A stored value more than a week in the past is
+/// ignored (returns 0).
+///
+/// Inputs:
+/// - `conf` -- [in] Pointer to the config object
+///
+/// Outputs:
+/// - `int64_t` - the unix timestamp (seconds) at which a purchase was initiated, or 0 if none is
+/// pending (or the stored value is stale).
+LIBSESSION_EXPORT int64_t user_profile_get_pro_prepaid(const config_object* conf);
+
+/// API: user_profile/user_profile_set_pro_prepaid
+///
+/// Records (or clears) that a Session Pro purchase is in flight so the user's other devices poll
+/// the backend to pull the entitlement through. A no-op if the account is already Pro; cleared
+/// automatically once entitlement lands, or explicitly by passing 0.
+///
+/// Inputs:
+/// - `conf` -- [in] Pointer to the config object
+/// - `prepaid_ts` -- the timestamp (unix epoch seconds) at which the purchase was initiated, or 0
+/// to clear the marker.
+LIBSESSION_EXPORT void user_profile_set_pro_prepaid(config_object* conf, int64_t prepaid_ts);
+
+/// API: user_profile/user_profile_get_pro_renewal_target
+///
+/// Decide when to (re)request a Session Pro proof (see the C++ pro_renewal_target). Given `now`,
+/// returns the unix timestamp (seconds) at which a renewal should be attempted -- renew now if it
+/// is <= now, otherwise schedule for then -- or 0 if no renewal is needed.
+///
+/// Inputs:
+/// - `conf` -- [in] Pointer to the config object
+/// - `now` -- the caller's current unix timestamp (seconds)
+///
+/// Outputs:
+/// - `int64_t` - the renewal-target unix timestamp, or 0 for "no renewal needed".
+LIBSESSION_EXPORT int64_t
+user_profile_get_pro_renewal_target(const config_object* conf, int64_t now);
 
 #ifdef __cplusplus
 }  // extern "C"

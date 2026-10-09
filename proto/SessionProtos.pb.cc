@@ -483,11 +483,10 @@ PROTOBUF_CONSTEXPR ProProof::ProProof(
     ::_pbi::ConstantInitialized): _impl_{
     /*decltype(_impl_._has_bits_)*/{}
   , /*decltype(_impl_._cached_size_)*/{}
-  , /*decltype(_impl_.genindexhash_)*/{&::_pbi::fixed_address_empty_string, ::_pbi::ConstantInitialized{}}
+  , /*decltype(_impl_.revocationtag_)*/{&::_pbi::fixed_address_empty_string, ::_pbi::ConstantInitialized{}}
   , /*decltype(_impl_.rotatingpublickey_)*/{&::_pbi::fixed_address_empty_string, ::_pbi::ConstantInitialized{}}
   , /*decltype(_impl_.sig_)*/{&::_pbi::fixed_address_empty_string, ::_pbi::ConstantInitialized{}}
-  , /*decltype(_impl_.expiryunixts_)*/uint64_t{0u}
-  , /*decltype(_impl_.version_)*/0u} {}
+  , /*decltype(_impl_.expiryunixts_)*/uint64_t{0u}} {}
 struct ProProofDefaultTypeInternal {
   PROTOBUF_CONSTEXPR ProProofDefaultTypeInternal()
       : _instance(::_pbi::ConstantInitialized{}) {}
@@ -10999,10 +10998,7 @@ std::string GroupUpdateDeleteMemberContentMessage::GetTypeName() const {
 class ProProof::_Internal {
  public:
   using HasBits = decltype(std::declval<ProProof>()._impl_._has_bits_);
-  static void set_has_version(HasBits* has_bits) {
-    (*has_bits)[0] |= 16u;
-  }
-  static void set_has_genindexhash(HasBits* has_bits) {
+  static void set_has_revocationtag(HasBits* has_bits) {
     (*has_bits)[0] |= 1u;
   }
   static void set_has_rotatingpublickey(HasBits* has_bits) {
@@ -11028,19 +11024,18 @@ ProProof::ProProof(const ProProof& from)
   new (&_impl_) Impl_{
       decltype(_impl_._has_bits_){from._impl_._has_bits_}
     , /*decltype(_impl_._cached_size_)*/{}
-    , decltype(_impl_.genindexhash_){}
+    , decltype(_impl_.revocationtag_){}
     , decltype(_impl_.rotatingpublickey_){}
     , decltype(_impl_.sig_){}
-    , decltype(_impl_.expiryunixts_){}
-    , decltype(_impl_.version_){}};
+    , decltype(_impl_.expiryunixts_){}};
 
   _internal_metadata_.MergeFrom<std::string>(from._internal_metadata_);
-  _impl_.genindexhash_.InitDefault();
+  _impl_.revocationtag_.InitDefault();
   #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
-    _impl_.genindexhash_.Set("", GetArenaForAllocation());
+    _impl_.revocationtag_.Set("", GetArenaForAllocation());
   #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
-  if (from._internal_has_genindexhash()) {
-    _this->_impl_.genindexhash_.Set(from._internal_genindexhash(), 
+  if (from._internal_has_revocationtag()) {
+    _this->_impl_.revocationtag_.Set(from._internal_revocationtag(), 
       _this->GetArenaForAllocation());
   }
   _impl_.rotatingpublickey_.InitDefault();
@@ -11059,9 +11054,7 @@ ProProof::ProProof(const ProProof& from)
     _this->_impl_.sig_.Set(from._internal_sig(), 
       _this->GetArenaForAllocation());
   }
-  ::memcpy(&_impl_.expiryunixts_, &from._impl_.expiryunixts_,
-    static_cast<size_t>(reinterpret_cast<char*>(&_impl_.version_) -
-    reinterpret_cast<char*>(&_impl_.expiryunixts_)) + sizeof(_impl_.version_));
+  _this->_impl_.expiryunixts_ = from._impl_.expiryunixts_;
   // @@protoc_insertion_point(copy_constructor:SessionProtos.ProProof)
 }
 
@@ -11072,15 +11065,14 @@ inline void ProProof::SharedCtor(
   new (&_impl_) Impl_{
       decltype(_impl_._has_bits_){}
     , /*decltype(_impl_._cached_size_)*/{}
-    , decltype(_impl_.genindexhash_){}
+    , decltype(_impl_.revocationtag_){}
     , decltype(_impl_.rotatingpublickey_){}
     , decltype(_impl_.sig_){}
     , decltype(_impl_.expiryunixts_){uint64_t{0u}}
-    , decltype(_impl_.version_){0u}
   };
-  _impl_.genindexhash_.InitDefault();
+  _impl_.revocationtag_.InitDefault();
   #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
-    _impl_.genindexhash_.Set("", GetArenaForAllocation());
+    _impl_.revocationtag_.Set("", GetArenaForAllocation());
   #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
   _impl_.rotatingpublickey_.InitDefault();
   #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
@@ -11103,7 +11095,7 @@ ProProof::~ProProof() {
 
 inline void ProProof::SharedDtor() {
   GOOGLE_DCHECK(GetArenaForAllocation() == nullptr);
-  _impl_.genindexhash_.Destroy();
+  _impl_.revocationtag_.Destroy();
   _impl_.rotatingpublickey_.Destroy();
   _impl_.sig_.Destroy();
 }
@@ -11121,7 +11113,7 @@ void ProProof::Clear() {
   cached_has_bits = _impl_._has_bits_[0];
   if (cached_has_bits & 0x00000007u) {
     if (cached_has_bits & 0x00000001u) {
-      _impl_.genindexhash_.ClearNonDefaultToEmpty();
+      _impl_.revocationtag_.ClearNonDefaultToEmpty();
     }
     if (cached_has_bits & 0x00000002u) {
       _impl_.rotatingpublickey_.ClearNonDefaultToEmpty();
@@ -11130,11 +11122,7 @@ void ProProof::Clear() {
       _impl_.sig_.ClearNonDefaultToEmpty();
     }
   }
-  if (cached_has_bits & 0x00000018u) {
-    ::memset(&_impl_.expiryunixts_, 0, static_cast<size_t>(
-        reinterpret_cast<char*>(&_impl_.version_) -
-        reinterpret_cast<char*>(&_impl_.expiryunixts_)) + sizeof(_impl_.version_));
-  }
+  _impl_.expiryunixts_ = uint64_t{0u};
   _impl_._has_bits_.Clear();
   _internal_metadata_.Clear<std::string>();
 }
@@ -11146,19 +11134,10 @@ const char* ProProof::_InternalParse(const char* ptr, ::_pbi::ParseContext* ctx)
     uint32_t tag;
     ptr = ::_pbi::ReadTag(ptr, &tag);
     switch (tag >> 3) {
-      // optional uint32 version = 1;
-      case 1:
-        if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 8)) {
-          _Internal::set_has_version(&has_bits);
-          _impl_.version_ = ::PROTOBUF_NAMESPACE_ID::internal::ReadVarint32(&ptr);
-          CHK_(ptr);
-        } else
-          goto handle_unusual;
-        continue;
-      // optional bytes genIndexHash = 2;
+      // optional bytes revocationTag = 2;
       case 2:
         if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 18)) {
-          auto str = _internal_mutable_genindexhash();
+          auto str = _internal_mutable_revocationtag();
           ptr = ::_pbi::InlineGreedyStringParser(str, ptr, ctx);
           CHK_(ptr);
         } else
@@ -11222,16 +11201,10 @@ uint8_t* ProProof::_InternalSerialize(
   (void) cached_has_bits;
 
   cached_has_bits = _impl_._has_bits_[0];
-  // optional uint32 version = 1;
-  if (cached_has_bits & 0x00000010u) {
-    target = stream->EnsureSpace(target);
-    target = ::_pbi::WireFormatLite::WriteUInt32ToArray(1, this->_internal_version(), target);
-  }
-
-  // optional bytes genIndexHash = 2;
+  // optional bytes revocationTag = 2;
   if (cached_has_bits & 0x00000001u) {
     target = stream->WriteBytesMaybeAliased(
-        2, this->_internal_genindexhash(), target);
+        2, this->_internal_revocationtag(), target);
   }
 
   // optional bytes rotatingPublicKey = 3;
@@ -11269,12 +11242,12 @@ size_t ProProof::ByteSizeLong() const {
   (void) cached_has_bits;
 
   cached_has_bits = _impl_._has_bits_[0];
-  if (cached_has_bits & 0x0000001fu) {
-    // optional bytes genIndexHash = 2;
+  if (cached_has_bits & 0x0000000fu) {
+    // optional bytes revocationTag = 2;
     if (cached_has_bits & 0x00000001u) {
       total_size += 1 +
         ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::BytesSize(
-          this->_internal_genindexhash());
+          this->_internal_revocationtag());
     }
 
     // optional bytes rotatingPublicKey = 3;
@@ -11294,11 +11267,6 @@ size_t ProProof::ByteSizeLong() const {
     // optional uint64 expiryUnixTs = 4;
     if (cached_has_bits & 0x00000008u) {
       total_size += ::_pbi::WireFormatLite::UInt64SizePlusOne(this->_internal_expiryunixts());
-    }
-
-    // optional uint32 version = 1;
-    if (cached_has_bits & 0x00000010u) {
-      total_size += ::_pbi::WireFormatLite::UInt32SizePlusOne(this->_internal_version());
     }
 
   }
@@ -11324,9 +11292,9 @@ void ProProof::MergeFrom(const ProProof& from) {
   (void) cached_has_bits;
 
   cached_has_bits = from._impl_._has_bits_[0];
-  if (cached_has_bits & 0x0000001fu) {
+  if (cached_has_bits & 0x0000000fu) {
     if (cached_has_bits & 0x00000001u) {
-      _this->_internal_set_genindexhash(from._internal_genindexhash());
+      _this->_internal_set_revocationtag(from._internal_revocationtag());
     }
     if (cached_has_bits & 0x00000002u) {
       _this->_internal_set_rotatingpublickey(from._internal_rotatingpublickey());
@@ -11336,9 +11304,6 @@ void ProProof::MergeFrom(const ProProof& from) {
     }
     if (cached_has_bits & 0x00000008u) {
       _this->_impl_.expiryunixts_ = from._impl_.expiryunixts_;
-    }
-    if (cached_has_bits & 0x00000010u) {
-      _this->_impl_.version_ = from._impl_.version_;
     }
     _this->_impl_._has_bits_[0] |= cached_has_bits;
   }
@@ -11363,8 +11328,8 @@ void ProProof::InternalSwap(ProProof* other) {
   _internal_metadata_.InternalSwap(&other->_internal_metadata_);
   swap(_impl_._has_bits_[0], other->_impl_._has_bits_[0]);
   ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr::InternalSwap(
-      &_impl_.genindexhash_, lhs_arena,
-      &other->_impl_.genindexhash_, rhs_arena
+      &_impl_.revocationtag_, lhs_arena,
+      &other->_impl_.revocationtag_, rhs_arena
   );
   ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr::InternalSwap(
       &_impl_.rotatingpublickey_, lhs_arena,
@@ -11374,12 +11339,7 @@ void ProProof::InternalSwap(ProProof* other) {
       &_impl_.sig_, lhs_arena,
       &other->_impl_.sig_, rhs_arena
   );
-  ::PROTOBUF_NAMESPACE_ID::internal::memswap<
-      PROTOBUF_FIELD_OFFSET(ProProof, _impl_.version_)
-      + sizeof(ProProof::_impl_.version_)
-      - PROTOBUF_FIELD_OFFSET(ProProof, _impl_.expiryunixts_)>(
-          reinterpret_cast<char*>(&_impl_.expiryunixts_),
-          reinterpret_cast<char*>(&other->_impl_.expiryunixts_));
+  swap(_impl_.expiryunixts_, other->_impl_.expiryunixts_);
 }
 
 std::string ProProof::GetTypeName() const {
