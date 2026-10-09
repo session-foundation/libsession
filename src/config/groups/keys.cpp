@@ -596,7 +596,7 @@ std::vector<unsigned char> Keys::swarm_make_subaccount(
     auto k = subaccount_blind_factor(X);
 
     // T = |S|
-    auto T = xed25519::pubkey(std::span<const unsigned char>{X.data(), X.size()});
+    auto T = xed25519::pubkey(X);
 
     // kT is the user's Ed25519 blinded pubkey:
     std::array<unsigned char, 32> kT;
@@ -633,7 +633,7 @@ std::vector<unsigned char> Keys::swarm_subaccount_token(
     auto k = subaccount_blind_factor(X);
 
     // T = |S|
-    auto T = xed25519::pubkey(std::span<const unsigned char>{X.data(), X.size()});
+    auto T = xed25519::pubkey(X);
 
     std::vector<unsigned char> out;
     out.resize(4 + 32);
@@ -1209,7 +1209,7 @@ std::pair<std::string, std::vector<unsigned char>> Keys::decrypt_message(
     //
     DecryptGroupMessage decrypt = {};
     bool decrypt_success = false;
-    if (auto pending = pending_key(); pending) {
+    if (auto pending = pending_key()) {
         try {
             std::span<std::span<const uint8_t>> key_list = {&(*pending), 1};
             decrypt = decrypt_group_message(key_list, *_sign_pk, ciphertext);

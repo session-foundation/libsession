@@ -67,7 +67,7 @@ namespace {
         auto k = blind15_factor(server_pk);
         if (session_id.size() == 33)
             session_id = session_id.subspan(1);
-        auto ed_pk = xed25519::pubkey(session_id);
+        auto ed_pk = xed25519::pubkey(session_id.first<32>());
         if (0 != crypto_scalarmult_ed25519_noclamp(out + 1, k.data(), ed_pk.data()))
             throw std::runtime_error{"Cannot blind: invalid session_id (not on main subgroup)"};
         out[0] = 0x15;
@@ -80,7 +80,7 @@ namespace {
         auto k = blind25_factor(session_id, server_pk);
         if (session_id.size() == 33)
             session_id = session_id.subspan(1);
-        auto ed_pk = xed25519::pubkey(session_id);
+        auto ed_pk = xed25519::pubkey(session_id.first<32>());
         if (0 != crypto_scalarmult_ed25519_noclamp(out + 1, k.data(), ed_pk.data()))
             throw std::runtime_error{"Cannot blind: invalid session_id (not on main subgroup)"};
         out[0] = 0x25;
@@ -532,9 +532,12 @@ bool session_id_matches_blinded_id(
     if (session_id.size() != 66 || !oxenc::is_hex(session_id))
         throw std::invalid_argument{
                 "session_id_matches_blinded_id: session_id must be hex (66 digits)"};
-    if (session_id[0] != '0' || session_id[1] != '5')
+    if (!session_id.starts_with("05"sv))
         throw std::invalid_argument{"session_id_matches_blinded_id: session_id must start with 05"};
-    if (blinded_id[1] != '5' && (blinded_id[0] != '1' || blinded_id[0] != '2'))
+    if (blinded_id.size() != 66 || !oxenc::is_hex(blinded_id))
+        throw std::invalid_argument{
+                "session_id_matches_blinded_id: blinded_id must be hex (66 digits)"};
+    if (!(blinded_id.starts_with("15"sv) || blinded_id.starts_with("25"sv)))
         throw std::invalid_argument{
                 "session_id_matches_blinded_id: blinded_id must start with 15 or 25"};
     if (server_pk.size() != 64 || !oxenc::is_hex(server_pk))

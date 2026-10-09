@@ -6451,28 +6451,27 @@ class ProProof final :
   // accessors -------------------------------------------------------
 
   enum : int {
-    kGenIndexHashFieldNumber = 2,
+    kRevocationTagFieldNumber = 2,
     kRotatingPublicKeyFieldNumber = 3,
     kSigFieldNumber = 5,
     kExpiryUnixTsFieldNumber = 4,
-    kVersionFieldNumber = 1,
   };
-  // optional bytes genIndexHash = 2;
-  bool has_genindexhash() const;
+  // optional bytes revocationTag = 2;
+  bool has_revocationtag() const;
   private:
-  bool _internal_has_genindexhash() const;
+  bool _internal_has_revocationtag() const;
   public:
-  void clear_genindexhash();
-  const std::string& genindexhash() const;
+  void clear_revocationtag();
+  const std::string& revocationtag() const;
   template <typename ArgT0 = const std::string&, typename... ArgT>
-  void set_genindexhash(ArgT0&& arg0, ArgT... args);
-  std::string* mutable_genindexhash();
-  PROTOBUF_NODISCARD std::string* release_genindexhash();
-  void set_allocated_genindexhash(std::string* genindexhash);
+  void set_revocationtag(ArgT0&& arg0, ArgT... args);
+  std::string* mutable_revocationtag();
+  PROTOBUF_NODISCARD std::string* release_revocationtag();
+  void set_allocated_revocationtag(std::string* revocationtag);
   private:
-  const std::string& _internal_genindexhash() const;
-  inline PROTOBUF_ALWAYS_INLINE void _internal_set_genindexhash(const std::string& value);
-  std::string* _internal_mutable_genindexhash();
+  const std::string& _internal_revocationtag() const;
+  inline PROTOBUF_ALWAYS_INLINE void _internal_set_revocationtag(const std::string& value);
+  std::string* _internal_mutable_revocationtag();
   public:
 
   // optional bytes rotatingPublicKey = 3;
@@ -6524,19 +6523,6 @@ class ProProof final :
   void _internal_set_expiryunixts(uint64_t value);
   public:
 
-  // optional uint32 version = 1;
-  bool has_version() const;
-  private:
-  bool _internal_has_version() const;
-  public:
-  void clear_version();
-  uint32_t version() const;
-  void set_version(uint32_t value);
-  private:
-  uint32_t _internal_version() const;
-  void _internal_set_version(uint32_t value);
-  public:
-
   // @@protoc_insertion_point(class_scope:SessionProtos.ProProof)
  private:
   class _Internal;
@@ -6547,11 +6533,10 @@ class ProProof final :
   struct Impl_ {
     ::PROTOBUF_NAMESPACE_ID::internal::HasBits<1> _has_bits_;
     mutable ::PROTOBUF_NAMESPACE_ID::internal::CachedSize _cached_size_;
-    ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr genindexhash_;
+    ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr revocationtag_;
     ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr rotatingpublickey_;
     ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr sig_;
     uint64_t expiryunixts_;
-    uint32_t version_;
   };
   union { Impl_ _impl_; };
   friend struct ::TableStruct_SessionProtos_2eproto;
@@ -13537,100 +13522,72 @@ inline void GroupUpdateDeleteMemberContentMessage::set_allocated_adminsignature(
 
 // ProProof
 
-// optional uint32 version = 1;
-inline bool ProProof::_internal_has_version() const {
-  bool value = (_impl_._has_bits_[0] & 0x00000010u) != 0;
-  return value;
-}
-inline bool ProProof::has_version() const {
-  return _internal_has_version();
-}
-inline void ProProof::clear_version() {
-  _impl_.version_ = 0u;
-  _impl_._has_bits_[0] &= ~0x00000010u;
-}
-inline uint32_t ProProof::_internal_version() const {
-  return _impl_.version_;
-}
-inline uint32_t ProProof::version() const {
-  // @@protoc_insertion_point(field_get:SessionProtos.ProProof.version)
-  return _internal_version();
-}
-inline void ProProof::_internal_set_version(uint32_t value) {
-  _impl_._has_bits_[0] |= 0x00000010u;
-  _impl_.version_ = value;
-}
-inline void ProProof::set_version(uint32_t value) {
-  _internal_set_version(value);
-  // @@protoc_insertion_point(field_set:SessionProtos.ProProof.version)
-}
-
-// optional bytes genIndexHash = 2;
-inline bool ProProof::_internal_has_genindexhash() const {
+// optional bytes revocationTag = 2;
+inline bool ProProof::_internal_has_revocationtag() const {
   bool value = (_impl_._has_bits_[0] & 0x00000001u) != 0;
   return value;
 }
-inline bool ProProof::has_genindexhash() const {
-  return _internal_has_genindexhash();
+inline bool ProProof::has_revocationtag() const {
+  return _internal_has_revocationtag();
 }
-inline void ProProof::clear_genindexhash() {
-  _impl_.genindexhash_.ClearToEmpty();
+inline void ProProof::clear_revocationtag() {
+  _impl_.revocationtag_.ClearToEmpty();
   _impl_._has_bits_[0] &= ~0x00000001u;
 }
-inline const std::string& ProProof::genindexhash() const {
-  // @@protoc_insertion_point(field_get:SessionProtos.ProProof.genIndexHash)
-  return _internal_genindexhash();
+inline const std::string& ProProof::revocationtag() const {
+  // @@protoc_insertion_point(field_get:SessionProtos.ProProof.revocationTag)
+  return _internal_revocationtag();
 }
 template <typename ArgT0, typename... ArgT>
 inline PROTOBUF_ALWAYS_INLINE
-void ProProof::set_genindexhash(ArgT0&& arg0, ArgT... args) {
+void ProProof::set_revocationtag(ArgT0&& arg0, ArgT... args) {
  _impl_._has_bits_[0] |= 0x00000001u;
- _impl_.genindexhash_.SetBytes(static_cast<ArgT0 &&>(arg0), args..., GetArenaForAllocation());
-  // @@protoc_insertion_point(field_set:SessionProtos.ProProof.genIndexHash)
+ _impl_.revocationtag_.SetBytes(static_cast<ArgT0 &&>(arg0), args..., GetArenaForAllocation());
+  // @@protoc_insertion_point(field_set:SessionProtos.ProProof.revocationTag)
 }
-inline std::string* ProProof::mutable_genindexhash() {
-  std::string* _s = _internal_mutable_genindexhash();
-  // @@protoc_insertion_point(field_mutable:SessionProtos.ProProof.genIndexHash)
+inline std::string* ProProof::mutable_revocationtag() {
+  std::string* _s = _internal_mutable_revocationtag();
+  // @@protoc_insertion_point(field_mutable:SessionProtos.ProProof.revocationTag)
   return _s;
 }
-inline const std::string& ProProof::_internal_genindexhash() const {
-  return _impl_.genindexhash_.Get();
+inline const std::string& ProProof::_internal_revocationtag() const {
+  return _impl_.revocationtag_.Get();
 }
-inline void ProProof::_internal_set_genindexhash(const std::string& value) {
+inline void ProProof::_internal_set_revocationtag(const std::string& value) {
   _impl_._has_bits_[0] |= 0x00000001u;
-  _impl_.genindexhash_.Set(value, GetArenaForAllocation());
+  _impl_.revocationtag_.Set(value, GetArenaForAllocation());
 }
-inline std::string* ProProof::_internal_mutable_genindexhash() {
+inline std::string* ProProof::_internal_mutable_revocationtag() {
   _impl_._has_bits_[0] |= 0x00000001u;
-  return _impl_.genindexhash_.Mutable(GetArenaForAllocation());
+  return _impl_.revocationtag_.Mutable(GetArenaForAllocation());
 }
-inline std::string* ProProof::release_genindexhash() {
-  // @@protoc_insertion_point(field_release:SessionProtos.ProProof.genIndexHash)
-  if (!_internal_has_genindexhash()) {
+inline std::string* ProProof::release_revocationtag() {
+  // @@protoc_insertion_point(field_release:SessionProtos.ProProof.revocationTag)
+  if (!_internal_has_revocationtag()) {
     return nullptr;
   }
   _impl_._has_bits_[0] &= ~0x00000001u;
-  auto* p = _impl_.genindexhash_.Release();
+  auto* p = _impl_.revocationtag_.Release();
 #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
-  if (_impl_.genindexhash_.IsDefault()) {
-    _impl_.genindexhash_.Set("", GetArenaForAllocation());
+  if (_impl_.revocationtag_.IsDefault()) {
+    _impl_.revocationtag_.Set("", GetArenaForAllocation());
   }
 #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
   return p;
 }
-inline void ProProof::set_allocated_genindexhash(std::string* genindexhash) {
-  if (genindexhash != nullptr) {
+inline void ProProof::set_allocated_revocationtag(std::string* revocationtag) {
+  if (revocationtag != nullptr) {
     _impl_._has_bits_[0] |= 0x00000001u;
   } else {
     _impl_._has_bits_[0] &= ~0x00000001u;
   }
-  _impl_.genindexhash_.SetAllocated(genindexhash, GetArenaForAllocation());
+  _impl_.revocationtag_.SetAllocated(revocationtag, GetArenaForAllocation());
 #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
-  if (_impl_.genindexhash_.IsDefault()) {
-    _impl_.genindexhash_.Set("", GetArenaForAllocation());
+  if (_impl_.revocationtag_.IsDefault()) {
+    _impl_.revocationtag_.Set("", GetArenaForAllocation());
   }
 #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
-  // @@protoc_insertion_point(field_set_allocated:SessionProtos.ProProof.genIndexHash)
+  // @@protoc_insertion_point(field_set_allocated:SessionProtos.ProProof.revocationTag)
 }
 
 // optional bytes rotatingPublicKey = 3;

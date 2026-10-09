@@ -24,7 +24,7 @@ namespace config {
         std::chrono::milliseconds handshake_timeout;
         std::chrono::seconds keep_alive;
 
-        bool disable_mtu_discovery;
+        std::optional<size_t> max_udp_payload;
     };
 }  // namespace config
 
@@ -92,9 +92,9 @@ class QuicTransport : public ITransport, public std::enable_shared_from_this<Qui
     void _fail_connection(
             const std::string& address_pubkey_hex,
             const std::string& initiating_req_id,
-            std::optional<oxen::quic::ConnectionID> conn_id,
             std::optional<uint64_t> error_code,
-            std::optional<std::string> custom_error);
+            std::optional<std::string> custom_error,
+            std::optional<oxen::quic::ConnectionID> conn_id = std::nullopt);
 };
 
 }  // namespace session::network

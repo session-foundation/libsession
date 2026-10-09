@@ -14,10 +14,11 @@ typedef struct convo_info_volatile_1to1 {
     int64_t last_read;  // milliseconds since unix epoch
     bool unread;        // true if the conversation is explicitly marked unread
 
-    bool has_pro_gen_index_hash;     // Flag indicating if hash is set
-    bytes32 pro_gen_index_hash;      // Hash of the generation index set by the Session Pro Backend
-    uint64_t pro_expiry_unix_ts_ms;  // Unix epoch timestamp to which this contacts entitlement to
-                                     // Session Pro features is valid to
+    bool has_pro_revocation_tag;  // Flag indicating if hash is set
+    bytes32 pro_revocation_tag;   // Opaque revocation tag identifying this proof (from the Session
+                                  // Pro backend)
+    int64_t pro_expiry_ts;        // Unix epoch timestamp (seconds) until which this contact's
+                                  // entitlement to Session Pro features is valid
 } convo_info_volatile_1to1;
 
 typedef struct convo_info_volatile_community {
@@ -51,10 +52,11 @@ typedef struct convo_info_volatile_blinded_1to1 {
     int64_t last_read;  // ms since unix epoch
     bool unread;        // true if the conversation is explicitly marked unread
 
-    bool has_pro_gen_index_hash;     // Flag indicating if hash is set
-    bytes32 pro_gen_index_hash;      // Hash of the generation index set by the Session Pro Backend
-    uint64_t pro_expiry_unix_ts_ms;  // Unix epoch timestamp to which this contacts entitlement to
-                                     // Session Pro features is valid to
+    bool has_pro_revocation_tag;  // Flag indicating if hash is set
+    bytes32 pro_revocation_tag;   // Opaque revocation tag identifying this proof (from the Session
+                                  // Pro backend)
+    int64_t pro_expiry_ts;        // Unix epoch timestamp (seconds) until which this contact's
+                                  // entitlement to Session Pro features is valid
 } convo_info_volatile_blinded_1to1;
 
 /// API: convo_info_volatile/convo_info_volatile_init

@@ -5,7 +5,9 @@
 #include <sodium/crypto_sign_ed25519.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <mutex>
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
 #include <set>
