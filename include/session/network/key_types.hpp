@@ -70,6 +70,10 @@ struct x25519_pubkey : pubkey_base<x25519_pubkey, 32> {};
 struct ed25519_pubkey : pubkey_base<ed25519_pubkey, 32> {
     // Returns the {base32z}.snode representation of this pubkey
     std::string snode_address() const;
+    // Returns the first 8 base32z characters of this pubkey (i.e. of its .snode address): the
+    // short form Session Router logs relays under, so path hops logged with it line up with
+    // Session Router's own path logs.
+    std::string short_string() const;
 };
 
 template <typename Derived, size_t KeyLength>

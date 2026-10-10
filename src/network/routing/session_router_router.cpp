@@ -254,7 +254,11 @@ std::optional<PathInfo> SessionRouter::get_path_to(const service_node& node) {
         try {
             info.hops.push_back({*pubkey, oxen::quic::ipv4{ip}});
         } catch (const std::exception& e) {
-            log::warning(cat, "Omitting path hop {} with an unparseable ip {}", address, ip);
+            log::warning(
+                    cat,
+                    "Omitting path hop {} with an unparseable ip {}",
+                    pubkey->short_string(),
+                    ip);
         }
     }
 

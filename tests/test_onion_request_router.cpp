@@ -827,4 +827,23 @@ TEST_CASE("Network", "[network][onion_request_router][check_request_queue_timeou
     CHECK(result.timeout);
 }
 
+TEST_CASE("Network", "[network][onion_request_router][short_string]") {
+    auto pk = ed25519_pubkey::from_hex(
+            "4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7");
+    auto pk2 = ed25519_pubkey::from_hex(
+            "5ea34e72bb044654a6a23675690ef5ffaaf1656b02f93fb76655f9cbdbe89876");
+    auto pk3 = ed25519_pubkey::from_hex(
+            "e17a692033200ae41350df9709754edde7343e2cf2f23e88f993319e0720e5e5");
+
+    for (const auto& key : {pk, pk2, pk3})
+        CHECK(key.short_string() == key.snode_address().substr(0, 8));
+    CHECK(pk.short_string() == "j15s9zdp");
+
+    auto node = [](const ed25519_pubkey& key) {
+        return service_node{key, oxen::quic::ipv4{"127.0.0.1"}, 20001, 30001, {2, 11, 0}, 0};
+    };
+    auto path = OnionPath{"Test", {node(pk), node(pk2), node(pk3)}};
+    CHECK(path.to_string() == "j15s9zdp⟷m4twhhi5⟷hf7g1ebu");
+}
+
 }  // namespace session::network
