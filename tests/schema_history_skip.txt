@@ -53,3 +53,43 @@ a80ea641  attachment-availability, mid-branch
 b075fa2e  attachment-availability, mid-branch
 c2ee7a45  attachment-availability, mid-branch
 9dfba1c6  attachment-availability, mid-branch
+
+# The device-group branch: every commit of it but the last.  Core 003_device_groups carries a
+# database across everything the branch changed in one step, but the branch's commits changed Core's
+# full schema without a migration of their own -- and went on adding to 003 after it was written --
+# so a database made partway through matches none of the schemas 003 starts from.
+f70eb407  device-group, mid-branch
+d39c16d7  device-group, mid-branch
+3f48ca88  device-group, mid-branch
+6eefaf00  device-group, mid-branch
+8a67afdb  device-group, mid-branch
+46fb385a  device-group, mid-branch
+8e19bd90  device-group, mid-branch
+3ced2fcd  device-group, mid-branch
+55273c86  device-group, mid-branch
+8216f489  device-group, mid-branch
+35245fec  device-group, mid-branch
+d14f585b  device-group, mid-branch
+809b9133  device-group, mid-branch
+1c1aac2f  device-group, mid-branch
+375973e9  device-group, mid-branch
+03542ecf  device-group, mid-branch
+277261d8  device-group, mid-branch
+d22ce362  device-group, mid-branch
+9ca4312b  device-group, mid-branch
+a3a486c4  device-group, mid-branch
+c2cbbab3  device-group, mid-branch
+32005c39  device-group, mid-branch
+12183f99  device-group, mid-branch
+04116bfa  device-group, mid-branch
+0a26aac4  device-group, mid-branch
+4c2fcc45  device-group, mid-branch
+a2088aab  device-group, mid-branch
+c8ee4731  device-group, mid-branch
+c52ed42f  device-group, mid-branch
+8e0ba99e  device-group, mid-branch
+69c766e9  device-group, mid-branch
+769e7625  device-group, mid-branch
+f4153a93  device-group, mid-branch
+861bf2ea  device-group, mid-branch
+d3ceb5e3  device-group, mid-branch

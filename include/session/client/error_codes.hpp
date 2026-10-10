@@ -1,5 +1,6 @@
 #pragma once
 
+#include <session/core/error_codes.hpp>
 #include <string_view>
 
 /// The `Error::code` values Client reports, named so that a caller comparing against one cannot be
@@ -47,7 +48,6 @@ inline constexpr std::string_view upload_failed = "file.upload_failed";
 /// A downloaded file could not be written where the caller asked for it.
 inline constexpr std::string_view save_failed = "file.save_failed";
 
-/// There is no network attached, so nothing that needs one can be done.
-inline constexpr std::string_view network_unavailable = "network.unavailable";
+using core::err::network_unavailable;
 
 }  // namespace session::client::err

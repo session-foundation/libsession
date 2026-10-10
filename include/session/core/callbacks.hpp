@@ -68,6 +68,64 @@ enum class MessageSendStatus {
     encrypt_failed,  ///< Encryption failed (should not normally happen).
 };
 
+/// What a device linking interface answers to: the requests other devices send this account, and
+/// the account's devices themselves.
+///
+/// One interface rather than a handler each because they only work as a set.  A prompt opened by
+/// `link_request_added` has to be closed by `link_request_ended`, or it goes on showing the SAS of
+/// a request that has been replaced -- the substitution the SAS exists to catch -- so leaving any
+/// of these out has to be a compile error, not a quiet gap.
+///
+/// Everything here is reported once the fetch that caused it has been merged in full, so a handler
+/// never sees a half-applied state.  State to draw from initially is read the ordinary way, through
+/// `Devices::membership()`, `Devices::devices()` and `Devices::incoming_link_requests()`; these
+/// report what changes after.
+///
+/// Called on Core's event loop, so a method must not block.  One that throws is logged, and the
+/// others are still called; what it was told is not told again.
+class DeviceEvents {
+  public:
+    virtual ~DeviceEvents() = default;
+
+    /// Another device asked to join the account's device group.  The request whole, so a prompt
+    /// can be drawn from it without reading anything back.
+    ///
+    /// Once per request per session, and not at all for one the application has already been handed
+    /// by `incoming_link_requests()` -- so an application that reads nothing at startup is still
+    /// told of every request waiting, and one that does is not told twice.  Held back until the
+    /// first fetch from the swarm has been merged, since a request stored before shutting down may
+    /// have been accepted elsewhere or expired since.  Never for this device's own request.
+    virtual void link_request_added(device::LinkRequest request) = 0;
+
+    /// A request announced by `link_request_added` can no longer be answered, and whatever prompt
+    /// was drawn for it should close.
+    virtual void link_request_ended(int reqid, device::LinkRequestEnd why) = 0;
+
+    /// The account's devices changed: one joined, was removed, or changed how it describes itself.
+    /// The whole set, since one group message can change several at once: every device that is or
+    /// was in the group.  Not the ones asking to join, which arrive as link requests instead.
+    virtual void devices_replaced(device::map devices) = 0;
+
+    /// Another device joined the group, or stopped being in it: removed, or left of its own accord.
+    /// Its record as it now stands -- `state` says which (Registered, Kicked or Left), and `kicked`
+    /// when it went.  For a notice ("Alice's laptop was added"); `devices_replaced` follows for
+    /// redrawing the list.  Not for a change this device made itself through `accept_request` or
+    /// `remove_device`, nor for the members of a group this device has just been admitted to.
+    virtual void device_membership_changed(device::Info device) = 0;
+
+    /// This device's membership changed, or became known with the first fetch of this run; see
+    /// device::Membership for what each value means.  `Removed` and `CutOff` are the two to alert
+    /// on, and arrive as soon as the fetch that reveals them is merged.  Not for the move to
+    /// `Waiting` that `Devices::request_link` makes, nor back from it when that call reports
+    /// failure: the caller knows.  Never `Unknown`.
+    virtual void membership_changed(device::Membership membership) = 0;
+
+    /// While this device is in a group, another group has appeared in the swarm alongside it: the
+    /// account has forked, which the user should be told of.  Once per group per run, and not for a
+    /// group dismissed through `Devices::dismiss_group`.
+    virtual void group_appeared(device::GroupId group) = 0;
+};
+
 /// Struct holding application callbacks to fire when libsession Core events happen to allow the
 /// Core object to fire into the application front-end.
 ///
@@ -78,71 +136,9 @@ enum class MessageSendStatus {
 /// anything, and a handler that just reads pays nothing.
 struct callbacks {
 
-    /// Callback that is invoked when a device linking request is received for entry into the device
-    /// group.  This is expected to notify the user of the linking request, and ask them to confirm
-    /// it.  Generally this should be followed (after user interaction) by a call to one of the
-    /// core.devices methods: ignore_request(), accept_request(), delete_request() with the reqid
-    /// value.
-    ///
-    /// This may fire multiple times: it generally fires when the request first comes in, but
-    /// will also fire during startup if there is a still-active request that has not been
-    /// accepted, ignored, or deleted.  (This is so that Session a shutdown or crash does not
-    /// lose a device request).
-    ///
-    /// It may also not fire at all if the request has been superceded (such as being accepted
-    /// by a third device).
-    ///
-    /// This request is not fired for the devices own linking request, i.e. when this device is the
-    /// one requesting entry into a device group.
-    ///
-    /// If this callback is not set then new device link requests are ignored by this device.
-    ///
-    /// Parameters:
-    /// - reqid -- a unique identifier for this request that persists across Core restarts and can
-    ///   be used to correlate this request with a subsequent device_added callback.  Never reused,
-    ///   even once the request is accepted or expires, so a later request always has a new one.
-    /// - new_device -- the new device metadata included in the link request.
-    /// - sas -- a span of 21 string_views representing the short authentication string for this
-    ///   request.  The first 7 are the standard display; all 21 are available for the extended
-    ///   view.  Formatting and joining is left to the caller.
-    std::function<void(
-            int reqid, device::Info&& new_device, std::span<const std::string_view, 21> sas)>
-            device_link_request;
-
-    /// Callback that is invoked when a new device has been linked to the account.  If a batch
-    /// of messages being processed includes both a device link request *and* an acceptance
-    /// (such as could happen if third device accepts the request) then only this, not the
-    /// request, will be fired.
-    ///
-    /// This callback is not fired if *this* is the device that has been added: see
-    /// device_self_added instead for that case.
-    ///
-    /// Note that this is fired once the new device is confirmed via stored swarm message, i.e.
-    /// it does not fire instantly upon calling `accept_request()`.
-    ///
-    /// Paramters:
-    /// - reqid -- if `on_device_link_request` had previously been called for this device, this
-    ///   value will be the same value, allowing the application to correlate linking requests and
-    ///   acceptance.  If there was no previous link request (such as when catching up on device
-    ///   updates performed by other account devices) then the value will be 0.
-    /// - new_device -- the metadata about the new device.
-    std::function<void(int reqid, device::Info&& new_device)> device_added;
-
-    /// Callback invoked when *this* device has been confirmed linked to the account by another
-    /// device.
-    std::function<void()> device_self_added;
-
-    /// Callback that is invoked if we determine that a device has been kicked out of the device
-    /// group, either initiated by this device or another device.  This does not, however, fire if
-    /// the *current* device gets kicked out; see device_self_removed for that.
-    ///
-    /// Parameters:
-    /// - removed_device -- the most recent info we have (locally) for the removed device.
-    std::function<void(device::Info&& removed_device)> device_removed;
-
-    /// Callback invoked when *this* device has been confirmed removed from the account (typically
-    /// from another device) from an incoming device group update.
-    std::function<void()> device_self_removed;
+    /// Device group and link request events; see DeviceEvents.  Null for an application with no
+    /// device linking of its own to show.  Must outlive the Core.
+    DeviceEvents* devices = nullptr;
 
     /// Callback invoked when a background PFS key fetch initiated by prefetch_pfs_keys() completes.
     /// Not invoked for cache hits or NAK suppressions (i.e. only fires when prefetch_pfs_keys()

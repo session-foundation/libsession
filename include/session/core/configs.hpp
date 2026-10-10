@@ -106,16 +106,6 @@ class Configs : public detail::CoreComponent {
     void _push_if_due();
     void _send_push();
 
-    // Applies a config push's answer.  Split out from the callback that receives it because that
-    // one arrives on the Network's own loop, and all of this is Configs' state: the callback
-    // checks it is still alive and hands this to Core's queue.
-    void _handle_push_response(
-            std::vector<Pending> pending,
-            bool success,
-            bool timeout,
-            int16_t status,
-            std::optional<std::string> resp);
-
     // Constructs the configs from their stored dumps, or empty if there are none.  Requires an
     // account; throws globals::no_account if there is not one yet.
     void _load();

@@ -30,11 +30,13 @@ service_node node_at(uint8_t n) {
             0};
 }
 
-/// Who each request was addressed to, in order.
+/// Who each poll was addressed to, in order.  Polls only, because a poll that completes goes on to
+/// push the device group, which walks the members as a separate operation of its own.
 std::vector<ed25519_pubkey> tried(const MockNetwork& net) {
     std::vector<ed25519_pubkey> out;
     for (const auto& s : net.sent_requests)
-        out.push_back(std::get<service_node>(s.request.destination).remote_pubkey);
+        if (s.request.endpoint == "batch")
+            out.push_back(std::get<service_node>(s.request.destination).remote_pubkey);
     return out;
 }
 

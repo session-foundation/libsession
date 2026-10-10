@@ -12,9 +12,9 @@
 #include <oxen/log/format.hpp>
 #include <oxen/quic/format.hpp>
 #include <ranges>
-#include <session/config/encrypt.hpp>
 #include <session/core.hpp>
 #include <session/core/devices.hpp>
+#include <session/core/error_codes.hpp>
 #include <session/core/link_sas.hpp>
 #include <session/crypto/ed25519.hpp>
 #include <session/crypto/mlkem768.hpp>
@@ -22,6 +22,7 @@
 #include <session/encrypt.hpp>
 #include <session/format.hpp>
 #include <session/hash.hpp>
+#include <session/placeholders.hpp>
 #include <session/random.hpp>
 #include <session/sqlite.hpp>
 #include <session/types.hpp>
@@ -70,6 +71,22 @@ static constexpr auto dev_key = "device_unique_id"sv;
 // restored account never sets it: its group, if it has one, belongs to devices we have not met yet.
 static constexpr auto establish_key = "devices_establish_group"sv;
 
+static constexpr auto group_id_key = "devices_group_id"sv;
+
+// The creation minute, then 4 random bytes to tell apart groups created in the same one.
+static device::GroupId new_group_id() {
+    device::GroupId id;
+    auto minutes = std::chrono::floor<std::chrono::minutes>(clock_now()).time_since_epoch();
+    oxenc::write_host_as_little(static_cast<uint32_t>(minutes.count()), id.value.data());
+    random::fill(std::span{id.value}.last<4>());
+    return id;
+}
+
+// The swarm timestamp of the newest message from our group that we could read, and of the one we
+// could not that displaced us from it, in unix milliseconds.
+static constexpr auto read_at_key = "devices_group_read_at"sv;
+static constexpr auto displaced_key = "devices_group_displaced_at"sv;
+
 void Devices::init() {
     if (core.globals.get_blob_to(dev_key, self_id))
         log::info(cat, "Loaded existing unique device id: {}", self_id);
@@ -83,6 +100,20 @@ void Devices::init() {
     // after Globals, so `self_id` does not exist yet at that point, and the flag is persisted, so
     // an account created by a run that died before reaching this still gets its group.
     establish_group();
+
+    _expiry_timer = jq().add_wakeable([this] { _flush_events(); });
+
+    // A request of ours from the last run carries on if the swarm still holds it, or if an
+    // admission on it waits for the user.  Otherwise it is withdrawn: lapsed, or never confirmed
+    // stored, which leaves us Pending with nothing to wait on.  Withdrawn only here -- a copy that
+    // did reach the swarm can still be accepted, and admits us once the user confirms it.
+    auto newest = _newest_request();
+    if (newest && newest->held)
+        return;
+    if (auto deadline = _own_deadline(); deadline && *deadline > clock_now())
+        _arm_expiry(deadline);
+    else
+        _withdraw_own_request();
 }
 
 void Devices::_mark_group_owed() {
@@ -99,7 +130,8 @@ void Devices::establish_group() {
     // generates this device's keys if it has none, which is the case being bootstrapped here.
     auto keys = active_device_keys();
     auto& key = keys.front();
-    active_account_keys();  // Mints the account's first shared seed if there is not one yet.
+    // Mints the account's first shared seed if there is not one yet.
+    auto link_x25519 = active_account_keys().front().x25519_pub;
 
     auto c = conn();
     SQLite::Transaction tx{c.sql};
@@ -128,6 +160,19 @@ void Devices::establish_group() {
             std::as_bytes(std::span{key.mlkem768_pub}),
             std::as_bytes(std::span{key.x25519_pub}));
 
+    // In view from the moment it exists, rather than from when its first message comes back from
+    // the swarm: until then another group alongside it would read as our having been cut off.
+    auto group = new_group_id();
+    _set_group_id(group);
+    _note_read(clock_now_ms());
+    auto now = clock_now_s();
+    c.prepared_exec(
+            "INSERT INTO device_groups (group_id, link_x25519, seen_at, expires_at)"
+            " VALUES (?, ?, ?, ?)",
+            std::span<const std::byte>{group.value},
+            link_x25519,
+            epoch_seconds(now),
+            epoch_seconds(now + DEVICE_GROUP_TTL));
     core.globals.set(establish_key, int64_t{0});
 
     tx.commit();
@@ -212,10 +257,15 @@ void Devices::rotate_account_keys() {
     random::fill(seed);
     auto keys = keys_from_seed<AccountKeys>(seed);
 
+    // Created after every key we hold, even within the same second: the newest key wins, with ties
+    // going to the lowest seed, so a rotation stamped with the same second as the key it replaces
+    // could lose to it -- and after a removal, that would leave current the key the removed device
+    // holds.
     auto c = conn();
     c.prepared_exec(
             "INSERT INTO device_account_keys (created, seed, pubkey_mlkem768, pubkey_x25519)"
-            " VALUES (?, ?, ?, ?)",
+            " VALUES (MAX(?1, IFNULL((SELECT MAX(created) + 1 FROM device_account_keys), ?1)),"
+            "  ?2, ?3, ?4)",
             epoch_seconds(clock_now_s()),
             seed,
             keys.mlkem768_pub,
@@ -370,8 +420,8 @@ namespace {
         auto dev_id = c.prepared_maybe_get<int64_t>(
                 R"(INSERT INTO devices
                     (unique_id, state, seqno, timestamp, device_type, description, version,
-                     pubkey_mlkem768, pubkey_x25519)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     pubkey_mlkem768, pubkey_x25519, digest)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(unique_id) DO UPDATE SET
                        state = excluded.state,
                        seqno = excluded.seqno,
@@ -380,8 +430,9 @@ namespace {
                        description = excluded.description,
                        version = excluded.version,
                        pubkey_mlkem768 = excluded.pubkey_mlkem768,
-                       pubkey_x25519 = excluded.pubkey_x25519
-                   WHERE (excluded.state, excluded.seqno) > (state, seqno)
+                       pubkey_x25519 = excluded.pubkey_x25519,
+                       digest = excluded.digest
+                   WHERE (excluded.state, excluded.seqno, excluded.digest) > (state, seqno, digest)
                    RETURNING id)",
                 info.id,
                 static_cast<int>(info.state),
@@ -391,7 +442,8 @@ namespace {
                 info.description,
                 ver,
                 info.pk_mlkem768,
-                info.pk_x25519);
+                info.pk_x25519,
+                info.digest);
 
         if (!dev_id)
             return std::nullopt;
@@ -420,12 +472,14 @@ device::map Devices::devices(
     // Encode included states as a bitmask, one bit per State value, so the query string is stable
     // regardless of which states are selected.
     //
-    // `include_unregistered` covers Kicked as well as Unregistered: the two were one state until
-    // the merge rules needed them apart, and a caller asking for devices that are not in the group
-    // means both.  Separating them here is a caller-visible change worth making on its own.
+    // `include_unregistered` covers Left and Kicked as well as Unregistered: they were one state
+    // until the merge rules needed them apart, and a caller asking for devices that are not in the
+    // group means all three.  Separating them here is a caller-visible change worth making on its
+    // own.
     int state_mask = (include_registered ? 1 << static_cast<int>(device::State::Registered) : 0) |
                      (include_pending ? 1 << static_cast<int>(device::State::Pending) : 0) |
                      (include_unregistered ? (1 << static_cast<int>(device::State::Unregistered)) |
+                                                     (1 << static_cast<int>(device::State::Left)) |
                                                      (1 << static_cast<int>(device::State::Kicked))
                                            : 0);
     if (state_mask == 0)
@@ -558,6 +612,9 @@ void Devices::_update_info(const device::Info& info) {
     }
 
     tx.commit();
+
+    _devices_changed = true;
+    _flush_events();
 }
 
 namespace {
@@ -643,17 +700,20 @@ namespace {
                             "Skipping pending device {} in device group data",
                             oxenc::to_hex(id));
                     continue;
-                } else if (info.state == device::State::Kicked) {
-                    // A kicked device goes in as a bare timestamp: that is how every other device
-                    // learns of the removal, since a record merely absent from a message means
-                    // "unchanged" rather than "removed".
+                } else if (
+                        info.state == device::State::Kicked || info.state == device::State::Left) {
+                    // A removed device goes in as a bare timestamp: that is how every other device
+                    // learns it is gone, since a record merely absent from a message means
+                    // "unchanged" rather than "removed".  Negated for one that left, which is what
+                    // keeps it out of the `kicked` list.
                     //
-                    // TODO: we should stop writing devices kicked a long time ago.  Pruning means
+                    // TODO: we should stop writing devices gone a long time ago.  Pruning means
                     // dropping them from *this payload* and never from the table -- the budget is
                     // on what the message carries, a local row costs nothing, and forgetting one
                     // would lower its rank and let a stale group resurrect the device.
                     assert(info.kicked);
-                    devs.append(id_sv, info.kicked->time_since_epoch().count());
+                    auto t = info.kicked->time_since_epoch().count();
+                    devs.append(id_sv, info.state == device::State::Left ? -t : t);
                     continue;
                 } else if (info.state == device::State::Unregistered) {
                     // Never in the group rather than removed from it, so there is nothing to say
@@ -680,12 +740,19 @@ namespace {
         return std::move(out).str();
     }
 
+    // The signed request: {"I": device id, "i": info dict, "~": signature by the account key}.  The
+    // signature is what stops a request being forged by anyone who merely knows the group's link
+    // key, which is published.
     std::string encode_link_request_plaintext(
-            std::span<const std::byte, 32> device_id, const device::Info& info) {
+            std::span<const std::byte, 32> device_id,
+            const device::Info& info,
+            std::span<const std::byte, 64> ed25519_secret) {
         oxenc::bt_dict_producer out;
-        // "I" (device id) sorts before "i" (info dict)
         out.append("I", device_id);
         encode_device_info(out.append_dict("i"), info);
+        out.append_signature("~", [&](std::span<const std::byte> body) {
+            return ed25519::sign(ed25519_secret, body);
+        });
         return std::move(out).str();
     }
 
@@ -746,9 +813,29 @@ namespace {
             consume_extra(dev, info.extra);
     }
 
+    // The device record a stored link request asks to have admitted.  Already verified when the
+    // request was received.
+    device::Info requested_record(
+            std::span<const std::byte, 32> id, std::span<const std::byte> encoded) {
+        device::Info info;
+        std::ranges::copy(id, info.id.begin());
+        decode_one(info, oxenc::bt_dict_consumer{encoded}, device::State::Pending);
+        info.digest = hash::blake2b<8>(encoded);
+        return info;
+    }
+
+    // The digest a device record has as a group message carries it: the last term of the merge
+    // comparison, so a record we change ourselves has to carry the digest every other device will
+    // compute for it.
+    std::array<std::byte, 8> record_digest(const device::Info& info) {
+        oxenc::bt_dict_producer out;
+        encode_device_info(std::move(out), info);
+        return hash::blake2b<8>(std::move(out).str());
+    }
+
     // Decodes the plaintext bt-encoded device group payload.  The returned device map will include
     // both full device records and tombstoned devices: the latter have a mostly default-constructed
-    // Info where only id, state (=State::Kicked), and kicked (=removal timestamp) are set.
+    // Info where only id, state (Kicked or Left), and kicked are set.
     GroupPayload decode_group_payload(std::span<const std::byte> data) {
         GroupPayload result;
 
@@ -772,16 +859,19 @@ namespace {
             info.id = id;
 
             if (devs.is_integer()) {
-                // An integer indicates a "device removed" timestamp, used to distinguish between
-                // "device removed" and "I don't know about the device yet".  It gets pruned when
-                // updating once it hits a certain age threshold.
-                //
-                // If the device wants to get re-added to the group then it must generate a new
-                // device id.
-                info.state = device::State::Kicked;
-                info.kicked.emplace(std::chrono::seconds{devs.consume_integer<int64_t>()});
+                // A tombstone: the time the device was removed, or negated, the time it left.
+                // Either way the id is spent, and the device must generate a new one to come back.
+                auto t = devs.consume_integer<int64_t>();
+                if (t == 0 || t == std::numeric_limits<int64_t>::min())
+                    throw std::runtime_error{"Invalid encoded device data: invalid tombstone"};
+                info.state = t > 0 ? device::State::Kicked : device::State::Left;
+                info.kicked.emplace(std::chrono::seconds{t > 0 ? t : -t});
             } else {
-                decode_one(info, devs.consume_dict_consumer(), device::State::Registered);
+                // The encoded record itself, rather than what we would make of it again: taking the
+                // view costs nothing here, and re-encoding to hash would.
+                auto raw = devs.consume_dict_data();
+                decode_one(info, oxenc::bt_dict_consumer{raw}, device::State::Registered);
+                info.digest = hash::blake2b<8>(raw);
             }
         }
 
@@ -798,28 +888,73 @@ namespace {
         return result;
     }
 
-    // Values for the devices.processing column, set during batch message processing and cleared
-    // after callbacks are fired at is_final.
-    enum class Processing {
-        LinkRequest = 1,  // new/updated link request received
-        Registered = 2,   // device newly transitioned to Registered
-        Removed = 3,      // device newly transitioned to Unregistered
-    };
-
-    constexpr std::string_view to_string(Processing p) {
-        switch (p) {
-            case Processing::LinkRequest: return "link-request";
-            case Processing::Registered: return "registered";
-            case Processing::Removed: return "removed";
-        }
-        return "unknown";
-    }
-
     constexpr auto PERS_DEV_NONCE = "SessionDevDNonce"_b2b_pers;
     constexpr auto PERS_KEY_NONCE = "SessionDevKNonce"_b2b_pers;
     constexpr auto PERS_KEY_KEY = "SessionDevKeyKey"_b2b_pers;
     constexpr auto PERS_KEY_KEY_IDX = "SessionDevKeyIdx"_b2b_pers;
     constexpr auto PERS_ACC_KEY_ROT = "SessionAccKeyRot"_b2b_pers;
+    constexpr auto PERS_KICKED = "SessionDevKicked"_b2b_pers;
+    constexpr auto PERS_GROUP_ID_KEY = "SessionDvGrpID_K"_b2b_pers;
+    constexpr auto PERS_GROUP_ID_NONCE = "SessionDvGrpID_N"_b2b_pers;
+    constexpr auto PERS_GROUP_SAS = "SessionDvGrp_SAS"_b2b_pers;
+    constexpr auto PERS_LINK = "SessionDvGrpLink"_b2b_pers;
+    constexpr auto PERS_LINK_KISS = "SessionDvGrpKISS"_b2b_pers;
+
+    // A link request's key and nonce, from the secret its sender's ephemeral key `E` shares with
+    // the group's link key `X`.
+    struct LinkKey {
+        cleared_b32 key;
+        std::array<std::byte, encryption::XCHACHA20_NONCEBYTES> nonce;
+    };
+    LinkKey link_request_key(
+            std::span<const std::byte, 32> shared,
+            std::span<const std::byte, 32> E,
+            std::span<const std::byte, 32> X) {
+        cleared_array<std::byte, 56> kn;
+        hash::blake2b_pers(kn, PERS_LINK, shared, E, X);
+        LinkKey out;
+        std::ranges::copy(std::span{kn}.first<32>(), out.key.begin());
+        std::ranges::copy(std::span{kn}.last<24>(), out.nonce.begin());
+        return out;
+    }
+
+    // What a link request's key indicator is masked with: the secret `E` shares with the account's
+    // long-term key `S`, so that only a seed holder can tell which group a request is for.
+    std::array<std::byte, 2> link_request_kiss(
+            std::span<const std::byte, 32> shared,
+            std::span<const std::byte, 32> E,
+            std::span<const std::byte, 32> S) {
+        std::array<std::byte, 2> out;
+        hash::blake2b_key_pers(out, shared, PERS_LINK_KISS, E, S);
+        return out;
+    }
+
+    // Encrypts or decrypts a group identifier for a message's outer `@` (XChaCha20 being its own
+    // inverse): readable by any holder of the account seed, and different in every message to
+    // anyone else, the nonce coming from that message's A.
+    std::array<std::byte, 8> crypt_group_id(
+            std::span<const std::byte, 8> in,
+            std::span<const std::byte, 32> A,
+            std::span<const std::byte, 32> seed) {
+        cleared_b32 key;
+        hash::blake2b_pers(key, PERS_GROUP_ID_KEY, seed);
+        std::array<std::byte, encryption::XCHACHA20_NONCEBYTES> nonce;
+        hash::blake2b_pers(nonce, PERS_GROUP_ID_NONCE, A);
+        std::array<std::byte, 8> out;
+        encryption::xchacha20_xor(out, in, nonce, key);
+        return out;
+    }
+
+    // A removed device's entry in a message's `kicked` list: computable only with the account seed,
+    // and different in every message, being keyed by that message's ephemeral A.
+    std::array<std::byte, 16> kicked_entry(
+            std::span<const std::byte, 32> A,
+            std::span<const std::byte, 32> seed,
+            std::span<const std::byte, 32> device_id) {
+        std::array<std::byte, 16> out;
+        hash::blake2b_key_pers(out, A, PERS_KICKED, seed, device_id);
+        return out;
+    }
 
     // Device group payloads are null-padded to a multiple of this before encryption so that the
     // encrypted size reveals only which bucket the payload falls in, not what it contains.  A
@@ -851,19 +986,38 @@ namespace {
 
 }  // namespace
 
-}  // namespace session::core
+std::chrono::sys_time<std::chrono::minutes> device::GroupId::created() const {
+    return std::chrono::sys_time<std::chrono::minutes>{
+            std::chrono::minutes{oxenc::load_little_to_host<uint32_t>(value.data())}};
+}
 
-/// Logs a `Processing` as the word `to_string` gives for it.  Out here for the reason given at the
-/// top of this file; `session::core::Processing` names the type because the unnamed namespace it
-/// lives in is reachable from its enclosing namespace.
-template <>
-struct fmt::formatter<session::core::Processing, char> : fmt::formatter<std::string_view> {
-    auto format(session::core::Processing p, fmt::format_context& ctx) const {
-        return formatter<std::string_view>::format(to_string(p), ctx);
-    }
-};
+std::array<std::string_view, 21> device::GroupId::sas() const {
+    std::array<std::byte, 16> seed;
+    hash::blake2b_pers(seed, PERS_GROUP_SAS, value);
+    return sas_from_seed(seed);
+}
 
-namespace session::core {
+std::optional<device::GroupId> Devices::_group_id() {
+    device::GroupId id;
+    if (core.globals.get_blob_to(group_id_key, id.value))
+        return id;
+    return std::nullopt;
+}
+
+void Devices::_set_group_id(const device::GroupId& id) {
+    core.globals.set(group_id_key, std::span<const std::byte>{id.value});
+}
+
+std::optional<device::GroupId> Devices::_group_of(std::span<const std::byte> message) {
+    oxenc::bt_dict_consumer in{message};
+    in.require<std::string_view>("");
+    if (!in.skip_until("@"))
+        return std::nullopt;
+    auto encrypted = in.consume_span<std::byte, 8>();
+    auto A = in.require_span<std::byte, 32>("A");
+    auto seed = core.globals.account_seed();
+    return device::GroupId{crypt_group_id(encrypted, A, seed.seed())};
+}
 
 std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) {
     cleared_b32 a;
@@ -879,6 +1033,41 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     for (const auto& [id, info] : devices)
         if (info.state == device::State::Registered)
             recipients.push_back(&info);
+
+    // Removals among the tombstones, announced to the devices removed, which have no key to read
+    // them from the payload.  Departures are left out: the device that left knows, and would read
+    // its own entry as a removal.  Padded to a multiple of 4 and shuffled, like the recipient
+    // lists, so that the length says only which bucket the removal count is in.
+    // A group established before groups had identifiers gets one from whichever of its devices
+    // pushes first, and the rest adopt it from that message.
+    auto group_id = _group_id();
+    if (!group_id) {
+        group_id = new_group_id();
+        _set_group_id(*group_id);
+        log::info(cat, "Gave this device group an identifier");
+    }
+    std::array<std::byte, 8> group_id_enc;
+
+    std::vector<std::byte> kicked_raw;
+    {
+        auto seed = core.globals.account_seed();
+        group_id_enc = crypt_group_id(group_id->value, A, seed.seed());
+
+        std::vector<const std::array<std::byte, 32>*> removed;
+        for (const auto& [id, info] : devices)
+            if (info.state == device::State::Kicked)
+                removed.push_back(&id);
+
+        std::vector<size_t> slots((removed.size() + 3) / 4 * 4);
+        std::iota(slots.begin(), slots.end(), 0);
+        std::ranges::shuffle(slots, csrng);
+
+        kicked_raw.resize(16 * slots.size());
+        random::fill(kicked_raw);
+        for (size_t i = 0; i < removed.size(); i++)
+            std::ranges::copy(
+                    kicked_entry(A, seed.seed(), *removed[i]), kicked_raw.begin() + 16 * slots[i]);
+    }
 
     int padded_count = recipients.size();
     padded_count = (padded_count + 3) / 4 * 4;
@@ -959,6 +1148,12 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
         k.rotated = rotated;
     }
 
+    // The current account key's X25519 half, published outside the payload so that a device asking
+    // to join can encrypt its request to the group: only members hold the secret half.
+    if (acc_keys.empty() || acc_keys.front().rotated)
+        throw std::logic_error{"Cannot build a device group message without a current account key"};
+    auto link_x25519 = keys_from_seed<AccountKeys>(acc_keys.front().seed).x25519_pub;
+
     auto plaintext_devices = encode_group_payload(devices, acc_keys);
     // 2300 + 6400N: at least one bucket, so a payload smaller than the account key allowance still
     // pads up rather than down to nothing.
@@ -1020,20 +1215,28 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     out.resize(
             2                                              // Outer "d" ... "e" delimiters
             + 5                                            // "0:" + "1:G" (message type indicator)
+            + 3 + bt_bytes_encoded(group_id_enc.size())    // "1:@" + "8:...(enc group id)..."
             + 3 + bt_bytes_encoded(A.size())               // "1:A" + "32:...(A eph pk)..."
             + 3 + bt_bytes_encoded(ciphertext_raw.size())  // "1:C" + "NNNN:...(mlkem cts)..."
             + 3 + bt_bytes_encoded(enc_key_raw.size())     // "1:K" + "NNN:...(encrypted keys)..."
+            + 3 + bt_bytes_encoded(link_x25519.size())     // "1:X" + "32:...(link x25519 pk)..."
             + 3 + bt_bytes_encoded(enc_devices.size())     // "1:d" + "MMMM:...(enc device info)..."
-            + 3 + bt_bytes_encoded(64)                     // "1:~" + "64:...(Ed25519 signature)..."
+            +
+            (kicked_raw.empty() ? 0 : 3 + bt_bytes_encoded(kicked_raw.size()))  // "1:k" + "NN:..."
+            + 3 + bt_bytes_encoded(64)  // "1:~" + "64:...(Ed25519 signature)..."
     );
 
     oxenc::bt_dict_producer o{reinterpret_cast<char*>(out.data()), out.size()};
 
     o.append("", "G");
+    o.append("@", group_id_enc);
     o.append("A", A);
     o.append("C", ciphertext_raw);
     o.append("K", enc_key_raw);
+    o.append("X", link_x25519);
     o.append("d", enc_devices);
+    if (!kicked_raw.empty())
+        o.append("k", kicked_raw);
     o.append_signature("~", [seed = core.globals.account_seed()](std::span<const std::byte> body) {
         return ed25519::sign(seed.ed25519_secret(), body);
     });
@@ -1043,8 +1246,8 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     return out;
 }
 
-// Prebuilt SQL with Processing/State enum values embedded as literals rather than parameters.
-// Records a device as kicked, inserting a bare tombstone row if we hold no record of it.
+// Records a device as removed (?3 = Kicked) or departed (?3 = Left) at ?1, inserting a bare
+// tombstone row if we hold no record of it.
 //
 // The insert half is what makes a removal durable for a device that joined after it: an update
 // alone matches nothing, stores nothing, and leaves that device free to accept the removed one back
@@ -1052,24 +1255,54 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
 // the columns the schema requires are filled with zeroes and the seqno left at 0, which no record
 // off the wire can be.
 //
-// `processing` is set only where the device was Registered: a removal is news to the application
-// only if we thought the device was a member, and a tombstone for one we never knew is not.
-static const std::string KICK_DEVICE_SQL =
+// Ranked like every other merge: Kicked outranks Left outranks any live record, and between two
+// tombstones of one kind the later wins.  Every group message carries every tombstone, so most of
+// these restate what is already held, and only a real change returns a row.
+static const std::string TOMBSTONE_SQL =
         "INSERT INTO devices"
         " (unique_id, state, seqno, timestamp, device_type, description, version,"
         "  pubkey_mlkem768, pubkey_x25519, kicked_timestamp)"
-        " VALUES (?2, {0}, 0, ?1, '', '', 0, zeroblob(1184), zeroblob(32), ?1)"
+        " VALUES (?2, ?3, 0, ?1, '', '', 0, zeroblob(1184), zeroblob(32), ?1)"
         " ON CONFLICT(unique_id) DO UPDATE SET"
-        "     state = {0}, kicked_timestamp = excluded.kicked_timestamp,"
-        "     processing = CASE WHEN state = {1} THEN {2} ELSE processing END,"
-        "     broadcast_needed = CASE WHEN state = {1} THEN 1 ELSE broadcast_needed END"_format(
-                static_cast<int>(device::State::Kicked),
-                static_cast<int>(device::State::Registered),
-                static_cast<int>(Processing::Removed));
+        "     state = excluded.state, kicked_timestamp = excluded.kicked_timestamp,"
+        "     broadcast_needed = CASE WHEN state = {} THEN 1 ELSE broadcast_needed END"
+        "   WHERE (excluded.state, excluded.kicked_timestamp) > (state, kicked_timestamp)"
+        " RETURNING id"_format(static_cast<int>(device::State::Registered));
 
 static const std::string REGISTER_DEVICE_SQL =
-        "UPDATE devices SET processing = {}, broadcast_needed = 1 WHERE id = ?"_format(
-                static_cast<int>(Processing::Registered));
+        "UPDATE devices SET broadcast_needed = 1 WHERE id = ?";
+
+// A device registered by a group message was admitted somewhere, so the request that asked for it
+// has been answered, whichever device answered it.
+static const std::string ANSWER_REQUEST_SQL =
+        "UPDATE device_link_requests SET status = {} WHERE device = ? AND status = {}"_format(
+                static_cast<int>(device::LinkStatus::Accepted),
+                static_cast<int>(device::LinkStatus::Pending));
+
+// The same for a device already in the group, whose record changing says nothing on its own: it
+// changes whenever the device updates its details or rotates its keys.  A request was answered if
+// the record now carries the keys it asked for.
+static void answer_replacements(
+        sqlite::Connection& c,
+        int64_t dev_id,
+        std::span<const std::byte, 32> id,
+        const device::Info& record) {
+    std::vector<int64_t> answered;
+    for (auto [row, encoded] : c.prepared_results<int64_t, sqlite::blob>(
+                 "SELECT id, info FROM device_link_requests"
+                 " WHERE device = ? AND replaces = 1 AND status = {}"_format(
+                         static_cast<int>(device::LinkStatus::Pending)),
+                 dev_id)) {
+        auto asked = requested_record(id, encoded);
+        if (asked.pk_x25519 == record.pk_x25519 && asked.pk_mlkem768 == record.pk_mlkem768)
+            answered.push_back(row);
+    }
+    for (auto row : answered)
+        c.prepared_exec(
+                "UPDATE device_link_requests SET status = ? WHERE id = ?",
+                static_cast<int>(device::LinkStatus::Accepted),
+                row);
+}
 
 // Restates a removal that an incoming message tried to undo, moving the tombstone to the front of
 // the removed list and marking it for broadcast.
@@ -1084,21 +1317,110 @@ static const std::string REGISTER_DEVICE_SQL =
 // the most recently removed: a tombstone left to age could be evicted while the device it names is
 // still trying to return, either by waiting out the window or by provoking enough other removals to
 // displace it.
-static const std::string REASSERT_KICK_SQL =
+//
+// Applies equally to a device that left: it holds the seed just the same.
+static const std::string REASSERT_TOMBSTONE_SQL =
         "UPDATE devices SET kicked_timestamp = ?, broadcast_needed = 1 WHERE unique_id = ?";
 
-void Devices::receive_device_group_message(std::span<const std::byte> data) {
+void Devices::receive_device_group_message(
+        std::span<const std::byte> data, const std::string& hash, sys_ms timestamp) {
     GroupPayload payload;
     try {
         auto raw = decrypt_device_data(std::as_bytes(data));
         payload = decode_group_payload(raw);
     } catch (const device::decryption_failed& e) {
+        if (_names_us_kicked(data)) {
+            // When we learned of it, which is the nearest we can say: the removal time is in the
+            // payload we can no longer read.  Only from a live state, so that every later message
+            // still naming us leaves it where it is.
+            if (conn().prepared_maybe_get<int64_t>(
+                        "UPDATE devices SET state = ?, kicked_timestamp = ?"
+                        " WHERE unique_id = ? AND state < ? RETURNING id",
+                        static_cast<int>(device::State::Kicked),
+                        epoch_seconds(clock_now_s()),
+                        self_id,
+                        static_cast<int>(device::State::Kicked))) {
+                log::warning(cat, "This device has been removed from its device group");
+                _devices_changed = true;
+            }
+            return;
+        }
+
+        // Every message from our group is encrypted to us while we are in it, so a newer one we
+        // cannot read means another device holds our place.  Older ones say nothing: they are from
+        // before we joined, or snapshots overtaken since -- see DISPLACEMENT_GRACE.
+        auto group = _group_of(data);
+        auto read_at = core.globals.get_integer(read_at_key);
+        if (group && group == _group_id() && read_at &&
+            timestamp.time_since_epoch() >
+                    std::chrono::milliseconds{*read_at} + DISPLACEMENT_GRACE &&
+            _member()) {
+            core.globals.set(displaced_key, int64_t{timestamp.time_since_epoch().count()});
+            log::warning(cat, "Another device has taken this device's place in its device group");
+            return;
+        }
         log::warning(cat, "Ignoring incoming device group message: {}", e.what());
         return;
     }
 
+    auto theirs = _group_of(data);
+    auto ours = _group_id();
+
+    // A member of the group, or of one that predates identifiers -- which adopts this one's, or
+    // hears from a device yet to give it one -- merges whatever it can read of it.
+    bool member = conn().prepared_maybe_get<int>(
+                          "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                          self_id,
+                          static_cast<int>(device::State::Registered)) &&
+                  (!ours || !theirs || *theirs == *ours);
+
+    // Anything else is ours only as an admission on one of our own requests: from outside any
+    // group, or from inside one, switching.  Being able to read it shows only that some holder of
+    // the seed encrypted it to us, so it admits us only on a request whose SAS the user confirmed
+    // -- the one the accepting device showed, identified by the record it admitted.
+    std::optional<OwnRequest> accepted;
+    if (!member) {
+        auto self = payload.devices.find(self_id);
+        if (theirs && self != payload.devices.end() &&
+            self->second.state == device::State::Registered)
+            accepted = _own_request_admitted(*theirs, self->second);
+        if (!accepted) {
+            log::warning(cat, "Not merging a readable device group message from another group");
+            return;
+        }
+        if (!accepted->confirmed) {
+            // Held only for the request the user is looking at.  One they moved on from by asking
+            // again is not what they will confirm; the newer request admits them instead.
+            if (auto newest = _newest_request(); !newest || newest->row != accepted->row) {
+                log::info(cat, "Admitted on an earlier request the user never confirmed; ignoring");
+                return;
+            }
+            conn().prepared_exec(
+                    "UPDATE device_own_requests SET admission = ?, admission_hash = ?,"
+                    " admission_at = ? WHERE id = ?",
+                    data,
+                    hash,
+                    timestamp.time_since_epoch().count(),
+                    accepted->row);
+            log::info(
+                    cat, "Admitted to a device group; holding it until the user confirms the SAS");
+            return;
+        }
+    }
+    bool admitting = accepted.has_value();
+    bool switching = admitting && ours && *ours != *theirs;
+
+    if (switching) {
+        _leave_group();
+        ours.reset();
+    }
+
     auto c = conn();
     SQLite::Transaction tx{c.sql};
+
+    // Admitted, or in a group that predates identifiers: either way this is the group's.
+    if (theirs && !ours)
+        _set_group_id(*theirs);
 
     // Merge incoming account keys.  New seeds are inserted and the rotation trigger applies
     // tie-breaking: latest created wins (smallest seed as tiebreaker), so concurrent rotations
@@ -1120,34 +1442,52 @@ void Devices::receive_device_group_message(std::span<const std::byte> data) {
                 keys.x25519_pub);
     }
 
+    bool departed = false;
+    std::vector<std::array<std::byte, 32>> members;
     for (const auto& [id, info] : payload.devices) {
-        if (info.state == device::State::Kicked) {
+        if (info.state == device::State::Kicked || info.state == device::State::Left) {
             // Whatever details we already hold are kept; only the state and the timestamp move.  A
-            // device we have never heard of gets a bare tombstone -- see KICK_DEVICE_SQL.
+            // device we have never heard of gets a bare tombstone -- see TOMBSTONE_SQL.
             assert(info.kicked);
-            c.prepared_exec(KICK_DEVICE_SQL, info.kicked->time_since_epoch().count(), id);
+            auto was =
+                    c.prepared_maybe_get<int>("SELECT state FROM devices WHERE unique_id = ?", id)
+                            .value_or(static_cast<int>(device::State::Unregistered));
+            if (c.prepared_maybe_get<int64_t>(
+                        TOMBSTONE_SQL,
+                        info.kicked->time_since_epoch().count(),
+                        id,
+                        static_cast<int>(info.state))) {
+                _devices_changed = true;
+                if (info.state == device::State::Left &&
+                    was < static_cast<int>(device::State::Left))
+                    departed = true;
+                // Gone from the group, rather than a tombstone for a device we never knew of.
+                if (was == static_cast<int>(device::State::Registered) && id != self_id)
+                    members.push_back(id);
+            }
             continue;
         }
 
         // A removal is one-way: a device we hold a tombstone for cannot be returned to the group by
         // a record in a message, only by a fresh link request under a new device id.  Anything
-        // claiming otherwise is either a device that was removed and is re-adding itself -- it
-        // still holds the account seed, so it can sign and push whatever it likes -- or a device
-        // relaying such a record.  Either way the answer is to restate the removal rather than to
-        // adopt it.
+        // claiming otherwise is either a device that was removed (or left) and is re-adding itself
+        // -- it still holds the account seed, so it can sign and push whatever it likes -- or a
+        // device relaying such a record.  Either way the answer is to restate the removal rather
+        // than to adopt it.
         //
-        // Asks the state, which now says only this: `Kicked` is removal and nothing else, where
-        // `Unregistered` covers a device that was never in the group -- our own row before the
-        // group is established, and an ignored link request -- both of which must still be able to
-        // register.
-        auto kicked = c.prepared_maybe_get<int>("SELECT state FROM devices WHERE unique_id = ?", id)
-                              .value_or(-1) == static_cast<int>(device::State::Kicked);
-        if (kicked) {
+        // Asks the state, which now says only this: Left and Kicked are a device gone and nothing
+        // else, where `Unregistered` covers a device that was never in the group -- our own row
+        // before the group is established, and an ignored link request -- both of which must still
+        // be able to register.
+        auto gone = c.prepared_maybe_get<int>("SELECT state FROM devices WHERE unique_id = ?", id)
+                            .value_or(-1) >= static_cast<int>(device::State::Left);
+        if (gone) {
             log::warning(
                     cat,
                     "Device group message tried to restore removed device {}; restating removal",
                     oxenc::to_hex(id));
-            c.prepared_exec(REASSERT_KICK_SQL, epoch_seconds(clock_now_s()), id);
+            c.prepared_exec(REASSERT_TOMBSTONE_SQL, epoch_seconds(clock_now_s()), id);
+            _devices_changed = true;
             continue;
         }
 
@@ -1159,35 +1499,393 @@ void Devices::receive_device_group_message(std::span<const std::byte> data) {
         auto dev_id = upsert_device_info(c, info);
         if (!dev_id)
             continue;
+        _devices_changed = true;
 
-        // Mark as newly registered only on a state transition (not for info-only updates).
-        if (!was_registered)
+        // Only on a state transition, not an update to a device already registered.
+        if (!was_registered) {
             c.prepared_exec(REGISTER_DEVICE_SQL, *dev_id);
+            c.prepared_exec(ANSWER_REQUEST_SQL, *dev_id);
+            if (id != self_id)
+                members.push_back(id);
+        } else {
+            answer_replacements(c, *dev_id, id, info);
+        }
     }
 
+    // A device that left still holds every account key we have, and could not rotate to one it
+    // lacks on our behalf: the rotation falls to whichever remaining member learns of it first --
+    // or to several, whose rotations then settle on one key as any crossing rotations do.  Not for
+    // a removal, which the removing device rotated for in the same step.
+    if (departed && _member()) {
+        log::info(cat, "A device left the group; rotating the account key");
+        rotate_account_keys();
+    }
+
+    if (theirs && theirs == _group_id())
+        _note_read(timestamp);
+
+    // Recorded whether or not the merge changed anything: a message that told us only what we
+    // already knew is just as redundant as one that told us something new, and our next push
+    // carries its contents either way.  A message we could not decrypt never reaches here.
+    if (!hash.empty())
+        c.prepared_exec(
+                "INSERT INTO device_group_merged (hash) VALUES (?) ON CONFLICT DO NOTHING", hash);
+
     tx.commit();
+
+    // Being admitted, every member is new to us, and none of them is news.
+    if (admitting)
+        _forget_own_requests();
+    else
+        _member_changes.insert(_member_changes.end(), members.begin(), members.end());
 }
 
-void Devices::build_link_request(result_function<LinkRequestResult> cb) {
-    async([this] { return _build_link_request(); }, std::move(cb));
+void Devices::_leave_group() {
+    assert(on_loop());
+    auto c = conn();
+    auto old = _group_id();
+
+    std::vector<std::string> messages;
+    for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
+        messages.push_back(std::move(hash));
+
+    // A departure for the members left, so they stop encrypting to us and rotate to a key we do not
+    // hold, pushed as an ordinary group message: so it replaces the old group's messages as any
+    // push does.  With nobody left, the messages are only deleted: nothing could read them, and
+    // devices elsewhere would go on alerting about a group nobody is in.
+    std::vector<SwarmStore> stores;
+    if (c.prepared_get<int>(
+                "SELECT count(*) FROM devices WHERE state = ? AND unique_id != ?",
+                static_cast<int>(device::State::Registered),
+                self_id) > 0) {
+        c.prepared_exec(
+                "UPDATE devices SET state = ?, kicked_timestamp = ? WHERE unique_id = ?",
+                static_cast<int>(device::State::Left),
+                epoch_seconds(clock_now_s()),
+                self_id);
+        stores.push_back(
+                {.ns = config::Namespace::Devices,
+                 .data = encrypt_device_data(devices(true, true, true)),
+                 .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
+    }
+    if (core.network())
+        core._swarm_push(std::move(stores), std::move(messages), [](auto results) {
+            if (!results)
+                log::warning(cat, "Could not leave the old device group cleanly");
+        });
+    else
+        log::warning(cat, "Leaving the old device group without telling it: no network");
+
+    // The group we have just left is not one to be alerted about.
+    if (old)
+        c.prepared_exec(
+                "UPDATE device_groups SET dismissed = 1 WHERE group_id = ?",
+                std::span<const std::byte>{old->value});
+    _forget_group();
+    log::info(cat, "Left the device group, to join another");
 }
 
-Devices::LinkRequestResult Devices::build_link_request(await_t) {
-    return jq().call_get([this] { return _build_link_request(); });
+void Devices::_record_group(const SwarmMessage& msg) {
+    oxenc::bt_dict_consumer in{msg.data};
+    in.require<std::string_view>("");
+    if (!in.skip_until("@"))
+        return;
+    auto encrypted_id = in.consume_span<std::byte, 8>();
+    auto A = in.require_span<std::byte, 32>("A");
+    auto X = in.require_span<std::byte, 32>("X");
+
+    // Checked even though only a seed holder could have encrypted the identifier: without the
+    // signature a storage server could still replay one group's identifier with a link key of its
+    // own, and have requests to join that group encrypted to it.
+    in.require_signature(
+            "~", [this](std::span<const std::byte> body, std::span<const std::byte> sig) {
+                if (sig.size() != 64 ||
+                    !ed25519::verify(sig.first<64>(), core.globals.pubkey_ed25519(), body))
+                    throw std::runtime_error{"Invalid device group message signature"};
+            });
+
+    auto seed = core.globals.account_seed();
+    auto group = crypt_group_id(encrypted_id, A, seed.seed());
+    conn().prepared_exec(
+            "INSERT INTO device_groups (group_id, link_x25519, seen_at, expires_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(group_id) DO UPDATE SET"
+            "   link_x25519 = CASE WHEN excluded.seen_at >= seen_at"
+            "       THEN excluded.link_x25519 ELSE link_x25519 END,"
+            "   seen_at = MAX(seen_at, excluded.seen_at),"
+            "   expires_at = MAX(expires_at, excluded.expires_at)",
+            std::span<const std::byte>{group},
+            X,
+            epoch_seconds(std::chrono::floor<std::chrono::seconds>(msg.timestamp)),
+            epoch_seconds(std::chrono::floor<std::chrono::seconds>(msg.expiry)));
 }
 
-Devices::LinkRequestResult Devices::_build_link_request() {
+bool Devices::_names_us_kicked(std::span<const std::byte> data) {
+    oxenc::bt_dict_consumer in{data};
+    in.require<std::string_view>("");
+    auto A = in.require_span<std::byte, 32>("A");
+    if (!in.skip_until("k"))
+        return false;
+    auto kicked = in.consume_span<std::byte>();
+    if (kicked.size() % 16 != 0)
+        return false;
+
+    auto seed = core.globals.account_seed();
+    auto ours = kicked_entry(A, seed.seed(), self_id);
+    for (size_t i = 0; i < kicked.size(); i += 16)
+        if (std::ranges::equal(kicked.subspan(i, 16), ours))
+            return true;
+    return false;
+}
+
+void Devices::request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb) {
+    enqueue([this, group, cb = std::move(cb)]() mutable {
+        // Everything that can throw comes before the upload takes `cb`, so this reports at most
+        // once.
+        try {
+            _request_link(group, cb);
+        } catch (const std::exception& e) {
+            detail::log_component_failure(e);
+            if (cb)
+                cb(unexpected{error_from(e)});
+        }
+    });
+}
+
+void Devices::_request_link(
+        const device::GroupId& group, result_function<OutgoingLinkRequest>& cb) {
+    assert(on_loop());
+
+    // Also what stops a device with no account getting as far as building a request, since a
+    // network cannot be attached without one.
+    if (!core.network())
+        throw session::error{err::network_unavailable, "Cannot request a link: no network"};
+    // Not even to switch groups: leaving its old one would announce a departure under an id that is
+    // now another device's.
+    if (_displaced())
+        throw session::error{
+                err::removed,
+                "Another device holds this device's place; it must ask under a new device id"};
+    if (_group_id() == group && _device_info().second)
+        throw session::error{err::already_registered, "This device is already in that group"};
+
+    auto link_x25519 = conn().prepared_maybe_get<sqlite::blob_guts<std::array<std::byte, 32>>>(
+            "SELECT link_x25519 FROM device_groups WHERE group_id = ? AND expires_at > ?",
+            std::span<const std::byte>{group.value},
+            epoch_seconds(clock_now_s()));
+    if (!link_x25519)
+        throw session::error{
+                err::unknown_group, "Cannot request a link: no such group is in the swarm"};
+
+    auto req = _build_link_request(group, *link_x25519);
+    OutgoingLinkRequest sent{.sas = req.sas, .expires = clock_now_s() + LINK_REQUEST_TTL};
+
+    std::vector<SwarmStore> stores;
+    stores.push_back(
+            {.ns = config::Namespace::Devices,
+             .data = std::move(req.message),
+             .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(LINK_REQUEST_TTL)});
+
+    core._swarm_push(
+            std::move(stores),
+            {},
+            [this, alive = std::weak_ptr<int>{_alive}, row = req.row, sent, cb = std::move(cb)](
+                    std::optional<std::vector<SwarmStoreResult>> results) {
+                if (alive.expired())
+                    return;
+
+                // Whether a later request has replaced this one, so that the user is now looking at
+                // that one instead.
+                auto newest = _newest_request();
+                bool current = newest && newest->row == row;
+
+                if (results && !results->empty() && results->front().stored) {
+                    conn().prepared_exec(
+                            "UPDATE device_own_requests SET expires_at = ? WHERE id = ?",
+                            epoch_seconds(sent.expires),
+                            row);
+                    if (current)
+                        _flush_events();
+                    if (cb)
+                        cb(sent);
+                    return;
+                }
+
+                // Nothing was sent that another device could accept, so nothing is outstanding --
+                // unless a later request has replaced this one, which is still in flight.  The
+                // caller hears it failed, so hearing that we stopped waiting as well would be news
+                // twice.
+                conn().prepared_exec("DELETE FROM device_own_requests WHERE id = ?", row);
+                if (current && _withdraw_own_request())
+                    _rebaseline_membership();
+                if (cb)
+                    cb(unexpected{Error{err::store_failed, "The swarm did not store the request"}});
+            });
+
+    _flush_events();
+}
+
+void Devices::outgoing_link_request(result_function<std::optional<OutgoingLinkRequest>> cb) {
+    async([this] { return _outgoing_link_request(); }, std::move(cb));
+}
+
+std::optional<Devices::OutgoingLinkRequest> Devices::outgoing_link_request(await_t) {
+    return jq().call_get([this] { return _outgoing_link_request(); });
+}
+
+template <typename... T>
+std::optional<Devices::OwnRequest> Devices::_select_own_request(
+        std::string_view where, const T&... bind) {
+    assert(on_loop());
+    auto found = conn().prepared_maybe_get<
+            int64_t,
+            sqlite::blob_guts<std::array<std::byte, 8>>,
+            sqlite::blob_guts<std::array<std::byte, 16>>,
+            int64_t,
+            std::optional<int64_t>,
+            int,
+            int>(
+            "SELECT id, group_id, sas_seed, timestamp, expires_at, confirmed,"
+            "       admission_at IS NOT NULL"
+            "  FROM device_own_requests {} ORDER BY id DESC LIMIT 1"_format(where),
+            bind...);
+    if (!found)
+        return std::nullopt;
+    auto& [row, group, seed, asked, expires, confirmed, held] = *found;
+    return OwnRequest{
+            .row = row,
+            .group = device::GroupId{group},
+            .sas_seed = seed,
+            .asked = from_epoch_s(asked),
+            .expires = expires ? std::optional{from_epoch_s(*expires)} : std::nullopt,
+            .confirmed = confirmed != 0,
+            .held = held != 0};
+}
+
+std::optional<Devices::OwnRequest> Devices::_newest_request() {
+    return _select_own_request("");
+}
+
+std::optional<Devices::OwnRequest> Devices::_own_request_admitted(
+        const device::GroupId& group, const device::Info& record) {
+    return _select_own_request(
+            "WHERE group_id = ? AND timestamp = ? AND pubkey_x25519 = ?",
+            std::span<const std::byte>{group.value},
+            record.timestamp.time_since_epoch().count(),
+            record.pk_x25519);
+}
+
+std::optional<std::chrono::sys_seconds> Devices::_own_deadline() {
+    auto newest = _newest_request();
+    if (!newest || newest->held || !newest->expires)
+        return std::nullopt;
+    // Past it only until the withdrawal it calls for, after which nothing waits on it.
+    if (*newest->expires > clock_now() || conn().prepared_maybe_get<int>(
+                                                  "SELECT 1 FROM devices"
+                                                  " WHERE unique_id = ? AND state = ?",
+                                                  self_id,
+                                                  static_cast<int>(device::State::Pending)))
+        return newest->expires;
+    return std::nullopt;
+}
+
+std::optional<Devices::OutgoingLinkRequest> Devices::_outgoing_link_request() {
+    assert(on_loop());
+    auto newest = _newest_request();
+    // Nothing until the swarm has stored it, which is when another device can see it -- unless an
+    // admission on it is waiting, which shows that one did.
+    if (!newest || !(newest->held || (newest->expires && *newest->expires > clock_now())))
+        return std::nullopt;
+
+    return OutgoingLinkRequest{
+            .sas = sas_from_seed(newest->sas_seed),
+            .expires = newest->expires.value_or(newest->asked + LINK_REQUEST_TTL),
+            .confirmed = newest->confirmed,
+            .accepted = newest->held};
+}
+
+void Devices::confirm_link(result_function<bool> cb) {
+    async([this] { return _confirm_link(); }, std::move(cb));
+}
+
+bool Devices::confirm_link(await_t) {
+    return jq().call_get([this] { return _confirm_link(); });
+}
+
+bool Devices::_asking() {
+    if (conn().prepared_maybe_get<int>(
+                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                self_id,
+                static_cast<int>(device::State::Pending)))
+        return true;
+    auto newest = _newest_request();
+    if (!newest)
+        return false;
+    if (newest->held)
+        return true;
+    // From inside a group, asking to switch: only while the request is live, since our own row
+    // says nothing of it.
+    return newest->expires && *newest->expires > clock_now() && newest->group != _group_id();
+}
+
+bool Devices::_confirm_link() {
+    assert(on_loop());
+    if (!_asking())
+        return false;
+    auto newest = _newest_request();
+    if (!newest)
+        return false;
+
+    auto c = conn();
+    c.prepared_exec("UPDATE device_own_requests SET confirmed = 1 WHERE id = ?", newest->row);
+    if (!newest->held)
+        return true;
+
+    std::vector<std::byte> admission;
+    std::string hash;
+    int64_t at = 0;
+    for (auto [data, h, t] : c.prepared_results<sqlite::blob, std::string, int64_t>(
+                 "SELECT admission, IFNULL(admission_hash, ''), admission_at"
+                 "  FROM device_own_requests WHERE id = ?",
+                 newest->row)) {
+        admission.assign(data.begin(), data.end());
+        hash = std::move(h);
+        at = t;
+    }
+    receive_device_group_message(admission, hash, sys_ms{std::chrono::milliseconds{at}});
+    _flush_events();
+    return true;
+}
+
+void Devices::_forget_own_requests() {
+    conn().prepared_exec("DELETE FROM device_own_requests");
+}
+
+bool Devices::_withdraw_own_request() {
+    assert(on_loop());
+    return conn()
+            .prepared_maybe_get<int64_t>(
+                    "UPDATE devices SET state = ? WHERE unique_id = ? AND state = ? RETURNING id",
+                    static_cast<int>(device::State::Unregistered),
+                    self_id,
+                    static_cast<int>(device::State::Pending))
+            .has_value();
+}
+
+Devices::LinkRequestResult Devices::_build_link_request(
+        const device::GroupId& group, std::span<const std::byte, 32> link_x25519) {
     assert(on_loop());
     auto [info, is_registered] = _device_info();
+    auto c = conn();
 
-    if (is_registered)
-        throw std::logic_error{
-                "build_link_request() called on a device that is already registered in the device "
-                "group"};
-
+    // After every request before it, even within the same second: the timestamp is what tells an
+    // admission which of our requests it accepted.
     info.id = self_id;
     info.seqno++;
-    info.timestamp = clock_now_s();
+    info.timestamp = std::max(
+            clock_now_s(),
+            from_epoch_s(c.prepared_get<int64_t>(
+                    "SELECT IFNULL(MAX(timestamp) + 1, 0) FROM device_own_requests")));
 
     // Always use the current active device keys for the pubkeys in the link request, regardless
     // of what is stored in the DB, as the DB may lag a key rotation.
@@ -1201,13 +1899,13 @@ Devices::LinkRequestResult Devices::_build_link_request() {
             reinterpret_cast<const std::byte*>(keys.front().mlkem768_pub.data()),
             info.pk_mlkem768.size());
 
-    // Upsert our own device row with the updated seqno, timestamp, and pubkeys.  The pending link
-    // request is detectable via state=Pending on our own row; needs_push() detects dirty state via
-    // the seqno increment above exceeding pushed_seqno.
-    auto c = conn();
+    // Outside a group, our own row moves to Pending with the updated seqno, timestamp, and pubkeys:
+    // Pending is what says we are waiting.  In one, we are asking to switch to another, and stay a
+    // working member of ours, row untouched, until we are admitted.
     auto ver = info.version[0] * 1000000 + info.version[1] * 1000 + info.version[2];
-    c.prepared_exec(
-            R"(INSERT INTO devices
+    if (!is_registered)
+        c.prepared_exec(
+                R"(INSERT INTO devices
                 (unique_id, state, seqno, timestamp, device_type, description, version,
                  pubkey_mlkem768, pubkey_x25519)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1220,37 +1918,74 @@ Devices::LinkRequestResult Devices::_build_link_request() {
                    version = excluded.version,
                    pubkey_mlkem768 = excluded.pubkey_mlkem768,
                    pubkey_x25519 = excluded.pubkey_x25519)",
-            self_id,
-            static_cast<int>(device::State::Pending),
-            info.seqno,
-            info.timestamp.time_since_epoch().count(),
-            info.encoded_type(),
-            info.description,
-            ver,
-            info.pk_mlkem768,
-            info.pk_x25519);
+                self_id,
+                static_cast<int>(device::State::Pending),
+                info.seqno,
+                info.timestamp.time_since_epoch().count(),
+                info.encoded_type(),
+                info.description,
+                ver,
+                info.pk_mlkem768,
+                info.pk_x25519);
 
-    auto plaintext = encode_link_request_plaintext(self_id, info);
-    auto sas = link_request_sas(to_span<std::byte>(plaintext));
-
-    // Encrypt the plaintext
-    std::vector<std::byte> encrypted(plaintext.size() + config::ENCRYPT_DATA_OVERHEAD);
-    std::memcpy(encrypted.data(), plaintext.data(), plaintext.size());
     auto seed = core.globals.account_seed();
-    config::encrypt_prealloced(encrypted, seed.seed(), "link-request");
+    auto plaintext = encode_link_request_plaintext(self_id, info, seed.ed25519_secret());
+    auto sas_seed = derive_sas_seed(to_span<std::byte>(plaintext));
+    auto out = _encrypt_link_request(to_span(plaintext), link_x25519);
 
-    // Wrap in outer bt-dict: {"": "L", "L": <encrypted>}
+    // An admission held for an earlier request is let go: the user has moved on to this one, whose
+    // emoji are what they will now confirm.  Requests too old for any admission to still be in the
+    // swarm go too.
+    c.prepared_exec(
+            "UPDATE device_own_requests"
+            " SET admission = NULL, admission_hash = NULL, admission_at = NULL");
+    c.prepared_exec(
+            "DELETE FROM device_own_requests WHERE timestamp < ?",
+            epoch_seconds(clock_now_s() - LINK_REQUEST_TTL - DEVICE_GROUP_TTL));
+    auto row = c.prepared_get<int64_t>(
+            "INSERT INTO device_own_requests (group_id, timestamp, pubkey_x25519, sas_seed)"
+            " VALUES (?, ?, ?, ?) RETURNING id",
+            std::span<const std::byte>{group.value},
+            info.timestamp.time_since_epoch().count(),
+            info.pk_x25519,
+            sas_seed);
+
+    // Now waiting on our own request, which the caller knows: it is the one asking.
+    _rebaseline_membership();
+
+    return {std::move(out), sas_from_seed(sas_seed), row};
+}
+
+std::vector<std::byte> Devices::_encrypt_link_request(
+        std::span<const std::byte> plaintext, std::span<const std::byte, 32> link_x25519) {
+    // Encrypted to the group being asked, so that only its members can read it -- not every holder
+    // of the seed, which includes any device ever removed.  See "Initiating a device link".
+    auto [E, e] = x25519::keypair();
+    cleared_b32 shared_x, shared_s;
+    const auto& S = core.globals.pubkey_x25519();
+    if (!x25519::scalarmult(shared_x, e, link_x25519) || !x25519::scalarmult(shared_s, e, S))
+        throw std::runtime_error{"Cannot encrypt a link request: degenerate X25519 key"};
+    auto kiss = link_request_kiss(shared_s, E, S);
+    std::array<std::byte, 2> indicator{link_x25519[0] ^ kiss[0], link_x25519[1] ^ kiss[1]};
+
+    auto [key, nonce] = link_request_key(shared_x, E, link_x25519);
+    std::vector<std::byte> encrypted(plaintext.size() + encryption::XCHACHA20_ABYTES);
+    encryption::xchacha20poly1305_encrypt(encrypted, plaintext, nonce, key);
+
     std::vector<std::byte> out(
             2                                         // Outer "d" ... "e" delimiters
             + 5                                       // "0:" + "1:L" (message type indicator)
-            + 3 + bt_bytes_encoded(encrypted.size())  // "1:L" + "NNN:...(encrypted blob)..."
+            + 3 + bt_bytes_encoded(E.size())          // "1:E" + "32:...(ephemeral pubkey)..."
+            + 3 + bt_bytes_encoded(encrypted.size())  // "1:L" + "NNN:...(encrypted request)..."
+            + 3 + bt_bytes_encoded(indicator.size())  // "1:i" + "2:...(key indicator)..."
     );
     oxenc::bt_dict_producer o{reinterpret_cast<char*>(out.data()), out.size()};
     o.append("", "L");
+    o.append("E", E);
     o.append("L", std::span<const std::byte>{encrypted});
+    o.append("i", indicator);
     assert(o.view().size() == out.size());
-
-    return {std::move(out), sas};
+    return out;
 }
 
 std::vector<std::byte> Devices::decrypt_device_data(std::span<const std::byte> enc_data) {
@@ -1390,26 +2125,58 @@ std::vector<std::byte> Devices::decrypt_device_data(std::span<const std::byte> e
     return plaintext_devices;
 }
 
-void Devices::receive_link_request(std::span<const std::byte> data) {
-    // Parse outer bt-dict: {"": "L", "L": <encrypted>}
-    oxenc::bt_dict_consumer outer{data};
-    outer.require<std::string_view>("");  // skip type indicator
-    auto encrypted = outer.require_span<std::byte>("L");
+std::optional<std::vector<std::byte>> Devices::_decrypt_link_request(
+        std::span<const std::byte, 32> E,
+        std::span<const std::byte> encrypted,
+        std::span<const std::byte, 2> indicator) {
+    if (encrypted.size() < encryption::XCHACHA20_ABYTES)
+        return std::nullopt;
 
-    // Decrypt using the account seed
-    std::vector<std::byte> plaintext;
-    try {
-        auto seed = core.globals.account_seed();
-        plaintext = config::decrypt(encrypted, seed.seed(), "link-request");
-    } catch (const config::decrypt_error& e) {
-        log::warning(cat, "Ignoring incoming link request: decryption failed: {}", e.what());
+    auto seed = core.globals.account_seed();
+    cleared_b32 shared_s;
+    if (!x25519::scalarmult(shared_s, seed.x25519_key(), E))
+        return std::nullopt;
+    auto kiss = link_request_kiss(shared_s, E, core.globals.pubkey_x25519());
+    std::array<std::byte, 2> prefix{indicator[0] ^ kiss[0], indicator[1] ^ kiss[1]};
+
+    // Any key we still hold, not only the current one: the group may have rotated since the
+    // request's sender read its link key.
+    for (auto account_seed : conn().prepared_results<sqlite::blobn<32>>(
+                 "SELECT seed FROM device_account_keys WHERE substr(pubkey_x25519, 1, 2) = ?",
+                 std::span<const std::byte>{prefix})) {
+        auto keys = keys_from_seed<AccountKeys>(account_seed);
+        cleared_b32 shared_x;
+        if (!x25519::scalarmult(shared_x, keys.x25519_sec, E))
+            continue;
+        auto [key, nonce] = link_request_key(shared_x, E, keys.x25519_pub);
+        std::vector<std::byte> plaintext(encrypted.size() - encryption::XCHACHA20_ABYTES);
+        if (encryption::xchacha20poly1305_decrypt(plaintext, encrypted, nonce, key))
+            return plaintext;
+    }
+    return std::nullopt;
+}
+
+void Devices::receive_link_request(
+        std::span<const std::byte> data, const std::string& hash, sys_ms expiry) {
+    oxenc::bt_dict_consumer outer{data};
+    outer.require<std::string_view>("");
+    auto E = outer.require_span<std::byte, 32>("E");
+    auto encrypted = outer.require_span<std::byte>("L");
+    auto indicator = outer.require_span<std::byte, 2>("i");
+
+    // Encrypted to one group's link key, so failing here is the ordinary case for a request asking
+    // to join a different group.
+    auto plaintext = _decrypt_link_request(E, encrypted, indicator);
+    if (!plaintext) {
+        log::debug(cat, "Ignoring a link request for a group this device is not in");
         return;
     }
 
-    // Parse plaintext: {"I": <32-byte device id>, "i": {device info dict}}
+    // {"I": device id, "i": device info dict, "~": signature by the account key}
     device::Info info;
+    std::string_view raw;
     try {
-        oxenc::bt_dict_consumer pt{std::span<const std::byte>{plaintext}};
+        oxenc::bt_dict_consumer pt{std::span<const std::byte>{*plaintext}};
         auto in_id = pt.require_span<unsigned char, 32>("I");
         std::memcpy(info.id.data(), in_id.data(), info.id.size());
 
@@ -1419,30 +2186,62 @@ void Devices::receive_link_request(std::span<const std::byte> data) {
             consume_extra(pt, extra_outer);
         if (pt.is_finished() || pt.key() != "i")
             throw std::runtime_error{"missing 'i' device info dict"};
-        decode_one(info, pt.consume_dict_consumer(), device::State::Pending);
+        raw = pt.consume_dict_data();
+        decode_one(info, oxenc::bt_dict_consumer{raw}, device::State::Pending);
+        info.digest = hash::blake2b<8>(raw);
+
+        // The group's link key is published, so anything could have encrypted to it; only a seed
+        // holder could have signed.
+        pt.require_signature(
+                "~", [this](std::span<const std::byte> body, std::span<const std::byte> sig) {
+                    if (sig.size() != 64 ||
+                        !ed25519::verify(sig.first<64>(), core.globals.pubkey_ed25519(), body))
+                        throw std::runtime_error{"signature verification failed"};
+                });
     } catch (const std::exception& e) {
         log::warning(cat, "Ignoring incoming link request: failed to parse: {}", e.what());
         return;
     }
 
+    // Our own request, fetched back from the swarm we sent it to.  The merge guard below would also
+    // turn it away, but only because our own row happens to carry no digest.
+    if (info.id == self_id)
+        return;
+
     auto c = conn();
 
-    // Reject if already registered or unregistered; only Pending (or absent) is valid
+    // A device already in the group is asking to replace its record: it lost track of having joined
+    // -- restored from a backup, say -- and no longer holds the keys the group encrypts to.  Its
+    // row keeps the record in use until the request is accepted.  A device that was removed, or
+    // left, cannot ask at all: its id is spent.
+    auto existing = c.prepared_maybe_get<int64_t, int, int64_t>(
+            "SELECT id, state, timestamp FROM devices WHERE unique_id = ?", info.id);
     auto existing_state =
-            c.prepared_maybe_get<int>("SELECT state FROM devices WHERE unique_id = ?", info.id)
-                    .value_or(-1);
-    if (existing_state != -1 && existing_state != static_cast<int>(device::State::Pending)) {
+            existing ? static_cast<device::State>(std::get<1>(*existing)) : device::State::Pending;
+    bool replaces = existing_state == device::State::Registered;
+
+    // Only a request made after the record it would replace: an older one is the request that
+    // admitted the device in the first place, or one it has since moved past, still in the swarm
+    // and fetched late.
+    if (replaces && info.timestamp.time_since_epoch().count() <= std::get<2>(*existing)) {
+        log::debug(
+                cat,
+                "Ignoring link request from {}: older than its record in the group",
+                oxenc::to_hex(info.id));
+        return;
+    }
+    if (!replaces && existing_state != device::State::Pending) {
         log::debug(
                 cat,
                 "Ignoring link request from {}: device already in state {}",
                 oxenc::to_hex(info.id),
-                existing_state);
+                static_cast<int>(existing_state));
         return;
     }
 
     SQLite::Transaction tx{c.sql};
 
-    auto dev_id = upsert_device_info(c, info);
+    auto dev_id = replaces ? std::optional{std::get<0>(*existing)} : upsert_device_info(c, info);
     if (!dev_id) {
         log::debug(
                 cat,
@@ -1451,26 +2250,677 @@ void Devices::receive_link_request(std::span<const std::byte> data) {
         return;
     }
 
-    auto sas_seed = derive_sas_seed(as_span<std::byte>(std::span{plaintext}));
+    auto sas_seed = derive_sas_seed(std::span<const std::byte>{*plaintext});
 
+    // A newer request from the same device replaces the earlier one for the user's purposes, but
+    // does not erase it: the older row stays readable as something this device saw.  Marked before
+    // the insert so that exactly one request per device is ever pending.
     c.prepared_exec(
-            R"(INSERT INTO device_link_requests (device, received_at, sas_seed)
-               VALUES (?, ?, ?)
-               ON CONFLICT(device) DO UPDATE SET
-                   received_at = excluded.received_at,
-                   sas_seed = excluded.sas_seed)",
-            *dev_id,
-            epoch_seconds(clock_now_s()),
-            sas_seed);
-
-    // Set processing=LinkRequest only if not already set to a higher-priority value by a
-    // concurrent device group message in the same batch
-    c.prepared_exec(
-            "UPDATE devices SET processing = ? WHERE id = ? AND processing IS NULL",
-            static_cast<int>(Processing::LinkRequest),
+            "UPDATE device_link_requests SET status = {} WHERE device = ? AND status = {}"_format(
+                    static_cast<int>(device::LinkStatus::Superseded),
+                    static_cast<int>(device::LinkStatus::Pending)),
             *dev_id);
 
+    c.prepared_exec(
+            R"(INSERT INTO device_link_requests
+                (device, received_at, expires_at, sas_seed, hash, info, replaces)
+               VALUES (?, ?, ?, ?, ?, ?, ?))",
+            *dev_id,
+            epoch_seconds(clock_now_s()),
+            epoch_seconds(expiry),
+            sas_seed,
+            hash,
+            to_span<std::byte>(raw),
+            replaces ? 1 : 0);
+
     tx.commit();
+}
+
+int Devices::_reqid_for(int64_t row) {
+    assert(on_loop());
+    auto [it, inserted] = _reqid_by_row.try_emplace(row, _next_reqid);
+    if (inserted)
+        _row_by_reqid.emplace(_next_reqid++, row);
+    return it->second;
+}
+
+std::optional<int64_t> Devices::_row_for(int reqid) {
+    assert(on_loop());
+    if (auto it = _row_by_reqid.find(reqid); it != _row_by_reqid.end())
+        return it->second;
+    return std::nullopt;
+}
+
+std::vector<device::LinkRequest> Devices::_link_requests(bool pending_only) {
+    auto now = clock_now();
+    bool opened = false;
+    std::vector<device::LinkRequest> out;
+    for (auto& [row, request] : _read_link_requests(pending_only)) {
+        if (!_reqid_by_row.contains(row)) {
+            // One handed out already closed is seen to be closed; reporting it so would be news
+            // about something that happened before the caller ever heard of it.
+            if (request.status != device::LinkStatus::Pending || request.expired(now))
+                _ended.insert(row);
+            else
+                opened = true;
+        }
+        request.id = _reqid_for(row);
+        out.push_back(std::move(request));
+    }
+    // Its deadline is one the expiry timer was not armed for.
+    if (opened)
+        jq().wake(_expiry_timer);
+    return out;
+}
+
+std::vector<std::pair<int64_t, device::LinkRequest>> Devices::_read_link_requests(
+        bool pending_only) {
+    assert(on_loop());
+    auto c = conn();
+    std::vector<std::pair<int64_t, device::LinkRequest>> out;
+
+    for (auto [row, received, expires, status, sas_seed, record, replaces, devid] :
+         c.prepared_results<
+                 int64_t,
+                 int64_t,
+                 int64_t,
+                 int,
+                 sqlite::blob_guts<std::array<std::byte, 16>>,
+                 sqlite::blob,
+                 int,
+                 sqlite::blob_guts<std::array<std::byte, 32>>>(
+                 "SELECT r.id, r.received_at, r.expires_at, r.status, r.sas_seed, r.info,"
+                 "       r.replaces, d.unique_id"
+                 "  FROM device_link_requests r JOIN devices d ON d.id = r.device"
+                 " WHERE ? = 0 OR (r.status = {} AND r.expires_at > ?)"
+                 " ORDER BY r.id DESC"_format(static_cast<int>(device::LinkStatus::Pending)),
+                 pending_only ? 1 : 0,
+                 epoch_seconds(clock_now_s()))) {
+        std::optional<device::Info> current;
+        if (replaces) {
+            auto held = devices(true, true, true, devid);
+            if (auto it = held.find(devid); it != held.end())
+                current = std::move(it->second);
+        }
+
+        out.emplace_back(
+                row,
+                device::LinkRequest{
+                        .id = 0,
+                        .device = requested_record(devid, record),
+                        .replaces = std::move(current),
+                        .sas = sas_from_seed(sas_seed),
+                        .received = std::chrono::sys_seconds{std::chrono::seconds{received}},
+                        .expires = std::chrono::sys_seconds{std::chrono::seconds{expires}},
+                        .status = static_cast<device::LinkStatus>(status)});
+    }
+    return out;
+}
+
+void Devices::link_requests(result_function<std::vector<device::LinkRequest>> cb) {
+    async([this] { return _link_requests(false); }, std::move(cb));
+}
+
+std::vector<device::LinkRequest> Devices::link_requests(await_t) {
+    return jq().call_get([this] { return _link_requests(false); });
+}
+
+void Devices::incoming_link_requests(result_function<std::vector<device::LinkRequest>> cb) {
+    async([this] { return _link_requests(true); }, std::move(cb));
+}
+
+std::vector<device::LinkRequest> Devices::incoming_link_requests(await_t) {
+    return jq().call_get([this] { return _link_requests(true); });
+}
+
+void Devices::accept_request(int reqid, result_function<bool> cb) {
+    async([this, reqid] { return _accept_request(reqid); }, std::move(cb));
+}
+
+bool Devices::accept_request(int reqid, await_t) {
+    return jq().call_get([this, reqid] { return _accept_request(reqid); });
+}
+
+bool Devices::_accept_request(int reqid) {
+    assert(on_loop());
+    auto row = _row_for(reqid);
+    if (!row)
+        throw std::invalid_argument{"accept_request: no such link request in this session"};
+
+    auto c = conn();
+    SQLite::Transaction tx{c.sql};
+
+    // A device outside the group has nobody to admit anyone to.  Checked here rather than left to
+    // the push, which would simply never happen and leave the request looking accepted.
+    if (!_member())
+        return false;
+
+    auto request = c.prepared_maybe_get<int64_t, int>(
+            "SELECT device, replaces FROM device_link_requests"
+            " WHERE id = ? AND status = {} AND expires_at > ?"_format(
+                    static_cast<int>(device::LinkStatus::Pending)),
+            *row,
+            epoch_seconds(clock_now_s()));
+    if (!request)
+        return false;
+    auto [dev, replaces] = *request;
+
+    // A new device only from Pending: one kicked since the request arrived is gone for good, and
+    // the rank rule would refuse to lower it anyway.
+    bool admitted = replaces ? _replace_record(*row)
+                             : c.prepared_maybe_get<int64_t>(
+                                        "UPDATE devices SET state = ?, broadcast_needed = 1"
+                                        " WHERE id = ? AND state = ? RETURNING id",
+                                        static_cast<int>(device::State::Registered),
+                                        dev,
+                                        static_cast<int>(device::State::Pending))
+                                       .has_value();
+    if (!admitted)
+        return false;
+
+    c.prepared_exec(
+            "UPDATE device_link_requests SET status = ? WHERE id = ?",
+            static_cast<int>(device::LinkStatus::Accepted),
+            *row);
+
+    tx.commit();
+
+    _ended.insert(*row);
+    _devices_changed = true;
+    _flush_events();
+    return true;
+}
+
+bool Devices::_replace_record(int64_t row) {
+    assert(on_loop());
+    auto c = conn();
+    std::optional<device::Info> info;
+    for (auto [record, id, seqno] :
+         c.prepared_results<sqlite::blob, sqlite::blob_guts<std::array<std::byte, 32>>, int64_t>(
+                 "SELECT r.info, d.unique_id, d.seqno"
+                 "  FROM device_link_requests r JOIN devices d ON d.id = r.device"
+                 " WHERE r.id = ? AND d.state = ?",
+                 row,
+                 static_cast<int>(device::State::Registered))) {
+        info = requested_record(id, record);
+        // Above both, so that the record wins every merge: the one it replaces everywhere it is
+        // held, and the requesting device's own row, which may have fallen behind with whatever
+        // else it lost.
+        info->seqno = std::max(seqno, info->seqno) + 1;
+    }
+    if (!info)
+        return false;
+
+    info->state = device::State::Registered;
+    info->digest = record_digest(*info);
+    auto dev = upsert_device_info(c, *info);
+    assert(dev);
+    c.prepared_exec(REGISTER_DEVICE_SQL, *dev);
+
+    log::info(cat, "Replacing the record of device {}; rotating the account key", info->id);
+    rotate_account_keys();
+    return true;
+}
+
+void Devices::ignore_request(int reqid, result_function<bool> cb) {
+    ignore_request(reqid, false, std::move(cb));
+}
+
+void Devices::ignore_request(int reqid, bool delete_from_swarm, result_function<bool> cb) {
+    async([this, reqid, delete_from_swarm] { return _ignore_request(reqid, delete_from_swarm); },
+          std::move(cb));
+}
+
+bool Devices::ignore_request(int reqid, await_t) {
+    return ignore_request(reqid, false, await);
+}
+
+bool Devices::ignore_request(int reqid, bool delete_from_swarm, await_t) {
+    return jq().call_get(
+            [this, reqid, delete_from_swarm] { return _ignore_request(reqid, delete_from_swarm); });
+}
+
+bool Devices::_ignore_request(int reqid, bool delete_from_swarm) {
+    assert(on_loop());
+    auto row = _row_for(reqid);
+    if (!row)
+        throw std::invalid_argument{"ignore_request: no such link request in this session"};
+
+    auto c = conn();
+    SQLite::Transaction tx{c.sql};
+
+    auto ignored = c.prepared_maybe_get<std::string>(
+            "UPDATE device_link_requests SET status = ? WHERE id = ? AND status = ?"
+            " RETURNING hash",
+            static_cast<int>(device::LinkStatus::Ignored),
+            *row,
+            static_cast<int>(device::LinkStatus::Pending));
+    if (!ignored)
+        return false;
+
+    // The device row stays Pending, deliberately: a redelivery of the same request then fails the
+    // merge guard and does not prompt again, while a genuine retry carries a higher seqno and does.
+    tx.commit();
+
+    _ended.insert(*row);
+
+    if (delete_from_swarm) {
+        if (core.network())
+            core._swarm_push({}, {std::move(*ignored)}, [](auto results) {
+                if (!results)
+                    log::warning(cat, "Could not delete an ignored link request from the swarm");
+            });
+        else
+            log::warning(cat, "Not deleting an ignored link request from the swarm: no network");
+    }
+    return true;
+}
+
+void Devices::membership(result_function<device::MembershipState> cb) {
+    async([this] { return _membership(); }, std::move(cb));
+}
+
+device::MembershipState Devices::membership(await_t) {
+    return jq().call_get([this] { return _membership(); });
+}
+
+device::MembershipState Devices::_membership() {
+    assert(on_loop());
+    device::MembershipState out{.membership = device::Membership::Unknown};
+    auto ours = _group_id();
+    auto c = conn();
+
+    bool ours_present = false;
+    for (auto [group, seen, dismissed] :
+         c.prepared_results<sqlite::blob_guts<std::array<std::byte, 8>>, int64_t, int>(
+                 "SELECT group_id, seen_at, dismissed FROM device_groups"
+                 " WHERE expires_at > ? ORDER BY seen_at DESC",
+                 epoch_seconds(clock_now_s()))) {
+        device::GroupId id{group};
+        if (ours && id == *ours)
+            ours_present = true;
+        else
+            out.others.push_back({id, from_epoch_s(seen), dismissed != 0});
+    }
+
+    auto own = static_cast<device::State>(
+            c.prepared_maybe_get<int>("SELECT state FROM devices WHERE unique_id = ?", self_id)
+                    .value_or(static_cast<int>(device::State::Unregistered)));
+    if (own == device::State::Registered)
+        out.group = ours;
+
+    if (!_fetched)
+        return out;
+
+    switch (own) {
+        case device::State::Kicked: out.membership = device::Membership::Removed; break;
+        case device::State::Registered:
+            // None of ours left is only alarming beside another's: alone, it is a group whose
+            // messages have yet to reach the swarm, or expired while every device was away, and
+            // our next push restores them.
+            out.membership = _displaced()                         ? device::Membership::Displaced
+                           : !ours_present && !out.others.empty() ? device::Membership::CutOff
+                                                                  : device::Membership::InGroup;
+            break;
+        case device::State::Pending: out.membership = device::Membership::Waiting; break;
+        default: {
+            // Admitted after the request lapsed here, and waiting for the user to confirm it.
+            auto newest = _newest_request();
+            out.membership = newest && newest->held ? device::Membership::Waiting
+                           : out.others.empty()     ? device::Membership::NoGroup
+                                                    : device::Membership::GroupsVisible;
+        }
+    }
+    return out;
+}
+
+void Devices::_rebaseline_membership() {
+    if (auto m = _membership().membership; m != device::Membership::Unknown)
+        _reported_membership = m;
+}
+
+void Devices::renew_device_identity(result_function<bool> cb) {
+    async([this] { return _renew_device_identity(); }, std::move(cb));
+}
+
+bool Devices::renew_device_identity(await_t) {
+    return jq().call_get([this] { return _renew_device_identity(); });
+}
+
+void Devices::_forget_group() {
+    assert(on_loop());
+    auto c = conn();
+    // Its devices, ourselves included: a group started from these would carry them over as members,
+    // and a group joined says who is in it.  Its account keys, which never carry into another group
+    // -- a group joined brings its own, and a group started mints a fresh one.
+    c.prepared_exec("DELETE FROM devices");
+    c.prepared_exec("DELETE FROM device_group_merged");
+    c.prepared_exec("DELETE FROM device_account_keys");
+    core.globals.erase(group_id_key);
+    core.globals.erase(read_at_key);
+    core.globals.erase(displaced_key);
+}
+
+bool Devices::_displaced() {
+    return core.globals.get_integer(displaced_key).has_value();
+}
+
+bool Devices::_member() {
+    return !_displaced() && conn().prepared_maybe_get<int>(
+                                    "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                                    self_id,
+                                    static_cast<int>(device::State::Registered));
+}
+
+void Devices::_note_read(sys_ms timestamp) {
+    int64_t ms = timestamp.time_since_epoch().count();
+    if (auto read_at = core.globals.get_integer(read_at_key); !read_at || ms > *read_at)
+        core.globals.set(read_at_key, ms);
+
+    // Read again at or past what displaced us, which only a member could: the group took us back,
+    // or what looked like displacement was a snapshot that had yet to hear of us after all.
+    if (auto displaced = core.globals.get_integer(displaced_key); displaced && ms >= *displaced) {
+        core.globals.erase(displaced_key);
+        log::info(cat, "This device can read its device group again");
+    }
+}
+
+bool Devices::_renew_device_identity() {
+    assert(on_loop());
+    if (!_displaced() && !conn().prepared_maybe_get<int>(
+                                 "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                                 self_id,
+                                 static_cast<int>(device::State::Kicked)))
+        return false;
+
+    // Before the transaction, which it would otherwise nest inside.
+    rotate_device_keys();
+
+    std::array<std::byte, 32> id;
+    random::fill(id);
+    {
+        auto c = conn();
+        SQLite::Transaction tx{c.sql};
+        _forget_group();
+        core.globals.set(dev_key, std::span<const std::byte>{id});
+        _forget_own_requests();
+        tx.commit();
+    }
+
+    log::info(cat, "Replaced removed device id {} with {}", self_id, id);
+    self_id = id;
+    _reqid_by_row.clear();
+    _row_by_reqid.clear();
+    _ended.clear();
+
+    _rebaseline_membership();
+    _flush_events();
+    return true;
+}
+
+void Devices::start_group(result_function<device::GroupId> cb) {
+    async([this] { return _start_group(); }, std::move(cb));
+}
+
+device::GroupId Devices::start_group(await_t) {
+    return jq().call_get([this] { return _start_group(); });
+}
+
+device::GroupId Devices::_start_group() {
+    assert(on_loop());
+    switch (_membership().membership) {
+        case device::Membership::Unknown:
+            throw session::error{
+                    err::membership_unknown,
+                    "Cannot start a group before a fetch has shown what the swarm holds"};
+        case device::Membership::InGroup:
+        case device::Membership::CutOff:
+            throw session::error{err::already_registered, "This device is already in a group"};
+        case device::Membership::Removed:
+        case device::Membership::Displaced:
+            // Its tables still hold the group it is no longer in, which a group started from them
+            // would carry on as its own members.
+            throw session::error{
+                    err::removed,
+                    "This device is no longer in its group; it must rejoin under a new device id "
+                    "before starting one"};
+        case device::Membership::Waiting: _withdraw_own_request(); break;
+        case device::Membership::NoGroup:
+        case device::Membership::GroupsVisible: break;
+    }
+
+    // Whatever it held before is no group's, the group starts with a fresh key, and an admission on
+    // anything it asked before would take it straight back out.
+    _forget_group();
+    _forget_own_requests();
+    _mark_group_owed();
+    establish_group();
+    auto group = _group_id();
+    if (!group)
+        throw std::logic_error{"Started a group but it has no identifier"};
+    log::info(cat, "Started a new device group");
+
+    _devices_changed = true;
+    _rebaseline_membership();
+    _flush_events();
+    return *group;
+}
+
+void Devices::dismiss_group(device::GroupId group, result_function<bool> cb) {
+    async([this, group] { return _dismiss_group(group); }, std::move(cb));
+}
+
+bool Devices::dismiss_group(const device::GroupId& group, await_t) {
+    return jq().call_get([this, &group] { return _dismiss_group(group); });
+}
+
+bool Devices::_dismiss_group(const device::GroupId& group) {
+    assert(on_loop());
+    return conn()
+            .prepared_maybe_get<int>(
+                    "UPDATE device_groups SET dismissed = 1 WHERE group_id = ? RETURNING 1",
+                    std::span<const std::byte>{group.value})
+            .has_value();
+}
+
+void Devices::remove_device(std::array<std::byte, 32> id, result_function<bool> cb) {
+    async([this, id] { return _remove_device(id); }, std::move(cb));
+}
+
+bool Devices::remove_device(std::span<const std::byte, 32> id, await_t) {
+    return jq().call_get([this, id] { return _remove_device(id); });
+}
+
+bool Devices::_remove_device(std::span<const std::byte, 32> id) {
+    assert(on_loop());
+    if (std::ranges::equal(id, self_id))
+        throw std::invalid_argument{"remove_device: cannot remove this device itself"};
+
+    auto c = conn();
+    SQLite::Transaction tx{c.sql};
+
+    if (!_member())
+        return false;
+
+    if (!c.prepared_maybe_get<int64_t>(
+                "UPDATE devices SET state = ?, kicked_timestamp = ?, broadcast_needed = 1"
+                " WHERE unique_id = ? AND state = ? RETURNING id",
+                static_cast<int>(device::State::Kicked),
+                epoch_seconds(clock_now_s()),
+                id,
+                static_cast<int>(device::State::Registered)))
+        return false;
+
+    // In the same transaction, so there is no moment at which the removal is recorded and the key
+    // the removed device holds is still the one a push would treat as current.
+    rotate_account_keys();
+    tx.commit();
+
+    log::info(cat, "Removed device {} from the group", oxenc::to_hex(id));
+    _devices_changed = true;
+    _flush_events();
+    return true;
+}
+
+void Devices::forget_link_requests(std::vector<int> reqids, result_function<size_t> cb) {
+    async([this, reqids = std::move(reqids)] { return _forget_link_requests(reqids); },
+          std::move(cb));
+}
+
+size_t Devices::forget_link_requests(std::span<const int> reqids, await_t) {
+    return jq().call_get([this, reqids] { return _forget_link_requests(reqids); });
+}
+
+size_t Devices::_forget_link_requests(std::span<const int> reqids) {
+    assert(on_loop());
+    std::vector<int64_t> rows;
+    for (auto id : reqids)
+        if (auto row = _row_for(id))
+            rows.push_back(*row);
+    if (rows.empty())
+        return 0;
+
+    std::vector<int64_t> gone;
+    auto c = conn();
+    for (auto row : c.prepared_results<int64_t>(
+                 "DELETE FROM device_link_requests WHERE id IN ({})"
+                 " AND NOT (status = {} AND expires_at > ?) RETURNING id"_format(
+                         sqlite::placeholders(rows.size()),
+                         static_cast<int>(device::LinkStatus::Pending)),
+                 sqlite::bind_each{rows},
+                 epoch_seconds(clock_now_s())))
+        gone.push_back(row);
+
+    for (auto row : gone) {
+        _ended.erase(row);
+        if (auto it = _reqid_by_row.find(row); it != _reqid_by_row.end()) {
+            _row_by_reqid.erase(it->second);
+            _reqid_by_row.erase(it);
+        }
+    }
+    return gone.size();
+}
+
+void Devices::_flush_events() {
+    assert(on_loop());
+    auto now = clock_now_s();
+
+    // Not cleared when we are admitted: the withdrawal finds nothing Pending and does nothing,
+    // which is simpler than clearing the deadline on every path that can admit us.
+    auto next_deadline = _own_deadline();
+    if (next_deadline && *next_deadline <= now) {
+        _withdraw_own_request();
+        next_deadline.reset();
+    }
+
+    bool changed = std::exchange(_devices_changed, false);
+    auto members = std::exchange(_member_changes, {});
+    if (auto* events = cb().devices)
+        if (auto theirs = _report_events(*events, changed, members, now))
+            next_deadline = std::min(next_deadline.value_or(*theirs), *theirs);
+
+    _arm_expiry(next_deadline);
+}
+
+void Devices::_arm_expiry(std::optional<std::chrono::sys_seconds> deadline) {
+    if (!deadline) {
+        jq().stop(_expiry_timer);
+        return;
+    }
+    // A non-positive interval would stop the timer instead.  Firing a moment early is harmless:
+    // the flush it runs finds nothing expired and re-arms for the remainder.
+    auto delay = std::chrono::ceil<std::chrono::microseconds>(*deadline - clock_now());
+    jq().repeat(_expiry_timer, std::max<std::chrono::microseconds>(delay, 1ms));
+}
+
+std::optional<std::chrono::sys_seconds> Devices::_report_events(
+        DeviceEvents& events,
+        bool devices_changed,
+        std::span<const std::array<std::byte, 32>> member_changes,
+        std::chrono::sys_seconds now) {
+    // One handler throwing must not take the others' reports down with it.
+    auto report = [](std::string_view which, auto&& call) {
+        try {
+            call();
+        } catch (const std::exception& e) {
+            log::error(cat, "DeviceEvents::{} threw: {}", which, e.what());
+        }
+    };
+
+    auto c = conn();
+    std::optional<std::chrono::sys_seconds> next_deadline;
+    auto open_until = [&](std::chrono::sys_seconds expires) {
+        next_deadline = std::min(next_deadline.value_or(expires), expires);
+    };
+
+    // Closed before opened, so a request superseded by a resend has its prompt closed before the
+    // new one's is raised.
+    std::vector<std::pair<int, device::LinkRequestEnd>> ended;
+    for (const auto& [row, reqid] : _reqid_by_row) {
+        if (_ended.contains(row))
+            continue;
+        auto st = c.prepared_maybe_get<int, int64_t>(
+                "SELECT status, expires_at FROM device_link_requests WHERE id = ?", row);
+        if (!st) {
+            _ended.insert(row);
+            continue;
+        }
+        auto [status, expires] = *st;
+        std::optional<device::LinkRequestEnd> why;
+        switch (static_cast<device::LinkStatus>(status)) {
+            case device::LinkStatus::Accepted: why = device::LinkRequestEnd::Accepted; break;
+            case device::LinkStatus::Superseded: why = device::LinkRequestEnd::Superseded; break;
+            case device::LinkStatus::Ignored: _ended.insert(row); break;
+            case device::LinkStatus::Pending:
+                if (from_epoch_s(expires) <= now)
+                    why = device::LinkRequestEnd::Expired;
+                else
+                    open_until(from_epoch_s(expires));
+                break;
+        }
+        if (why) {
+            _ended.insert(row);
+            ended.emplace_back(reqid, *why);
+        }
+    }
+    for (auto [reqid, why] : ended)
+        report("link_request_ended", [&] { events.link_request_ended(reqid, why); });
+
+    // Only once the swarm has been asked: a request stored before a restart may have been
+    // answered or expired while we were away, and the fetch is what says so.
+    if (_fetched)
+        for (auto& [row, request] : _read_link_requests(true))
+            if (!_reqid_by_row.contains(row)) {
+                request.id = _reqid_for(row);
+                open_until(request.expires);
+                report("link_request_added",
+                       [&] { events.link_request_added(std::move(request)); });
+            }
+
+    // Each as it stands now, which is what it changed to: a device admitted and removed again
+    // within one fetch reads as removed, which is the news.
+    for (const auto& id : member_changes)
+        for (auto& [_, info] : devices(true, false, true, id))
+            report("device_membership_changed",
+                   [&] { events.device_membership_changed(std::move(info)); });
+
+    if (devices_changed)
+        report("devices_replaced", [&] { events.devices_replaced(devices(true, false, true)); });
+
+    auto state = _membership();
+    if (state.membership != device::Membership::Unknown &&
+        state.membership != _reported_membership) {
+        _reported_membership = state.membership;
+        report("membership_changed", [&] { events.membership_changed(state.membership); });
+    }
+
+    // A fork is news only to a device in a group: one outside any has nothing to be forked from.
+    if (state.membership == device::Membership::InGroup)
+        for (const auto& other : state.others)
+            if (!other.dismissed && _announced_groups.insert(other.id.value).second)
+                report("group_appeared", [&] { events.group_appeared(other.id); });
+
+    return next_deadline;
 }
 
 void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool is_final) {
@@ -1478,10 +2928,11 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
         try {
             oxenc::bt_dict_consumer in{msg.data};
             auto type = in.require<std::string_view>("");
-            if (type == "G")
-                receive_device_group_message(msg.data);
-            else if (type == "L")
-                receive_link_request(msg.data);
+            if (type == "G") {
+                _record_group(msg);
+                receive_device_group_message(msg.data, msg.hash, msg.timestamp);
+            } else if (type == "L")
+                receive_link_request(msg.data, msg.hash, msg.expiry);
             else
                 log::warning(cat, "Ignoring device message with unknown type '{}'", type);
         } catch (const std::exception& e) {
@@ -1492,124 +2943,13 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
     if (!is_final)
         return;
 
-    // Fire deferred callbacks for all devices with a pending processing state.  We collect first
-    // to avoid nested statement conflicts during callback + processing-clear operations.
-    struct ProcessingItem {
-        int64_t row_id;
-        std::array<std::byte, 32> id;
-        Processing processing;
-        device::Info info;
-    };
+    _fetched = true;
+    _flush_events();
 
-    auto c = conn();
-    std::vector<ProcessingItem> items;
-    for (auto [row_id,
-               raw_id,
-               processing_int,
-               state_int,
-               seqno,
-               timestamp,
-               dtype,
-               desc,
-               ver,
-               pk_ml,
-               pk_x,
-               kicked_ts] :
-         c.prepared_results<
-                 int64_t,
-                 sqlite::blob_guts<std::array<std::byte, 32>>,
-                 int,
-                 int,
-                 int,
-                 int64_t,
-                 std::string,
-                 std::string,
-                 int64_t,
-                 sqlite::blobn<mlkem768::PUBLICKEYBYTES>,
-                 sqlite::blobn<32>,
-                 std::optional<int64_t>>(
-                 "SELECT id, unique_id, processing, state, seqno, timestamp, device_type,"
-                 "       description, version, pubkey_mlkem768, pubkey_x25519, kicked_timestamp"
-                 " FROM devices WHERE processing IS NOT NULL ORDER BY unique_id")) {
-        auto& item = items.emplace_back();
-        item.row_id = row_id;
-        item.id = raw_id;
-        item.processing = static_cast<Processing>(processing_int);
-        item.info = fill_device_info(
-                raw_id,
-                state_int,
-                seqno,
-                timestamp,
-                std::move(dtype),
-                std::move(desc),
-                ver,
-                pk_ml,
-                pk_x);
-        if (kicked_ts)
-            item.info.kicked.emplace(std::chrono::seconds{*kicked_ts});
-        load_device_extras(c, row_id, item.info);
-    }
-
-    // Non-const so a handler can take the info: each item reaches exactly one branch below, and
-    // nothing after the switch reads `info` again.
-    for (auto& item : items) {
-        bool is_self = (item.id == self_id);
-        try {
-            switch (item.processing) {
-                case Processing::LinkRequest:
-                    if (auto& f = cb().device_link_request) {
-                        auto [lr_id, sas_seed] = c.prepared_get<
-                                int64_t,
-                                sqlite::blob_guts<std::array<std::byte, 16>>>(
-                                "SELECT id, sas_seed FROM device_link_requests WHERE device = ?",
-                                item.row_id);
-                        f(static_cast<int>(lr_id), std::move(item.info), sas_from_seed(sas_seed));
-                    }
-                    break;
-                case Processing::Registered:
-                    if (is_self) {
-                        if (auto& f = cb().device_self_added)
-                            f();
-                    } else {
-                        if (auto& f = cb().device_added) {
-                            auto reqid =
-                                    c.prepared_maybe_get<int64_t>(
-                                             "SELECT id FROM device_link_requests WHERE device = ?",
-                                             item.row_id)
-                                            .value_or(0LL);
-                            f(static_cast<int>(reqid), std::move(item.info));
-                        }
-                        // Clean up any link request row (whether callback was set or not)
-                        c.prepared_exec(
-                                "DELETE FROM device_link_requests WHERE device = ?", item.row_id);
-                    }
-                    break;
-                case Processing::Removed:
-                    if (is_self) {
-                        if (auto& f = cb().device_self_removed)
-                            f();
-                    } else {
-                        if (auto& f = cb().device_removed)
-                            f(std::move(item.info));
-                    }
-                    break;
-            }
-            c.prepared_exec("UPDATE devices SET processing = NULL WHERE id = ?", item.row_id);
-        } catch (const std::exception& e) {
-            log::error(
-                    cat,
-                    "Exception in {} device callback for device {}: {}",
-                    item.processing,
-                    oxenc::to_hex(item.id),
-                    e.what());
-            // Don't clear processing so the callback will be retried
-        }
-    }
-
-    // Prune stale link requests (older than 10 minutes)
-    c.prepared_exec(
-            "DELETE FROM device_link_requests WHERE received_at < ?",
-            epoch_seconds(clock_now_s() - LINK_REQUEST_MAX_AGE));
+    // Pushed from here rather than from whatever dirtied the group, so that what goes out is built
+    // on top of everything this fetch merged.  A local change made between fetches waits for the
+    // next one, which is what stops two devices answering the same update with duelling pushes.
+    push_device_group();
 }
 
 void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool /*is_final*/) {
@@ -1667,26 +3007,107 @@ static const std::string NEEDS_PUSH_SQL =
 Devices::NeedsPush Devices::needs_push() {
     auto c = conn();
     auto [dg, ap] = c.prepared_get<int, int>(NEEDS_PUSH_SQL, self_id, self_id);
-    return {.device_group = bool(dg), .account_pubkey = bool(ap)};
+    // Not for a group that has moved on without us: we cannot read what it holds now, and would
+    // push a snapshot of what it held before.
+    return {.device_group = bool(dg) && !_displaced(), .account_pubkey = bool(ap)};
 }
 
-void Devices::mark_device_group_pushed(int64_t seqno) {
+void Devices::mark_device_group_pushed(const DeviceGroupPush& push, std::string hash) {
     auto c = conn();
     SQLite::Transaction tx{c.sql};
-    c.prepared_exec("UPDATE devices SET pushed_seqno = ? WHERE unique_id = ?", seqno, self_id);
-    c.prepared_exec("UPDATE devices SET broadcast_needed = 0");
-    c.prepared_exec("UPDATE device_account_keys SET distributed = 1");
+    c.prepared_exec("UPDATE devices SET pushed_seqno = ? WHERE unique_id = ?", push.seqno, self_id);
+
+    // Our own group, seen as it is now in the swarm, without waiting for the next fetch to bring
+    // the message back -- in the meantime another group alongside it would read as our having been
+    // cut off.
+    auto now = clock_now_ms();
+    _record_group(
+            {.data = push.message,
+             .hash = hash,
+             .timestamp = now,
+             .expiry = now +
+                       std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
+
+    // Gone from the swarm, so stop naming them.  Scoped to what this message carried: one merged
+    // while the push was in flight was not deleted and is not superseded by it.
+    if (!push.obsolete.empty())
+        c.prepared_exec(
+                "DELETE FROM device_group_merged WHERE hash IN ({})"_format(
+                        sqlite::placeholders(push.obsolete.size())),
+                sqlite::bind_each{push.obsolete});
+
+    // Our own message is now the newest snapshot, and the next push supersedes it in turn -- by the
+    // same rule as everyone else's, since what makes a snapshot redundant is that its contents have
+    // been carried forward, not who wrote it.
+    if (!hash.empty())
+        c.prepared_exec(
+                "INSERT INTO device_group_merged (hash) VALUES (?) ON CONFLICT DO NOTHING", hash);
+
+    if (!push.broadcast.empty())
+        c.prepared_exec(
+                "UPDATE devices SET broadcast_needed = 0 WHERE unique_id IN ({})"_format(
+                        sqlite::placeholders(push.broadcast.size())),
+                sqlite::bind_each{push.broadcast});
+
+    if (!push.keys.empty())
+        c.prepared_exec(
+                "UPDATE device_account_keys SET distributed = 1 WHERE id IN ({})"_format(
+                        sqlite::placeholders(push.keys.size())),
+                sqlite::bind_each{push.keys});
+
     tx.commit();
+}
+
+void Devices::push_device_group() {
+    if (_push_in_flight)
+        return;
+    if (!needs_push().device_group)
+        return;
+
+    DeviceGroupPush push;
+    try {
+        push = build_device_group_message();
+    } catch (const std::exception& e) {
+        log::warning(cat, "Not pushing device group: {}", e.what());
+        return;
+    }
+
+    std::vector<SwarmStore> stores;
+    stores.push_back(
+            {.ns = config::Namespace::Devices,
+             .data = push.message,
+             .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
+
+    _push_in_flight = true;
+
+    // Copied out before the call rather than passed as `push.obsolete`: the callback below captures
+    // `push` by move, and the order the two arguments are evaluated in is unspecified, so reading
+    // it inline can hand over an empty list from an already-moved-from struct.
+    auto obsolete = push.obsolete;
+
+    core._swarm_push(
+            std::move(stores),
+            std::move(obsolete),
+            [this, alive = std::weak_ptr<int>{_alive}, push = std::move(push)](
+                    std::optional<std::vector<SwarmStoreResult>> results) {
+                if (alive.expired())
+                    return;
+                _push_in_flight = false;
+
+                if (!results || results->empty() || !results->front().stored) {
+                    log::warning(cat, "Device group push was not stored; leaving it owed");
+                    return;
+                }
+
+                mark_device_group_pushed(push, std::move(results->front().hash));
+            });
 }
 
 std::optional<std::chrono::system_clock::time_point> Devices::next_account_rotation() {
     auto c = conn();
     SQLite::Transaction tx{c.sql};
 
-    if (!c.prepared_maybe_get<int>(
-                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                self_id,
-                static_cast<int>(device::State::Registered)))
+    if (!_member())
         return std::nullopt;
 
     int64_t t_created = 0;
@@ -1737,7 +3158,23 @@ Devices::DeviceGroupPush Devices::build_device_group_message() {
     if (self == devs.end() || self->second.state != device::State::Registered)
         throw std::logic_error{"Cannot build device group message: this device is not registered"};
 
-    return {encrypt_device_data(devs), self->second.seqno};
+    DeviceGroupPush push;
+    push.seqno = self->second.seqno;
+
+    // Read in the same breath as the payload, so that what the confirm clears is what the message
+    // actually contains rather than whatever is owed by the time the swarm answers.
+    auto c = conn();
+    for (auto id : c.prepared_results<sqlite::blob_guts<std::array<std::byte, 32>>>(
+                 "SELECT unique_id FROM devices WHERE broadcast_needed"))
+        push.broadcast.push_back(id);
+    for (auto id :
+         c.prepared_results<int64_t>("SELECT id FROM device_account_keys WHERE NOT distributed"))
+        push.keys.push_back(id);
+    for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
+        push.obsolete.push_back(std::move(hash));
+
+    push.message = encrypt_device_data(devs);
+    return push;
 }
 
 std::vector<std::byte> Devices::build_account_pubkey_message() {

@@ -321,9 +321,10 @@ class Core {
     sqlite::Database db;
     friend class detail::CoreComponent;
 
-    // Friendship does not reach a component through its base, and Configs pushes to the swarm, so
-    // it needs `_swarm_request` by name.
+    // Friendship does not reach a component through its base, and both of these push to the
+    // swarm, so they need `_swarm_push` by name.
     friend class Configs;
+    friend class Devices;
 
     core::callbacks callbacks;
 
@@ -396,6 +397,26 @@ class Core {
             std::function<std::vector<std::byte>(const network::service_node&)> make_body,
             std::function<void(SwarmResponse)> on_done,
             std::optional<network::service_node> prefer = std::nullopt);
+
+    // Uploads messages to this account's swarm, and deletes ones they supersede.
+    //
+    // Sent as a `sequence` rather than a `batch`, with the delete last: a sequence stops at the
+    // first failure, so nothing is dropped before its replacement has been stored.  The deletes are
+    // one subrequest for all the hashes together, since they go to the same swarm.
+    //
+    // Either list may be empty: deletes alone are how a message is withdrawn from the swarm.
+    //
+    // `done` is given one result per store, positionally, or `nullopt` if the request never
+    // produced a usable answer -- no network, no swarm member reachable, or an unreadable response.
+    // It runs on Core's queue, as every `_swarm_request` reply does, and is not called at all if
+    // both lists are empty.
+    //
+    // The transport and nothing more: how often to push, whether a partial result counts, and what
+    // to record afterwards all differ between the things that push, and belong to them.
+    void _swarm_push(
+            std::vector<SwarmStore> stores,
+            std::vector<std::string> obsolete,
+            std::function<void(std::optional<std::vector<SwarmStoreResult>>)> done);
 
     struct SwarmOp;
     void _swarm_attempt(std::shared_ptr<SwarmOp> op);

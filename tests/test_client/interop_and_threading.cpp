@@ -72,6 +72,29 @@ TEST_CASE("Client: handlers arrive through the dispatcher", "[client][callbacks]
     CHECK(Recorder::messages(r.msg_added)[1].body == "direct");
 }
 
+TEST_CASE("Client: device events arrive through the dispatcher", "[client][callbacks][devices]") {
+    std::vector<std::function<void()>> queued;
+    DeviceEventsRecorder events;
+    callbacks cbs;
+    cbs.devices = &events;
+    TempClient c{std::move(cbs)};
+    c->set_dispatcher([&](std::function<void()> job) { queued.push_back(std::move(job)); });
+
+    core::device::Info info{};
+    info.description = "renamed";
+    c->core.devices.update_info(info, await);
+    sync(*c);
+
+    CHECK(events.replaced.empty());
+    REQUIRE(!queued.empty());
+    for (auto& job : queued)
+        job();
+
+    auto self = c->core.devices.device_info(await).first;
+    REQUIRE(events.replaced.size() == 1);
+    CHECK(events.replaced[0].at(self.id).description == "renamed");
+}
+
 TEST_CASE("Client: Core is usable directly through the Client", "[client][callbacks]") {
     TempClient c;
 

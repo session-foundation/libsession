@@ -20,6 +20,13 @@ class Core;
 // Defined in core.hpp, which includes this header; only referenced here as a parameter type.
 struct predefined_seed;
 
+/// How much randomness a generated account seed carries, which fixes the length of its recovery
+/// phrase.
+enum class SeedSize {
+    Bits128,  ///< 13 words: the upper half of the 32-byte seed is zero.
+    Bits256,  ///< 25 words.
+};
+
 // Core component contains one-off global values that don't make sense storing in a table, typically
 // because the value is highly special purpose or is only used in one single place.  If you ever
 // find yourself wanting to put multiple values in here under the same key, that is a sign that you
@@ -79,12 +86,14 @@ class Globals final : detail::CoreComponent {
     // Derives and caches the key material for `seed`, and stores the seed if `persist`.
     void _adopt_seed(const cleared_b32& seed, bool persist);
 
-    // Records that a freshly *generated* account owes a device group.  Not called for a restored
-    // account: that one may already have a group belonging to devices we have not met.
-    void _mark_new_account();
+    // Generates a seed of `size` and adopts it as a *new* account: one that starts its configs from
+    // nothing and owes a device group.  A restored account gets neither -- it may already have a
+    // group belonging to devices we have not met.  The group is only recorded as owed, because
+    // Devices initialises after this component and has no device id yet during init.
+    void _adopt_new_account(SeedSize size);
 
     // What both public forms of each dispatch onto the loop; each asserts it got there.
-    void _create_account();
+    void _create_account(SeedSize size);
     void _restore_account(const predefined_seed& seed);
 
   public:
@@ -104,21 +113,26 @@ class Globals final : detail::CoreComponent {
 
     /// Generates a fresh account and stores it.
     ///
+    /// The only way to get a *new* account, whatever size of seed it wants.  Adopting a seed
+    /// generated elsewhere through `restore_account` makes an account indistinguishable from a
+    /// restored one, which is never given a device group of its own -- correctly, for a restore,
+    /// but a new account then has no group and no device that could ever admit it to one.
+    ///
     /// Two forms and no third: this rewrites the cached key material Core's loop reads, so it
     /// happens on the loop either way.  Code already there uses the `await` form and pays nothing,
     /// since `call_get` runs the job inline when it is already the loop thread.
     ///
     /// @throws std::logic_error if this account already has an identity: adopting a second one
     /// would orphan every message and key already stored against the first.
-    void create_account(result_function<> cb);
-    void create_account(await_t);
+    void create_account(SeedSize size, result_function<> cb);
+    void create_account(SeedSize size, await_t);
 
     /// Adopts an existing account seed, as typed from a recovery phrase or transferred from
     /// another device, and stores it.
     ///
     /// This is also the first half of linking a new device to an existing account: a link request
     /// is encrypted to the account root key, so the seed must be adopted before
-    /// devices.build_link_request() can be called.
+    /// devices.request_link() can be called.
     ///
     /// The handler form takes the seed by value because it outlives the call: it is carried to the
     /// loop and zeroed with the job, rather than borrowed from a caller that has already returned.
