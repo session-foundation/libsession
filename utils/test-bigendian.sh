@@ -10,11 +10,6 @@
 # the [endian] known-answer test (hash::blake2b_pers integer args must be little-endian) on an actual
 # big-endian machine, where make_hashable takes its otherwise-never-compiled swap branch.
 #
-# session-router (the onion-routing layer) is endian-irrelevant to what we test and drags in the
-# heaviest deps, so we build with -DENABLE_NETWORKING_SROUTER=OFF. This branch has no ENABLE_NETWORKING
-# toggle (networking is always required), so oxen::quic still builds regardless — we satisfy it with
-# libngtcp2 + gnutls from apt (nghttp3 is not needed; libquic uses raw QUIC).
-#
 # Cost: everything runs under qemu-user emulation, so expect a slow build (oxen-libquic is the bulk of
 # it). Fine for an occasional manual audit; it is deliberately not in CI.
 #
@@ -43,7 +38,7 @@ docker run --platform=linux/s390x --rm -v "$PWD:/src" -w /src debian:sid bash -e
         libsqlite3-dev libzstd-dev \
         libngtcp2-dev libngtcp2-crypto-gnutls-dev libgnutls28-dev libevent-dev
     rm -rf build-bigendian   # fresh configure each run; the dir lives in the mounted tree and would otherwise reuse a stale CMake cache
-    cmake -B build-bigendian -G Ninja -DBUILD_STATIC_DEPS=OFF -DENABLE_NETWORKING_SROUTER=OFF -DCMAKE_BUILD_TYPE=Release
+    cmake -B build-bigendian -G Ninja -DBUILD_STATIC_DEPS=OFF -DCMAKE_BUILD_TYPE=Release
     cmake --build build-bigendian --target testAll
     # Run the endian-sensitive tags on this big-endian host. [endian] is the make_hashable little-endian
     # known-answer test; the hash / protocol / Pro / config tags also exercise serialization here. Catch2
