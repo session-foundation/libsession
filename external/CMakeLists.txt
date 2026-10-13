@@ -34,15 +34,13 @@ if(NOT TARGET oxenc::oxenc)
     sessiondep_or_submodule(liboxenc 1.6.0 session-router/external/oxen-libquic/external/oxen-encoding oxenc::oxenc)
 endif()
 
-if(ENABLE_NETWORKING_SROUTER)
-    set(SROUTER_FULL OFF CACHE BOOL "")
-    set(SROUTER_DAEMON OFF CACHE BOOL "")
-    set(SROUTER_NATIVE_BUILD OFF CACHE BOOL "")
-    set(SROUTER_JEMALLOC OFF CACHE BOOL "")
+set(SROUTER_FULL OFF CACHE BOOL "")
+set(SROUTER_DAEMON OFF CACHE BOOL "")
+set(SROUTER_NATIVE_BUILD OFF CACHE BOOL "")
+set(SROUTER_JEMALLOC OFF CACHE BOOL "")
 
-    add_static_subdirectory(session-router EXCLUDE_FROM_ALL)
-    libsession_static_bundle(session-router::core)
-endif()
+add_static_subdirectory(session-router EXCLUDE_FROM_ALL)
+libsession_static_bundle(session-router::core)
 
 # The network library always needs oxen::quic.  When session-router is built (SROUTER, above) it
 # provides oxen::quic transitively; otherwise pull in oxen-libquic on its own.
