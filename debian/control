@@ -8,7 +8,7 @@ Build-Depends:
     pkg-config,
     liboxenc-dev (>= 1.0.7),
     liboxen-logging-dev (>= 1.2.0),
-    liboxen-quic-dev (>= 1.8.0),
+    liboxen-quic-dev (>= 1.12.1),
     nlohmann-json3-dev,
     libunbound-dev,
     nettle-dev,
@@ -25,7 +25,7 @@ Architecture: any
 Depends: libsession-util1.9.4 (= ${binary:Version}), ${misc:Depends},
     liboxenc-dev (>= 1.5.0),
     liboxen-logging-dev (>= 1.2.0),
-    liboxen-quic-dev (>= 1.8.0),
+    liboxen-quic-dev (>= 1.12.1),
     nlohmann-json3-dev,
     libsodium-dev
 Description: Utility library for the Session messenger (headers)
