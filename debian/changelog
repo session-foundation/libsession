@@ -1,3 +1,11 @@
+libsession-util (1.9.4-2~ubuntu2604) resolute; urgency=medium
+
+  * Build-depend on libsimdutf-dev where the distro has simdutf >= 7
+  * Fix missing direct linking to libzstd
+  * bump required libquic to latest
+
+ -- Jason Rhinelander <jason@session.foundation>  Thu, 15 Oct 2026 13:26:58 -0300
+
 libsession-util (1.9.4-1~ubuntu2604) resolute; urgency=medium
 
   [ Morgan Pretty ]
