@@ -1,3 +1,9 @@
+libsession-util (1.9.4-2~deb14) forky; urgency=medium
+
+  * bump required libquic to latest
+
+ -- Jason Rhinelander <jason@session.foundation>  Thu, 15 Oct 2026 13:26:53 -0300
+
 libsession-util (1.9.4-1~deb14+1) forky; urgency=medium
 
   * Rebuild against current forky libraries
