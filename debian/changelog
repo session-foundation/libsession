@@ -1,3 +1,10 @@
+libsession-util (1.9.4-2~ubuntu2204) jammy; urgency=medium
+
+  * Fix missing direct linking to libzstd
+  * bump required libquic to latest
+
+ -- Jason Rhinelander <jason@session.foundation>  Thu, 15 Oct 2026 13:27:01 -0300
+
 libsession-util (1.9.4-1~ubuntu2204) jammy; urgency=medium
 
   [ Morgan Pretty ]
