@@ -127,7 +127,10 @@ TEST_CASE("Group Keys - C++ API", "[config][groups][keys][cpp]") {
 
     auto maybe_key_config = admin1.keys.pending_config();
     REQUIRE(maybe_key_config);
-    auto new_keys_config1 = *maybe_key_config;
+    // Copied out, as is each keys message below: what pending_config() and rekey() return views
+    // admin1's pending config, which admin1 loading the message clears -- before the other admins
+    // and the members have loaded it from the same view.
+    auto new_keys_config1 = session::to_vector(*maybe_key_config);
 
     auto [iseq1, new_info_config1, iobs1] = admin1.info.push();
     admin1.info.confirm_pushed(iseq1, {"fakehash1"});
@@ -177,7 +180,7 @@ TEST_CASE("Group Keys - C++ API", "[config][groups][keys][cpp]") {
 
     CHECK(admin1.members.needs_push());
 
-    auto new_keys_config2 = admin1.keys.rekey(admin1.info, admin1.members);
+    auto new_keys_config2 = session::to_vector(admin1.keys.rekey(admin1.info, admin1.members));
     CHECK(not new_keys_config2.empty());
 
     auto [iseq2, new_info_config2, iobs2] = admin1.info.push();
@@ -217,7 +220,7 @@ TEST_CASE("Group Keys - C++ API", "[config][groups][keys][cpp]") {
 
     CHECK(admin1.info.needs_push());
 
-    auto new_keys_config3 = admin1.keys.rekey(admin1.info, admin1.members);
+    auto new_keys_config3 = session::to_vector(admin1.keys.rekey(admin1.info, admin1.members));
     CHECK(not new_keys_config3.empty());
 
     auto [iseq3, new_info_config3, iobs3] = admin1.info.push();
@@ -265,7 +268,7 @@ TEST_CASE("Group Keys - C++ API", "[config][groups][keys][cpp]") {
     CHECK(admin1.members.needs_push());
 
     std::vector<std::byte> old_key = session::to_vector(admin1.keys.group_enc_key());
-    auto new_keys_config4 = admin1.keys.rekey(admin1.info, admin1.members);
+    auto new_keys_config4 = session::to_vector(admin1.keys.rekey(admin1.info, admin1.members));
     CHECK(not new_keys_config4.empty());
 
     CHECK(old_key != session::to_vector(admin1.keys.group_enc_key()));
@@ -293,7 +296,7 @@ TEST_CASE("Group Keys - C++ API", "[config][groups][keys][cpp]") {
     for (size_t i = 0; i < members.size(); i++) {
         auto& m = members[i];
         bool found_key = m.keys.load_key_message(
-                "keyhash4", new_keys_config2, get_timestamp_ms(), m.info, m.members);
+                "keyhash4", new_keys_config4, get_timestamp_ms(), m.info, m.members);
 
         CHECK(m.keys.active_hashes() ==
               std::unordered_set{{"keyhash2"s, "keyhash3"s, "keyhash4"s}});
@@ -648,9 +651,14 @@ TEST_CASE("Group Keys - C API", "[config][groups][keys][c]") {
 
     CHECK(config_needs_push(admin1.members));
 
-    const unsigned char* new_keys_config_1;
+    const unsigned char* pending_keys_config_1;
     size_t key_len1;
-    REQUIRE(groups_keys_pending_config(admin1.keys, &new_keys_config_1, &key_len1));
+    REQUIRE(groups_keys_pending_config(admin1.keys, &pending_keys_config_1, &key_len1));
+    // Copied out, as is the rekey below: the pointer is into admin1's pending config, which admin1
+    // loading the message clears -- before the other admins and the members have loaded it.
+    std::vector<unsigned char> keys_config_1{
+            pending_keys_config_1, pending_keys_config_1 + key_len1};
+    const unsigned char* new_keys_config_1 = keys_config_1.data();
 
     config_push_data* new_info_config1 = config_push(admin1.info);
     CHECK(new_info_config1->seqno == 1);
@@ -740,10 +748,13 @@ TEST_CASE("Group Keys - C API", "[config][groups][keys][c]") {
 
     CHECK(config_needs_push(admin1.members));
 
-    const unsigned char* new_keys_config_2;
+    const unsigned char* pending_keys_config_2;
     size_t key_len2;
     REQUIRE(groups_keys_rekey(
-            admin1.keys, admin1.info, admin1.members, &new_keys_config_2, &key_len2));
+            admin1.keys, admin1.info, admin1.members, &pending_keys_config_2, &key_len2));
+    std::vector<unsigned char> keys_config_2{
+            pending_keys_config_2, pending_keys_config_2 + key_len2};
+    const unsigned char* new_keys_config_2 = keys_config_2.data();
 
     config_push_data* new_info_config2 = config_push(admin1.info);
     CHECK(new_info_config2->seqno == 2);
