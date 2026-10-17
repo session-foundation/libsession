@@ -536,6 +536,8 @@ class Client {
     /// here, rather than on a timer: those are things that happen while we are not looking, and
     /// this is the moment we look.  It runs off the event loop and reports only to the log.
     ///
+    /// It also resumes the auto-downloads an earlier run left owed, once a network is attached.
+    ///
     /// Contents are encrypted under a key generated once and kept in the database, so they outlive
     /// the message or config entry whose key originally opened them — and so the files are not
     /// readable by whoever ends up with the disk.  That protection is only as good as the
@@ -636,7 +638,8 @@ class Client {
     /// somebody asking for one particular file, and are never refused for being large; whether
     /// what they fetch is kept is `requested_cache_max_size`'s question.
     ///
-    /// Persisted and device-local, for the same reasons as the cache limit.
+    /// Persisted and device-local, for the same reasons as the cache limit.  Lowering it also
+    /// forgets the queued auto-downloads it now refuses.
     ///
     /// @throws std::invalid_argument if `bytes` is negative.
     void set_auto_download_max_size(std::optional<int64_t> bytes, result_function<> cb);
@@ -800,6 +803,8 @@ class Client {
     void _set_expiry(
             const ConversationId& id, config::expiration_mode mode, std::chrono::seconds timer);
     void _set_auto_download(const ConversationId& id, AutoDownload mode);
+    void _download_existing_attachments(const ConversationId& id);
+    ExistingAttachmentCounts _existing_attachments(const ConversationId& id);
     void _set_nickname(const ConversationId& id, std::string_view nickname);
 
     // One conversation-row column, updated where it differs and re-derived into the config if it
@@ -1124,15 +1129,28 @@ class Client {
         size_t index;
     };
 
-    // Core's loop's.  Newest at the front, and taken from there.
+    // Core's loop's.  Newest at the front, and taken from there.  What it holds is also flagged
+    // `auto_pending` in the database, which is what a restart rebuilds it from.
     std::deque<PendingAutoDownload> _auto_pending;
     size_t _auto_running = 0;
     bool _auto_pumping = false;
 
+    // Replaces the queue with every attachment still flagged, newest sent first.  Run when the
+    // cache directory is set and when a network is attached, and does nothing without the first.
+    void _reload_auto_downloads();
+
+    // Unflags what the setting of its conversation, under the current size limit, no longer takes:
+    // in one conversation, or in all of them for nullopt.
+    void _drop_unwanted_auto(std::optional<int64_t> convo);
+
+    // Whether a queued entry is still owed under the conversation's current setting and size
+    // limit, dropping its flag when the answer has become no.
+    bool _auto_still_owed(const PendingAutoDownload& entry);
+
     // Starts queued auto-downloads until as many are running as `auto_download_concurrency`
     // allows.  Does nothing when called from within itself, which an auto-download ending as soon
-    // as it starts -- a cache hit, or no network -- does: the loop already running picks up the
-    // freed slot, where recursing would go one level deeper for every entry in the queue.
+    // as it starts -- a cache hit, say -- does: the loop already running picks up the freed slot,
+    // where recursing would go one level deeper for every entry in the queue.
     void _pump_auto_downloads();
 
     // Whether a file somebody asked for, of the size its sender declared, is kept once fetched: it

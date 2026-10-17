@@ -224,6 +224,9 @@ void Core::set_network(std::unique_ptr<network::Network> network) {
     }
 
     _update_polling();
+
+    if (_network && callbacks.network_attached)
+        callbacks.network_attached();
 }
 
 void Core::_remove_timer(quic::TimerID& timer) {

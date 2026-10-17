@@ -6,6 +6,7 @@ endif()
 
 set(LIB_SESSION_UTESTS_SOURCES
     test_client/attachments.cpp
+    test_client/auto_download.cpp
     test_client/configs.cpp
     test_client/conversation_api.cpp
     test_client/download_cache.cpp

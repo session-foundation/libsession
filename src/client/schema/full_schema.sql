@@ -470,6 +470,10 @@ CREATE TABLE message_attachments (
     -- and this file has to describe the same column order a migrated database ends up with.
     thumbhash BLOB,
 
+    -- 1 while an auto-download still owes this file.  Cleared once it is cached or found unavailable,
+    -- so eviction never makes it owed again, or once the conversation's setting stops taking it.
+    auto_pending INTEGER,
+
     PRIMARY KEY (message, idx)
 ) STRICT;
 
@@ -492,3 +496,7 @@ CREATE INDEX message_attachments_url ON message_attachments(url) WHERE url IS NO
 -- Partial for the same reason as above: most rows are not cached at any given moment, and those
 -- are never the subject of this question.
 CREATE INDEX message_attachments_cached ON message_attachments(cached) WHERE cached IS NOT NULL;
+
+-- What a restart queues again, and what a setting change checks: the few rows still owed.
+CREATE INDEX message_attachments_auto_pending ON message_attachments(message)
+    WHERE auto_pending IS NOT NULL;

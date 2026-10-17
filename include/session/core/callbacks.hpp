@@ -215,6 +215,10 @@ struct callbacks {
     /// - changed -- the namespaces whose configs the merge altered.  Valid only for the duration of
     ///   the call.
     std::function<void(std::span<const config::Namespace> changed)> configs_changed;
+
+    /// Callback fired once `set_network` (or `make_network`) has attached a network, on the
+    /// caller's thread, so that work which needs one can start.
+    std::function<void()> network_attached;
 };
 
 }  // namespace session::core

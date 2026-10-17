@@ -72,6 +72,22 @@ enum class AutoDownload : int {
     all = 2,                ///< Every attachment.
 };
 
+/// Files already in a conversation that `Conversation::download_existing_attachments` would
+/// download.
+struct ExistingAttachmentCount {
+    /// Distinct files: one carried by several messages counts once.
+    size_t count = 0;
+    /// The sizes their senders declared, summed; one declaring no size adds nothing.
+    int64_t bytes = 0;
+};
+
+/// `ExistingAttachmentCount` for each mode that fetches anything, so a prompt offering both can
+/// show either without asking again.
+struct ExistingAttachmentCounts {
+    ExistingAttachmentCount all;
+    ExistingAttachmentCount image_attachments;
+};
+
 /// How an attachment transfer is going.
 ///
 /// Reported two ways, for the two kinds of transfer: handed directly to whoever called
