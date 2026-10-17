@@ -227,6 +227,48 @@ inline size_t fail_downloads(MockNetwork& net, int16_t status = 404) {
     return pending.size();
 }
 
+/// Keeps everything a Core reports through DeviceEvents, in order.  Reports arrive on Core's loop,
+/// so a test reads these after draining it.  `on_added` runs inside the report itself, for a test
+/// that needs to look at the state it is reported in.
+struct DeviceEventsRecorder : core::DeviceEvents {
+    std::function<void(const core::device::LinkRequest&)> on_added;
+
+    std::vector<core::device::LinkRequest> added;
+    std::vector<std::pair<int, core::device::LinkRequestEnd>> ended;
+    std::vector<core::device::map> replaced;
+    std::vector<core::device::Membership> membership;
+    std::vector<core::device::GroupId> appeared;
+    std::vector<core::device::Info> members;
+    std::vector<std::string> order;  // which of them, as they arrived
+
+    void link_request_added(core::device::LinkRequest request) override {
+        if (on_added)
+            on_added(request);
+        order.push_back("added");
+        added.push_back(std::move(request));
+    }
+    void link_request_ended(int reqid, core::device::LinkRequestEnd why) override {
+        order.push_back("ended");
+        ended.emplace_back(reqid, why);
+    }
+    void devices_replaced(core::device::map devices) override {
+        order.push_back("replaced");
+        replaced.push_back(std::move(devices));
+    }
+    void membership_changed(core::device::Membership m) override {
+        order.push_back("membership");
+        membership.push_back(m);
+    }
+    void device_membership_changed(core::device::Info device) override {
+        order.push_back("member");
+        members.push_back(std::move(device));
+    }
+    void group_appeared(core::device::GroupId group) override {
+        order.push_back("appeared");
+        appeared.push_back(group);
+    }
+};
+
 /// The store requests a MockNetwork has captured, in the order they were sent.  Filtered rather
 /// than taken wholesale because a Core with a network attached also fetches PFS keys, so a test
 /// that asked for a send finds retrieves in the list it never asked for.
@@ -236,6 +278,36 @@ inline std::vector<MockNetwork::SentRequest*> stores(MockNetwork& net) {
         if (r.request.endpoint == "store")
             found.push_back(&r);
     return found;
+}
+
+/// The swarm polls a MockNetwork has captured.  Filtered rather than taken wholesale for the same
+/// reason as `stores()`: a poll is a "batch" of retrieves and a push is a "sequence", so a test
+/// that counts requests to check how many times it polled also counts whatever the poll went on to
+/// send.
+inline std::vector<MockNetwork::SentRequest*> polls(MockNetwork& net) {
+    std::vector<MockNetwork::SentRequest*> found;
+    for (auto& r : net.sent_requests)
+        if (r.request.endpoint == "batch")
+            found.push_back(&r);
+    return found;
+}
+
+/// The swarm pushes a MockNetwork has captured.  A push is a "sequence" of store subrequests
+/// followed by at most one delete, so its payload is inside the body rather than in the request
+/// itself the way a bare "store" endpoint's is.
+inline std::vector<MockNetwork::SentRequest*> pushes(MockNetwork& net) {
+    std::vector<MockNetwork::SentRequest*> found;
+    for (auto& r : net.sent_requests)
+        if (r.request.endpoint == "sequence")
+            found.push_back(&r);
+    return found;
+}
+
+/// The subrequests a push carries, in the order they will be applied.
+inline nlohmann::json push_requests(const MockNetwork::SentRequest& r) {
+    if (!r.request.body)
+        throw std::logic_error{"push request has no body"};
+    return parse_json(*r.request.body)["requests"];
 }
 
 /// The JSON a store request carries, which is where the namespace and the payload are.
@@ -524,9 +596,8 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
                 epoch_ms(clock_now_ms()));
     }
 
-    // Device group payload encryption/decryption.  These are private to Devices and currently have
-    // no production caller (nothing yet builds or pushes a device group message), so tests are the
-    // only thing exercising them.
+    // Device group payload encryption/decryption, which are private to Devices, for tests that need
+    // to build a group message with contents of their choosing.
     static std::vector<std::byte> encrypt_device_data(
             core::Devices& d, const core::device::map& devices) {
         return d.encrypt_device_data(devices);
@@ -536,9 +607,100 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         return d.decrypt_device_data(data);
     }
 
-    // Feeds an encrypted device group message through the receive path, as a poll would.
-    static void receive_device_group_message(core::Devices& d, std::span<const std::byte> data) {
-        d.receive_device_group_message(data);
+    // Feeds an encrypted device group message through the receive path, as a poll would.  The hash
+    // defaults to empty, which is a message with no swarm identity: merged, but never recorded as
+    // something a push supersedes.
+    static void receive_device_group_message(
+            core::Devices& d, std::span<const std::byte> data, const std::string& hash = "") {
+        d.receive_device_group_message(data, hash, clock_now_ms());
+    }
+
+    // Gives `core` another device's id, as a copy of that device's data would have it -- though
+    // not its keys, which is what a copy that has since rotated them looks like.
+    static void set_device_id(core::Core& core, std::span<const std::byte, 32> id) {
+        on_loop(core, [&] {
+            std::ranges::copy(id, core.devices.self_id.begin());
+            return 0;
+        });
+    }
+
+    // A link request as `request_link` builds it, asking to join `member`'s group, without the
+    // upload, for a test that hands it to another device itself.  Leaves no deadline behind, so the
+    // request never lapses on its own.
+    static auto build_link_request(core::Core& core, core::Core& member) {
+        auto link_x25519 = member.devices.active_account_keys().front().x25519_pub;
+        auto group = *group_id(member);
+        return on_loop(core, [&] { return core.devices._build_link_request(group, link_x25519); });
+    }
+
+    // A link request from `core` to `member`'s group carrying arbitrary contents, signed or not.
+    static std::vector<std::byte> encrypt_link_request(
+            core::Core& core, core::Core& member, std::span<const std::byte> plaintext) {
+        auto link_x25519 = member.devices.active_account_keys().front().x25519_pub;
+        return on_loop(
+                core, [&] { return core.devices._encrypt_link_request(plaintext, link_x25519); });
+    }
+
+    // Gives `core` a group of its own, as a new account gets one -- a second group, on an account
+    // that already has a first.
+    static void start_group(core::Core& core) {
+        on_loop(core, [&] {
+            core.devices._mark_group_owed();
+            core.devices.establish_group();
+        });
+    }
+
+    static std::optional<core::device::GroupId> group_id(core::Core& core) {
+        return on_loop(core, [&] { return core.devices._group_id(); });
+    }
+    static void set_group_id(core::Core& core, const core::device::GroupId& id) {
+        on_loop(core, [&] { core.devices._set_group_id(id); });
+    }
+    // What `device_groups` holds for a group: its link key and when it expires.
+    static std::optional<std::pair<std::array<std::byte, 32>, int64_t>> seen_group(
+            core::Core& core, const core::device::GroupId& group) {
+        return on_loop(core, [&]() -> std::optional<std::pair<std::array<std::byte, 32>, int64_t>> {
+            auto row = core.devices.conn()
+                               .prepared_maybe_get<
+                                       sqlite::blob_guts<std::array<std::byte, 32>>,
+                                       int64_t>(
+                                       "SELECT link_x25519, expires_at FROM device_groups"
+                                       " WHERE group_id = ?",
+                                       std::span<const std::byte>{group.value});
+            if (!row)
+                return std::nullopt;
+            auto& [key, expires] = *row;
+            return std::pair{std::array<std::byte, 32>{key}, expires};
+        });
+    }
+
+    static std::optional<core::device::GroupId> group_of(
+            core::Core& core, std::span<const std::byte> message) {
+        return on_loop(core, [&] { return core.devices._group_of(message); });
+    }
+
+    // Delivers one namespace-21 message as a completed fetch would: through the same dispatch, with
+    // `is_final` set so the deferred work -- the prompts, and the ids they carry -- happens too,
+    // and with the expiry the swarm assigned it, which a link request takes as its deadline.
+    static void deliver_device_message(
+            core::Core& core,
+            std::span<const std::byte> data,
+            sys_ms expiry,
+            std::string hash = "hash",
+            bool is_final = true) {
+        on_loop(core, [&] {
+            core::SwarmMessage m{
+                    .data = data,
+                    .hash = std::move(hash),
+                    .timestamp = clock_now_ms(),
+                    .expiry = expiry};
+            core.devices.parse_device_messages(std::span{&m, 1}, is_final);
+        });
+    }
+
+    // A namespace-21 fetch completing with nothing new, which is still a completed fetch.
+    static void finish_fetch(core::Core& core) {
+        on_loop(core, [&] { core.devices.parse_device_messages({}, true); });
     }
 
     // Returns the raw 32-byte seed for the account key identified by the given x25519 public key.

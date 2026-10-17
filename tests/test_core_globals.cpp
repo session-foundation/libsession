@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <session/core.hpp>
 
 #include "test_helper.hpp"
@@ -90,17 +91,31 @@ TEST_CASE("Globals: defer_account leaves the account unresolved", "[core][global
         {
             Core core{path, defer_account{}};
             REQUIRE_FALSE(core.globals.have_account());
-            core.globals.create_account(await);
+            core.globals.create_account(SeedSize::Bits128, await);
             CHECK(core.globals.have_account());
             id = core.globals.session_id_hex();
             CHECK(id.starts_with("05"));
             // Adopting a second identity would orphan everything stored against the first.
-            CHECK_THROWS_AS(core.globals.create_account(await), std::logic_error);
+            CHECK_THROWS_AS(
+                    core.globals.create_account(SeedSize::Bits128, await), std::logic_error);
         }
         // Reopening finds the stored seed, so defer_account is a no-op on an existing account.
         Core core{path, defer_account{}};
         CHECK(core.globals.have_account());
         CHECK(core.globals.session_id_hex() == id);
+    }
+
+    SECTION("create_account makes a new account at either seed size") {
+        auto [size, words] = GENERATE(
+                std::pair{SeedSize::Bits128, size_t{13}}, std::pair{SeedSize::Bits256, size_t{25}});
+        Core core{path, defer_account{}};
+        core.globals.create_account(size, await);
+
+        CHECK(core.globals.seed_mnemonic().size() == words);
+
+        // New rather than restored, whatever its size: a restored account is never given a group,
+        // so a new one treated as restored would have no device that could ever admit it to one.
+        CHECK(core.devices.device_info(await).second);
     }
 
     SECTION("restore_account adopts a given seed") {

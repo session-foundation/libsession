@@ -7,10 +7,13 @@
 #include <session/client/conversation_id.hpp>
 #include <session/client/handler.hpp>
 #include <session/client/message.hpp>
+#include <session/core/callbacks.hpp>
 #include <string>
 #include <vector>
 
 namespace session::client {
+
+using core::DeviceEvents;
 
 /// Notifications of everything the conversation layer changes, so that an application never has to
 /// ask.  A caller sets the handlers it cares about and leaves the rest empty; an unset handler is
@@ -133,6 +136,14 @@ struct callbacks {
             int64_t total,
             std::optional<Expected<void>> result)>
             display_picture_progress;
+
+    /// Link requests from other devices, and the account's devices themselves; see DeviceEvents.
+    /// Delivered through the dispatcher like everything above.  Null for an application with no
+    /// device linking of its own to show.
+    ///
+    /// Held by pointer, so it must outlive the Client, and any delivery the dispatcher still has
+    /// queued once the Client is gone.
+    DeviceEvents* devices = nullptr;
 };
 
 }  // namespace session::client

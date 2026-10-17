@@ -70,7 +70,10 @@ namespace session::client {
 
 using namespace std::literals;
 
-class Client {
+// Privately a DeviceEvents so that what Core reports can be relayed through the dispatcher.  A base
+// rather than a member because Core holds it by pointer: a base is constructed before `core` and
+// destroyed after it, which a member only is by virtue of where it is declared.
+class Client : private core::DeviceEvents {
     friend class session::TestHelper;  // for unit tests
 
     // A conversation *is* part of Client's interface, split off rather than added to: what these
@@ -1467,6 +1470,13 @@ class Client {
 
     core::callbacks _core_callbacks();
     void _init();
+
+    void link_request_added(core::device::LinkRequest request) override;
+    void link_request_ended(int reqid, core::device::LinkRequestEnd why) override;
+    void devices_replaced(core::device::map devices) override;
+    void device_membership_changed(core::device::Info device) override;
+    void membership_changed(core::device::Membership membership) override;
+    void group_appeared(core::device::GroupId group) override;
 
     void _on_message_received(core::ReceivedMessage&& msg);
     void _on_send_status(

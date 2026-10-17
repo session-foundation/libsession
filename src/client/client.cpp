@@ -374,8 +374,8 @@ static std::optional<int64_t> find_conversation(sqlite::Connection& c, const Con
 
 core::callbacks Client::_core_callbacks() {
     // Capturing `this` here is safe despite running in Core's member-init list: every callback we
-    // install can only fire from receive_messages(), send_dm(), or a config merge, none of which
-    // Core calls during its own construction.
+    // install can only fire from receive_messages(), send_dm(), a config merge, or a change to the
+    // device group, none of which Core makes during its own construction.
     //
     // These are Client's own wiring, and an application cannot supply any of its own: what it is
     // promised is `client::callbacks`, which is reported through the dispatcher and carries whole
@@ -399,7 +399,42 @@ core::callbacks Client::_core_callbacks() {
         _on_configs_changed(changed);
     };
 
+    // Only when there is somewhere to relay to, since Core skips working out what changed for an
+    // application that has not asked.
+    if (_cbs->devices)
+        cb.devices = this;
+
     return cb;
+}
+
+void Client::link_request_added(core::device::LinkRequest request) {
+    _emit([request = std::move(request)](const callbacks& cbs) mutable {
+        cbs.devices->link_request_added(std::move(request));
+    });
+}
+
+void Client::link_request_ended(int reqid, core::device::LinkRequestEnd why) {
+    _emit([reqid, why](const callbacks& cbs) { cbs.devices->link_request_ended(reqid, why); });
+}
+
+void Client::devices_replaced(core::device::map devices) {
+    _emit([devices = std::move(devices)](const callbacks& cbs) mutable {
+        cbs.devices->devices_replaced(std::move(devices));
+    });
+}
+
+void Client::device_membership_changed(core::device::Info device) {
+    _emit([device = std::move(device)](const callbacks& cbs) mutable {
+        cbs.devices->device_membership_changed(std::move(device));
+    });
+}
+
+void Client::membership_changed(core::device::Membership membership) {
+    _emit([membership](const callbacks& cbs) { cbs.devices->membership_changed(membership); });
+}
+
+void Client::group_appeared(core::device::GroupId group) {
+    _emit([group](const callbacks& cbs) { cbs.devices->group_appeared(group); });
 }
 
 void Client::_init() {

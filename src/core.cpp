@@ -2039,6 +2039,110 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
     }
 }
 
+void Core::_swarm_push(
+        std::vector<SwarmStore> stores,
+        std::vector<std::string> obsolete,
+        std::function<void(std::optional<std::vector<SwarmStoreResult>>)> done) {
+
+    if (stores.empty() && obsolete.empty())
+        return;
+
+    auto now_ms = epoch_ms(clock_now_ms());
+    auto pubkey_hex = globals.session_id_hex();
+    auto ed25519_hex = globals.pubkey_ed25519().hex();
+
+    auto sign = [this](std::string_view value) {
+        b64 sig;
+        auto seed = globals.account_seed();
+        ed25519::sign(sig, seed.ed25519_secret(), std::as_bytes(std::span{value}));
+        return "{:b}"_format(sig);
+    };
+
+    auto requests = nlohmann::json::array();
+    for (const auto& s : stores) {
+        auto ns_val = static_cast<int16_t>(s.ns);
+        nlohmann::json params = {
+                {"pubkey", pubkey_hex},
+                {"namespace", ns_val},
+                {"data", "{:b}"_format(s.data)},
+                {"timestamp", now_ms},
+                {"ttl", s.ttl.count()},
+                {"pubkey_ed25519", ed25519_hex},
+                {"sig_timestamp", now_ms},
+                {"signature", sign(ns_signature_value("store", ns_val, now_ms))},
+        };
+        requests.push_back({{"method", "store"}, {"params", std::move(params)}});
+    }
+
+    // Last, and one subrequest for all of them: they go to the same pubkey's swarm, and putting the
+    // delete after every store is what stops a message being dropped before its replacement exists.
+    if (!obsolete.empty()) {
+        nlohmann::json params = {
+                {"pubkey", pubkey_hex},
+                {"pubkey_ed25519", ed25519_hex},
+                {"messages", obsolete},
+                // Signed over the hashes in the order they are sent, so the two must not be
+                // reordered independently.
+                {"signature", sign(delete_signature_value(obsolete))},
+        };
+        requests.push_back({{"method", "delete"}, {"params", std::move(params)}});
+    }
+
+    auto body = to_vector<std::byte>(nlohmann::json{{"requests", std::move(requests)}}.dump());
+
+    log::debug(
+            cat,
+            "Pushing {} message(s) to the swarm, obsoleting {}",
+            stores.size(),
+            obsolete.size());
+
+    // Unlike a poll's, this body does not depend on which member it goes to.
+    _swarm_request(
+            globals.pubkey_x25519(),
+            "sequence",
+            [body = std::move(body)](const network::service_node&) { return body; },
+            [count = stores.size(), done = std::move(done)](SwarmResponse res) {
+                if (!done)
+                    return;
+
+                if (!res.ok() || !res.body) {
+                    log::warning(
+                            cat,
+                            "Swarm push failed ({}): {}",
+                            res.timeout ? "timed out" : "status {}"_format(res.status_code),
+                            res.body.value_or("no response body"));
+                    return done(std::nullopt);
+                }
+
+                std::vector<SwarmStoreResult> out(count);
+                try {
+                    auto json = nlohmann::json::parse(*res.body);
+                    auto results = json.find("results");
+                    if (results == json.end() || !results->is_array()) {
+                        log::warning(cat, "Swarm push response carried no results");
+                        return done(std::nullopt);
+                    }
+
+                    for (size_t i = 0; i < count && i < results->size(); i++) {
+                        const auto& r = (*results)[i];
+                        auto code = r.find("code");
+                        auto b = r.find("body");
+                        if (code == r.end() || code->get<int>() != 200 || b == r.end())
+                            continue;
+                        auto h = b->find("hash");
+                        if (h == b->end() || !h->is_string())
+                            continue;
+                        out[i] = {.stored = true, .hash = h->get<std::string>()};
+                    }
+                } catch (const std::exception& e) {
+                    log::warning(cat, "Could not read swarm push response: {}", e.what());
+                    return done(std::nullopt);
+                }
+
+                done(std::move(out));
+            });
+}
+
 void Core::receive_messages(
         std::span<const SwarmMessage> messages, config::Namespace ns, bool is_final) {
     using config::Namespace;

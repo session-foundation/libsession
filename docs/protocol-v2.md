@@ -169,7 +169,12 @@ server reads to enforce a device limit (see "Extension - Pro subscriptions" belo
 
 A removed device is written into the devices dict as a tombstone: its ID maps to the unix timestamp
 of the removal, where a live device maps to a sub-dict.  The type of the value distinguishes the
-two.
+two, so a device can never be both.
+
+The sign of the timestamp says how the device went: positive for a device removed by another, and
+negative (the timestamp negated) for one that left of its own accord (see "Leaving a group to join
+another").  Zero is invalid.  Where two tombstones for the same device differ, a removal beats a
+departure, and between two of the same kind the later timestamp wins.
 
 A device holding an existing record for the removed device marks that record removed and retains the
 rest of its fields; a device with no record for it ignores the entry.  Since a record absent from a
@@ -177,7 +182,10 @@ message is left unchanged rather than removed, a removal must be stated in this 
 all.
 
 A tombstone and a live record for one device ID cannot coexist, so a device that is removed and
-later rejoins the group must generate a new device ID.
+later rejoins the group must generate a new device ID, with new device keys to go with it.  It also
+leaves behind the old group's account keys, as any device leaving a group does (see "Leaving a group
+to join another"); its message history, the account seed and configs are all still valid, and are
+kept.  It then asks to join as any device outside a group does.
 
 The removed device is not among the message recipients and cannot decrypt the payload; see
 "Announcing removals" below.
@@ -213,8 +221,10 @@ as:
     {
         "A": "pubkey...",   // ephemeral X25519 pubkey
         "ciphertexts": "[ct123...][ct456...][ct789...][ctabc...]"],
+        "group": "...encrypted 8-byte group identifier...",
         "keys": "[abc123...][def456...][789aaa...][888bbb...]],
         "kicked": "[k123...][k456...][k789...][kabc...]",
+        "link_x25519": "...the group's current account X25519 pubkey...",
         "payload": "...encrypted payload...",
         "signature": "...above data signed with long-term account key...",
     }
@@ -224,8 +234,16 @@ where:
 - `payload` contains the encrypted payload the device needs, using xchacha20-poly1305 encryption
   with the random base key, `key_base`.
 - `A` is a single ephemeral X25519 key used for symmetric encryption keys
+- `group` identifies which of the account's device groups the message belongs to; see "Group
+  identifier" below.
 - `kicked` announces removals to devices that can no longer read the payload; see "Announcing
   removals" below.
+- `link_x25519` is the X25519 half of the group's current account key (see "Account keys"), to which
+  a device asking to join the group encrypts its link request (see "Initiating a device link").  Only
+  members hold the matching secret, so only they can read requests.  The ML-KEM half is not
+  published here: it would add over a kilobyte to every group message, to protect a short-lived
+  request whose contents -- a device's public keys and description -- are of little use to anyone
+  recording it for a future quantum attack.
 - `ciphertexts` is a packed binary value of N×4×1088 bytes where each 1088 byte segment contains an
   ML-KEM768 ciphertext for one of the accounts devices.  When the number of devices is not a
   multiple of 4, the unused slots are filled with random data.
@@ -338,7 +356,9 @@ A removed device computes this value for its own device ID to detect its removal
 the group take removals from the tombstones in the payload and have no use for this field.  Without
 the root seed the entries are indistinguishable from random.
 
-The list is built from the tombstones the payload carries, recomputed for each message: the entries
+The list is built from the removals among the tombstones the payload carries -- never from
+departures, since a device that left already knows, and would otherwise read its own departure as a
+removal -- recomputed for each message: the entries
 cannot be recovered from a previous message, since a device ID cannot be derived from an entry and
 the value depends on that message's `A`.
 
@@ -352,22 +372,97 @@ The list is padded to a multiple of 4 entries with random values and shuffled, a
 An adversary who obtains the root seed can compute these values, and so recover an account's removal
 history from stored messages.
 
+### Displaced devices
+
+A device can also lose its place without being removed: another device comes to hold its record,
+under its device ID, with keys it does not have.  That happens when a restored copy of it is
+admitted as a replacement (see "Device link request handling"), and when someone holding a copy of
+its data -- device keys and all -- rotates those keys and pushes the record.  The second is an
+attack, and the design deliberately settles it in favour of whichever copy rotates first: the other
+can read nothing after that.  If the real device rotates first, the copy is shut out, which is the
+point; if the copy does, the real device must notice and say so.
+
+It can: while it is in the group, every message from the group is encrypted to it, so one carrying
+its group's identifier that it cannot decrypt, and that does not name it in `kicked`, means the
+group has moved on without it.  Such a message counts only if its swarm timestamp is more than 5
+minutes past the newest message from the group the device *could* read.  Just after a device joins,
+a member may push a snapshot it built before fetching the admission, which leaves the new device
+out for no reason but timing, and the margin also absorbs the difference between the two devices'
+clocks.  It costs nothing in detection: every later message is unreadable too, and account key
+rotation guarantees one.
+
+A displaced device alerts its user, as a possible attack, and stops acting for the group: it pushes
+nothing, admits and removes nobody, and does not leave the group to join another, since a departure
+under its ID would now apply to the device holding it.  It can come back only under a new device
+ID, as a removed device does.  Reading a message from the group again, as new as the one that
+displaced it, undoes this.
+
+A holder of the account seed can forge a message carrying the group's identifier, and so cause this
+alert, as it can forge a `kicked` entry to cause a removal alert.  Neither gives it anything: the
+device stops acting for its group, rather than starting to trust anything new.
+
+### Group identifier
+
+Each device group has an identifier, generated when the group is created and never changed
+afterwards: rotating keys, and adding or removing devices, all leave it alone.  It is what tells one
+group's messages from another's when an account has more than one (see "Multiple groups" below),
+it gives a user a way to check by eye that two devices are in the same group, and it says roughly
+when a group was created, so that one a device has not seen before can be shown with its age.
+
+The identifier is 8 bytes: the creation time in minutes since the unix epoch as a little-endian
+32-bit integer, followed by 4 random bytes.  Devices compare all 8 bytes, so two groups created in
+the same minute are told apart by the random half.
+
+It is shown as a SAS by the same mechanism as a link request's (see "Handshake short authentication
+string"), from a 16-byte seed hashed from the identifier rather than from the identifier itself, so
+that groups created close together do not look alike:
+
+    seed = BLAKE2b_16(identifier, pers="SessionDvGrp_SAS")
+
+from which the 21 emoji are taken exactly as for a link request.  The suggested basic display is the
+first 4 of them together with the creation time; the full 21 are there for an extended view.  Two
+groups sharing a displayed SAS affects only what a user sees, never what a device decides, since
+devices compare identifiers rather than emoji.
+
+Four emoji rather than the seven of a link SAS is deliberate, so that the two are not mistaken for
+each other at a glance; the creation time shown beside them does most of the work of telling an
+account's groups apart.  Nor is the seed memory-hard as a link SAS's is: anyone holding the account
+seed can copy a group's identifier outright, so there is nothing for Argon2 to protect.  The
+identifier tells groups apart for honest devices and for the user's eye; it does not authenticate
+one, and its creation time is whatever the creating device's clock said.
+
+It is carried in the outer structure, encrypted so that any device holding the account seed can
+read it -- including one not yet in any group -- while to anyone else it differs from message to
+message:
+
+    k     = BLAKE2b_32(seed, pers="SessionDvGrpID_K")
+    nonce = BLAKE2b_24(A, pers="SessionDvGrpID_N")
+    group = XChaCha20(identifier, key=k, nonce=nonce)
+
+where `seed` is the account root seed and `A` is the message's ephemeral X25519 pubkey.  There is no
+MAC: the outer structure is signed with the account key, so the value can only have been written by
+a holder of the seed, who could equally have written any other.
+
 ## New device setup
 
-When setting up a new Session instance on a device (either after wiping and restoring, or on a new
-device) the device must check for an existing linked device config in namespace 21.
+A device that generates a brand new account creates its device group at once, with only itself as a
+member.  (The stored data in this single device case is not particularly useful, but is needed to
+allow other devices to link.)
 
-If no linked device config messages exist then this is a brand new account (or an account that
-has not been used in some time), and so the device can simply construct a linked device config
-with only itself as a member.  (The actual stored data in this single device case is not
-particularly useful, but is needed to allow other linked devices to properly link).
+Any other device outside a group -- one that has restored an account, or been removed from its
+group -- checks namespace 21 for device group messages, and finds one of:
 
-If a linked device config exists, and its device it is able to successfully decrypt one of the
-device keys, then it is *already* part of the linked device group and there is nothing extra needed
-beyond uploading the new linked device config.
+- **None at all.**  Either the account has never had a group, or it had one and every device was
+  offline for longer than the group message TTL, so that it expired.  The two cannot be told apart
+  from the swarm, and creating a group in the second case forks the account, so the device does not
+  create one on its own.  The user decides between starting a new group and bringing an existing
+  device online to link this one.
+- **One or more groups it cannot read.**  It may ask to join one, choosing by identifier when there
+  is more than one, or start a new group alongside them (see "Multiple groups").
 
-Otherwise, the new device must request to join the linked device group, and that is what the rest of
-this section details.
+A device that can decrypt a group message is already in that group, and needs nothing further.
+
+The rest of this section describes asking to join.
 
 ### Initiating a device link
 
@@ -388,12 +483,59 @@ message namespace 21.  This message is constructed as follows:
         }
     }
 
-That is, it is simply the information to add to the linked device list plus some metadata.  This
-request is encrypted using the session account root key, and uploaded to namespace 21 with a TTL of
-10 minutes.  (Since device linking requires a user to have access to both devices at the same time,
-a longer TTL accomplishes nothing).  Note that the above is not signed explicitly: the recipient
-already needs the account long-term root key to decrypt the content, and so an additional signature
-by that same key would add nothing.
+That is, it is simply the information to add to the linked device list plus some metadata.  It is
+uploaded to namespace 21 with a TTL of 10 minutes.  (Since device linking requires a user to have
+access to both devices at the same time, a longer TTL accomplishes nothing.)
+
+The request is encrypted to the group asked to join, using the `link_x25519` pubkey from that
+group's messages, so that only the group's members can read it.  It must not be readable by every
+holder of the root seed: a removed device still holds the seed, and a request it could read would
+give it the requesting device's keys and SAS, enough to admit that device into a group of its own.
+Encrypting to the group also means only that group's devices prompt for it, where an account has
+more than one.
+
+The encryption is that of one-to-one messages (see "One-to-one Message Encryption") without the
+ML-KEM steps, there being no ML-KEM key to encapsulate to, and so not X-Wing.  With `X` the group's
+`link_x25519` and `S` the account's long-term pubkey:
+
+1. Generate an ephemeral X25519 keypair, e/E.
+
+2. Compute the encrypted key indicator, which tells the group's devices which of their current and
+   recent account keys the request was encrypted to:
+
+       kiss = BLAKE2b_2(E || S, key=eS, pers="SessionDvGrpKISS")
+       ki   = X[0:2] ⊕ kiss
+
+   Without `kiss` the indicator would tell anyone who can see the group's messages, where `X`
+   appears in the clear, which group and key a request was meant for.
+
+3. Derive the key and nonce:
+
+       kn = BLAKE2b_56(eX || E || X, pers="SessionDvGrpLink")
+       k  = kn[0:32]
+       n  = kn[32:56]
+
+   BLAKE2b rather than the SHA3-256 and SHAKE256 of one-to-one messages: those follow from X-Wing,
+   which this is not, and every other derivation in device groups is BLAKE2b.
+
+4. The request dict above is signed with the account's Ed25519 key, under a `"~"` key appended to
+   it in the same way as a one-to-one message's inner signature.  A request is not otherwise
+   authenticated: without the signature, anyone able to see the group's `link_x25519` -- including
+   a storage server -- could encrypt a request of their own to it, and have the group's devices
+   prompt for a device that does not exist.
+
+5. The signed request is encrypted with XChaCha20-Poly1305 using `k` and `n`, and the message is
+   the bt-encoded dict:
+
+       {
+           "": "L",
+           "E": "...ephemeral X25519 pubkey...",
+           "L": "...encrypted request...",
+           "i": "...ki, the 2-byte encrypted key indicator..."
+       }
+
+A member decrypts with `xE` for the account key whose X25519 pubkey begins with `ki ⊕ kiss`,
+`kiss` being computed as `BLAKE2b_2(E || S, key=sE, ...)` from the account's long-term secret `s`.
 
 #### Handshake short authentication string
 
@@ -410,7 +552,7 @@ The exact sequence is calculated from a list of 6-bit (0-63) integer values that
 of the emoji value, generated as follows:
 
 - seed = Argon2id(M, salt=blake2b(M, size=16, pers="SessionLinkEmoji"), size=16, cost=16MiB, ops=2)
-  where M is the decrypted device link message data.
+  where M is the signed request dict, as decrypted from `L`.
 - emoji indices are then selected by interpreting the resulting 16 bytes as a 128-bit, little-endian
   encoded integer where index 0 is the value of the least significant 6 bits, index 1 is bits 6-11,
   and so on.
@@ -432,8 +574,8 @@ the short window before the user accepts the request; a memory-hard hash makes t
 
 ### Device link request handling
 
-Upon receiving a (valid) device link request in namespace 21, an existing (linked) device must
-display to the user a screen with the new device details, asking for confirmation of the new linked
+Upon receiving a device link request in namespace 21 that it can decrypt and whose signature is
+valid, an existing (linked) device must display to the user a screen with the new device details, asking for confirmation of the new linked
 device.  This information should generally consist of the device type, description, and version,
 time the request was made, and the short authentication string.
 
@@ -442,7 +584,10 @@ In some circumstances, additional information might also need to be confirmed or
 - if the new device has the same device identifier as an existing device then the user should be
   told that accepting this will replace the existing device in the device group.  (This path is
   relatively rare, but would apply, for instance, if someone restores their system from a backup
-  with expired keys that needs to re-join the device group with new keys.)
+  with expired keys that needs to re-join the device group with new keys.)  Only a request made
+  after the record it would replace counts: an older one is the request that first admitted the
+  device, or one since superseded, fetched late.  A device identifier the group holds a removal or
+  departure for is spent, and a request under it is ignored.
 
 - if there are no available additional linked device slots (i.e. because the user is not a Pro user,
   and has used all available non-Pro device slots) then the user must be informed and given a list
@@ -453,8 +598,12 @@ The user is then given a choice to accept or deny the linking request.
 
 #### Device link request denial
 
-If the user chooses to deny the request then the device should delete the linking request from
-namespace, and take no other action.
+If the user chooses to ignore the request then by default the device simply stops prompting for it,
+and takes no other action: another of the account's devices can still accept the same request.
+
+Ignoring may optionally also delete the request from the namespace, so that no device can accept
+it.  This is for a request the user does not recognise, rather than one that is merely being
+answered elsewhere.
 
 #### Device link request acceptance
 
@@ -465,8 +614,98 @@ Upon accepting a device linking request, the existing linked device accepting th
   device.
 - push the updated linked device config to the account's swarm.
 
+Accepting a request that replaces an existing device puts the requested record in place of the one
+held, with a seqno above both that record's and the request's, so that it wins the merge on every
+device -- the requesting device's own included, which may have lost track of its seqno along with
+its membership.  The accepting device also rotates the account key: a copy of the device as it was
+still holds the replaced record's keys, and must not read what comes after.  A device that saw the
+request without answering it treats it as accepted once a group message gives the device the keys
+the request asked for.
+
 The device that requested linking, meanwhile, continues to monitor namespace 21 for an updated
 device message that it is successfully able to decrypt.
+
+#### Confirmation on the requesting device
+
+Decrypting a group message is not by itself enough for the requesting device to consider itself
+linked: its user must also confirm on it that its SAS matches the one the accepting device showed,
+and it joins only once both have happened.
+
+Encrypting the request to the group stops a removed device, or any other seed holder outside the
+group, from reading it.  It does not stop one from publishing a group message of its own, carrying
+its own `link_x25519` and even the real group's identifier.  A device that encrypts its request to
+such a key has its request read by that impostor, which can then admit it to a group of its own --
+and from the requesting device, that is indistinguishable from being accepted.  The real group
+cannot read such a request at all, and so never prompts for it.  Asking the user to confirm on the
+requesting device closes this: the user confirms only having seen the same SAS on one of their own
+devices, which happens only if the request reached the real group.
+
+The confirmation belongs to one request, so an admission is matched to the request it accepted: the
+record it admits is the one that request carried, identified by its timestamp and X25519 key.  A
+device stamps each of its requests later than the one before, so no two carry the same record.  It
+keeps its requests for as long as an admission accepting one could still be in the swarm, and:
+
+- an admission matching none of them is ignored: the device asked for nothing that it answers;
+- one matching a request the user confirmed admits the device;
+- one matching the device's newest request, unconfirmed, is held until the user confirms it --
+  even past that request's deadline, since the acceptance came in time and only the message
+  carrying it arrived late;
+- one matching an older request the user never confirmed is ignored.  The user has moved on to a
+  newer request, whose SAS is what they are now looking at, and that one admits them instead.
+
+This is what lets a device ask again, after a request seemed to go unanswered, without losing an
+earlier one that was accepted meanwhile.
+
+## Multiple groups
+
+An account can come to have more than one device group, when a device starts a new group while
+another already exists, whether by mistake or deliberately.  Starting a group never deletes another
+group's messages: they are what lets the user notice and undo it.
+
+A device in a group that sees messages carrying another group's identifier alerts its user that
+another device group exists alongside its own.  The user can dismiss the alert, and the device then
+remembers that identifier and does not alert about it again; a group with yet another identifier
+still alerts.  Dismissing is each device's own decision and is not shared with the rest of its
+group, each of which alerts, and is dismissed, separately.
+
+A device in a group that finds none of its own group's messages left, but another group's present,
+has been **cut off**: nothing it could still read remains, so it can no longer receive anything
+encrypted to its group.  Group messages leave the swarm only by expiring, which takes every device
+of the group being offline for the whole TTL, or by being deleted by a holder of the account seed.
+This is always alerted, as a possible attack, whether or not the other group's identifier was
+dismissed.
+
+### Leaving a group to join another
+
+A device in a group may ask to join a different one, for instance to undo starting a group by
+mistake.  It sends a link request naming the other group, as any applicant does, and stays in its
+own group, fully working, until it is accepted.  If the request lapses, nothing has changed.
+
+Once accepted into the new group, it leaves the old one:
+
+- If it was the old group's only member, it deletes that group's messages from the swarm.  No
+  device is left to read them, and other devices would otherwise go on alerting about a group that
+  nobody is in.
+- Otherwise it pushes one last update to the old group with a departure tombstone for itself, so
+  that the remaining members stop encrypting to it.  Being a departure rather than a removal, it
+  does not appear in the `kicked` list.  It also remembers the old group's identifier as dismissed,
+  so as not to alert about the group it has just left.
+
+Either way it leaves all of the old group behind -- its devices, its messages, and its account keys
+-- and takes on the new group's, all of which arrive with the message admitting it.  A group's
+account keys never carry into another: they would be handed to the new group's members in every
+message the device pushed, and the newest of them could displace the new group's current key.  For
+the same reason a device starting a group starts it with a newly generated account key, whatever it
+held before.
+
+The departed device still holds every account key the old group had, and the group must move to one
+it does not.  A removal does this in the same step: the removing device generates a new account key
+and pushes it in the message that carries the tombstone, which the removed device is not given a key
+to.  A departing device cannot do the same for itself, since it would know any key it generated,
+and so the rotation is a second step: a remaining member that merges a departure tombstone it did
+not already hold generates a new account key and pushes it.  Several members may do so at once; as
+with any rotations that cross, the merge keeps the most recently created key as current, the lowest
+seed breaking a tie, so every device settles on the same one.
 
 # Account keys
 
