@@ -5,12 +5,7 @@
 #include "../log_setup.hpp"
 
 // Router selection: consumed by make_testnet_core() in live_utils.hpp.
-session::network::opt::router live_router_mode =
-#ifdef ENABLE_NETWORKING_SROUTER
-        session::network::opt::router::session_router();
-#else
-        session::network::opt::router::onion_requests();
-#endif
+session::network::opt::router live_router_mode = session::network::opt::router::session_router();
 
 int main(int argc, char* argv[]) {
     Catch::Session session;
