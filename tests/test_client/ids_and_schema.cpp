@@ -1,3 +1,4 @@
+#include "../schema_fingerprint.hpp"
 #include "common.hpp"
 
 // ── ConversationId ──────────────────────────────────────────────────────────────────────────────
@@ -150,88 +151,83 @@ TEST_CASE("Client: an attachment cache id is never handed out twice", "[client][
     CHECK(next > gone);
 }
 
-TEST_CASE(
-        "Client: rebuilding for AUTOINCREMENT keeps every row and reference", "[client][schema]") {
-    TempClient c;
+TEST_CASE("Client: upgrading for AUTOINCREMENT keeps every row and reference", "[client][schema]") {
+    TempClient c{TempClient::unopened};
     SenderKeys sender;
     auto convo = ConversationId::dm(sender.session_id);
 
-    deliver(*c, sender, "plain", from_epoch_ms(1000), "h1");
-    deliver(*c,
-            sender,
-            "with a file",
-            from_epoch_ms(2000),
-            "h2",
-            "",
-            std::nullopt,
-            [](SessionProtos::DataMessage& d) {
-                auto* a = d.add_attachments();
-                a->set_id(1);
-                a->set_url("http://fs.example/file/111#d");
-                a->set_key(std::string(32, 'k'));
-                a->set_contenttype("image/png");
-            });
-
-    auto db = [&](auto&& f) {
-        return TestHelper::on_loop(c->core, [&] {
-            auto conn = c->core.database().conn();
+    auto db = [](core::Core& core, auto&& f) {
+        return TestHelper::on_loop(core, [&] {
+            auto conn = core.database().conn();
             return f(conn);
         });
     };
 
-    // A cache entry the attachment points at, so the rebuilt reference has something to name.
-    db([](sqlite::Connection& conn) {
-        conn.prepared_exec(
-                "INSERT INTO attachment_cache (name, size, last_used) VALUES ('f', 10, 1)");
-        conn.prepared_exec(
-                "UPDATE message_attachments SET cached = (SELECT id FROM attachment_cache)");
-        return 0;
-    });
-
+    // Valid against the tables both before and after 006 rebuilds them.
     using row = std::tuple<int64_t, int64_t, std::optional<std::string>, std::optional<int64_t>>;
-    auto snapshot = [&] {
-        return db([](sqlite::Connection& conn) {
-            std::vector<row> rows;
-            for (auto [a, b, s, n] : conn.prepared_results<
-                                     int64_t,
-                                     int64_t,
-                                     std::optional<std::string>,
-                                     std::optional<int64_t>>(R"(
-                SELECT id, conversation, body, count FROM messages
-                    JOIN (SELECT id AS cid, count FROM conversations) ON cid = conversation
-                UNION ALL SELECT message, length(content), NULL, NULL FROM message_raw_content
-                UNION ALL SELECT message, idx, url, cached FROM message_attachments
-                UNION ALL SELECT id, size, name, last_used FROM attachment_cache
-                ORDER BY 1, 2, 3)"))
-                rows.emplace_back(a, b, std::move(s), n);
-            return rows;
-        });
+    auto snapshot = [](sqlite::Connection& conn) {
+        std::vector<row> rows;
+        for (auto [a, b, s, n] : conn.prepared_results<
+                                 int64_t,
+                                 int64_t,
+                                 std::optional<std::string>,
+                                 std::optional<int64_t>>(R"(
+            SELECT id, conversation, body, count FROM messages
+                JOIN (SELECT id AS cid, count FROM conversations) ON cid = conversation
+            UNION ALL SELECT message, length(content), NULL, NULL FROM message_raw_content
+            UNION ALL SELECT message, idx, url, cached FROM message_attachments
+            UNION ALL SELECT id, size, name, last_used FROM attachment_cache
+            ORDER BY 1, 2, 3)"))
+            rows.emplace_back(a, b, std::move(s), n);
+        return rows;
     };
-    auto before = snapshot();
-    REQUIRE(before.size() == 6);
 
-    // Run again over the database it already ran on, which is the one starting point a test can
-    // build without carrying the old schema around: the rebuild does not care what it rebuilds.
-    db([](sqlite::Connection& conn) {
-        return conn.prepared_exec(
-                "DELETE FROM migrations_applied WHERE name = 'client:006_ids_never_reused'");
-    });
+    auto [before, file_msg] = [&] {
+        auto old = open_client_schema_before(c.path, "006_ids_never_reused");
+        REQUIRE(TestHelper::migration_applied(old, "client:005_attachment_availability"));
+        REQUIRE_FALSE(TestHelper::migration_applied(old, "client:006_ids_never_reused"));
+
+        return db(old, [&](sqlite::Connection& conn) {
+            conn.prepared_exec("INSERT INTO accounts (session_id) VALUES (?)", sender.session_id);
+            conn.prepared_exec(
+                    "INSERT INTO conversations (dm, created, last_activity)"
+                    " VALUES ((SELECT id FROM accounts), 1, 2000)");
+            auto insert_message = [&](std::string_view body, int64_t ts, std::string_view hash) {
+                conn.prepared_exec(
+                        "INSERT INTO messages (conversation, swarm_hash, sender, outgoing,"
+                        " timestamp, body) VALUES ((SELECT id FROM conversations), ?,"
+                        " (SELECT id FROM accounts), 0, ?, ?)",
+                        hash,
+                        ts,
+                        body);
+                return conn.prepared_get<int64_t>("SELECT last_insert_rowid()");
+            };
+            insert_message("plain", 1000, "h1");
+            auto file_msg = insert_message("with a file", 2000, "h2");
+
+            conn.prepared_exec(
+                    "INSERT INTO message_raw_content (message, content) VALUES (?, X'0a0b0c')",
+                    file_msg);
+            conn.prepared_exec(
+                    "INSERT INTO attachment_cache (name, size, last_used) VALUES ('f', 10, 1)");
+            conn.prepared_exec(
+                    "INSERT INTO message_attachments (message, idx, url, content_type, cached)"
+                    " VALUES (?, 0, 'http://fs.example/file/111#d', 'image/png',"
+                    " (SELECT id FROM attachment_cache))",
+                    file_msg);
+            return std::pair{snapshot(conn), file_msg};
+        });
+    }();
+    REQUIRE(before.size() == 5);
+
     c.reopen();
     REQUIRE(TestHelper::migration_applied(c->core, "client:006_ids_never_reused"));
 
-    CHECK(snapshot() == before);
-
-    auto [newest, file_msg] = db([](sqlite::Connection& conn) {
-        return std::pair{
-                conn.prepared_get<int64_t>("SELECT max(id) FROM messages"),
-                conn.prepared_get<int64_t>("SELECT message FROM message_attachments")};
-    });
-    deliver(*c, sender, "after", from_epoch_ms(3000), "h3");
-    CHECK(c->conversation(convo, await)->messages(await).front().id > newest);
+    CHECK(db(c->core, snapshot) == before);
 
     // The children point at the rebuilt tables, and not at the ones the rebuild dropped: deleting
     // through them still reaches them.
-    auto [cached, children] = db([&](sqlite::Connection& conn) {
+    auto [cached, children] = db(c->core, [&](sqlite::Connection& conn) {
         conn.prepared_exec("DELETE FROM attachment_cache");
         auto cached = conn.prepared_get<int64_t>(
                 "SELECT count(*) FROM message_attachments WHERE cached IS NOT NULL");
@@ -244,5 +240,26 @@ TEST_CASE(
     });
     CHECK(cached == 0);
     CHECK(children == 0);
-    CHECK(c->conversation(convo, await)->messages(await).size() == 2);
+
+    // The deleted message held the highest id, so this is the insert that would retake it.
+    deliver(*c, sender, "after", from_epoch_ms(3000), "h3");
+    auto messages = c->conversation(convo, await)->messages(await);
+    REQUIRE(messages.size() == 2);
+    CHECK(messages.front().body == "after");
+    CHECK(messages.front().id > file_msg);
+}
+
+TEST_CASE("Client: the base schema and every migration make today's schema", "[client][schema]") {
+    // Schema only: a migration that seeds rows is not checked here.
+    TempClient fresh;
+    TempClient upgraded{TempClient::unopened};
+    open_client_schema_before(upgraded.path, {});
+    upgraded.reopen();
+    auto fingerprint = [](Client& c) {
+        return TestHelper::on_loop(c.core, [&] {
+            auto conn = c.core.database().conn();
+            return session::test::schema_fingerprint(conn);
+        });
+    };
+    CHECK(fingerprint(*upgraded) == fingerprint(*fresh));
 }
