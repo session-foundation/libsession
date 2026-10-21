@@ -1,7 +1,10 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <concepts>
 #include <memory>
+#include <mutex>
 #include <oxen/quic/loop.hpp>
 #include <session/clock.hpp>
 #include <session/config/namespaces.hpp>
@@ -321,6 +324,14 @@ class Core {
     sqlite::Database db;
     friend class detail::CoreComponent;
 
+    // Set from `suspend_storage` until `resume_storage`.  Read anywhere, so atomic; but only set on
+    // the loop, between jobs.
+    std::atomic<bool> _storage_suspended{false};
+
+    // Taken by `suspend_storage` and `resume_storage`, so that a resume racing a suspend cannot
+    // leave the database suspended with the flag above clear.
+    std::mutex _suspend_mutex;
+
     // Friendship does not reach a component through its base, and Configs pushes to the swarm, so
     // it needs `_swarm_request` by name.
     friend class Configs;
@@ -399,6 +410,8 @@ class Core {
 
     struct SwarmOp;
     void _swarm_attempt(std::shared_ptr<SwarmOp> op);
+    // Picks the member `_swarm_attempt` sends to from the swarm it resolved, and sends.
+    void _swarm_chosen(std::shared_ptr<SwarmOp> op, std::vector<network::service_node> swarm);
     void _swarm_send(std::shared_ptr<SwarmOp> op, network::service_node node);
 
     // What `_swarm_send`'s reply does, once it is back on our own queue.  Split out rather than
@@ -641,6 +654,48 @@ class Core {
     /// swarm work quiesced before the old Network is dropped.
     void set_network(std::unique_ptr<network::Network> network);
 
+    /// **The suspend contract.**  iOS kills an app that is suspended while holding a lock on a file
+    /// in a shared container, and the database is shared with a notification extension there.  So
+    /// before the app is suspended, its wake wrapper calls this, and the database is not touched
+    /// again until `resume_storage()`.  Platform-neutral, but only iOS needs to call it: elsewhere
+    /// nothing kills a process for a lock it holds.
+    ///
+    /// In order, it:
+    /// - stops polling and drops any push subscription, on the loop between jobs;
+    /// - writes the dumps of any configs that changed and have not been written;
+    /// - suspends the database (see `sqlite::Database::suspend`): it waits up to `wait` for work
+    ///   already holding a connection to finish, interrupting it first with `interrupt` (the
+    ///   emergency case, when the background time has run out: a statement interrupted
+    ///   mid-transaction throws, and the transaction rolls back);
+    /// - closes every connection, and with `checkpoint` also checkpoints and truncates the WAL.
+    ///   The app asks for that; an extension, short-lived and suspended rarely, need not.
+    ///
+    /// While suspended, work on this Core's loop and its disk loop that reaches for the database
+    /// waits for the resume rather than failing: a job already queued, or an answer the network
+    /// brings back -- a poll's messages, a send's confirmation, a downloaded file -- carries on
+    /// once resumed, and if the process is killed first it is as if the answer never came.  So the
+    /// loop is held up.  A blocking call into Core from off the loop is refused instead, with
+    /// `sqlite::database_suspended` (see `refuse_while_suspended`), and so is database work on any
+    /// other thread; both are logged as critical, being a bug in whatever forgot to resume.  A call
+    /// taking a callback is queued, and answered once resumed.
+    ///
+    /// Suspending again while suspended repeats only the database's part: everything on the loop
+    /// was done by the first, and the loop may be holding a job that would make a second wait.
+    ///
+    /// Returns what was managed in time: see `sqlite::Database::suspend`.  `wait` bounds the
+    /// database's part; before that, putting the loop between jobs waits for the job it is running.
+    /// Blocking; not to be called on the loop.
+    sqlite::Database::suspend_result suspend_storage(
+            std::chrono::milliseconds wait, bool interrupt = false, bool checkpoint = false);
+
+    /// Lifts `suspend_storage`: work held meanwhile carries on, connections reopen as they are
+    /// next needed, polling restarts at once, and configs changed meanwhile are pushed.  Ends a
+    /// suspend still waiting for connections.  Safe to call when not suspended.
+    void resume_storage();
+
+    /// Whether `suspend_storage` is in force.
+    bool storage_suspended() const { return _storage_suspended; }
+
     /// Constructs a Network from `args` and attaches it, returning a reference to it that is valid
     /// for as long as this Core is.  The usual way to attach one:
     ///
@@ -862,10 +917,26 @@ class Core {
     }
     /// Returns by value, deliberately: a reference handed back here would have outlived the job
     /// that produced it, which is the whole hazard this queue exists to close.
+    ///
+    /// From off the loop, refused while storage is suspended (see `suspend_storage`): before it is
+    /// queued, and again when it runs, since a suspend landing in between would otherwise hold the
+    /// job with the caller blocked on it.
     template <typename F>
     auto call_get(F&& f) {
-        return _jq.call_get(std::forward<F>(f));
+        const bool off_loop = !loop().inside();
+        if (off_loop)
+            refuse_while_suspended();
+        return _jq.call_get([this, off_loop, &f] {
+            if (off_loop)
+                refuse_while_suspended();
+            return f();
+        });
     }
+
+    /// Throws `sqlite::database_suspended`, logged as critical, while storage is suspended: what a
+    /// blocking call from off the loop gets then, rather than waiting for a resume its own thread
+    /// may be the one to make.  For a layer on Core with blocking calls of its own, as Client has.
+    void refuse_while_suspended() const;
 
     /// The account database, for a layer built on top of Core that keeps its own tables alongside
     /// Core's — the same layer that supplies a schema_extension to create them.

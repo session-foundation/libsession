@@ -76,6 +76,9 @@ class MockNetwork : public network::Network {
         // itself, and what that prompts -- continuing a swarm walk, writing a cache entry -- would
         // otherwise sit on the queue until something else happened to run it.  `call_get` is inline
         // once already on the loop, so scripted replies, which are sent from there, cost nothing.
+        // The loop's own rather than Core's, which refuses a blocking call while storage is
+        // suspended: this stands in for the network handing a reply over, not for an application
+        // call, and a reply arriving while suspended is exactly what the suspend tests send.
         network::network_response_callback_t on_loop =
                 [this, callback = std::move(callback)](
                         bool ok,
@@ -85,7 +88,7 @@ class MockNetwork : public network::Network {
                         std::optional<std::string> body) {
                     if (!core)
                         return callback(ok, timeout, status, std::move(headers), std::move(body));
-                    core->call_get([&] {
+                    core->loop().call_get([&] {
                         callback(ok, timeout, status, std::move(headers), std::move(body));
                     });
                 };

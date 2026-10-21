@@ -1,5 +1,8 @@
 #include "session/core/configs.hpp"
 
+#include <SQLiteCpp/Transaction.h>
+#include <sqlite3.h>
+
 #include <algorithm>
 #include <cassert>
 #include <nlohmann/json.hpp>
@@ -66,6 +69,7 @@ void Configs::_load() {
     _user_groups = std::make_unique<config::UserGroups>(key, stored("UserGroups"));
     _local = std::make_unique<config::Local>(key, stored("Local"));
 
+    _known_dumps = dumps;
     _loaded = true;
 
     // The names above are literals because a dump has to be handed to the constructor, so there is
@@ -140,23 +144,161 @@ config::ConfigBase* Configs::for_namespace(config::Namespace ns) {
     }
 }
 
+template <typename F>
+void Configs::_slot(std::string_view type, F&& f) {
+    if (type == "UserProfile")
+        f(_user_profile);
+    else if (type == "Contacts")
+        f(_contacts);
+    else if (type == "ConvoInfoVolatile")
+        f(_convo_info_volatile);
+    else if (type == "UserGroups")
+        f(_user_groups);
+    else if (type == "Local")
+        f(_local);
+}
+
+// Stands in for the storage hash of a state another process holds but has not pushed: merging it
+// as a message is the only way to reuse the config merge, and the merge needs a hash for each one.
+// It must never reach a storage server, nor be taken for a hash of something stored there.
+static constexpr std::string_view UNPUBLISHED = "unpublished-dump:";
+
+static bool unpublished(std::string_view hash) {
+    return hash.starts_with(UNPUBLISHED);
+}
+
 void Configs::_store(config::ConfigBase& conf) {
     if (!conf.needs_dump())
         return;
 
-    conn().prepared_exec(
+    auto c = conn();
+    std::string type{conf.encryption_domain()};
+    std::optional<std::vector<std::byte>> now;
+    for (auto data : c.prepared_results<sqlite::blob>(
+                 "SELECT data FROM config_dumps WHERE pubkey = ? AND type = ?",
+                 core.globals.session_id(),
+                 type))
+        now.emplace(data.begin(), data.end());
+    auto known = _known_dumps.find(type);
+    auto* out = &conf;
+    if (now && (known == _known_dumps.end() || known->second != *now)) {
+        // Theirs, as the message it would push.  Pushed and confirmed, it carries its real hashes;
+        // otherwise it exists only in that dump, and a placeholder stands in for them.
+        auto seed = core.globals.account_seed();
+        std::span<const std::byte> stored{*now};
+        std::unique_ptr<config::ConfigBase> theirs;
+        try {
+            _slot(type, [&]<typename T>(std::unique_ptr<T>&) {
+                theirs = std::make_unique<T>(seed.ed25519_secret(), stored);
+            });
+        } catch (const std::exception& e) {
+            log::warning(
+                    cat, "Overwriting unreadable {} dump from another process: {}", type, e.what());
+        }
+        auto hashes = theirs ? theirs->curr_hashes() : std::unordered_set<std::string>{};
+        bool published = theirs && theirs->is_clean();
+        std::vector<std::pair<std::string, std::vector<std::byte>>> incoming;
+        if (theirs) {
+            auto [seqno, msgs, obsolete] = theirs->push();
+            published = published && hashes.size() == msgs.size();
+            auto h = hashes.begin();
+            for (auto& msg : msgs)
+                incoming.emplace_back(
+                        published ? *h++ : "{}{}"_format(UNPUBLISHED, incoming.size()),
+                        std::move(msg));
+        }
+
+        auto before = conf.seqno();
+        if (!incoming.empty()) {
+            conf.merge(incoming);
+            log::info(cat, "Merged {} written by another process before writing ours", type);
+        } else if (theirs) {
+            log::warning(cat, "Overwriting {} written by another process: it cannot merge", type);
+        }
+
+        // Theirs held everything ours did, and the merge adopted it as stored on the swarm --
+        // which an unpushed state is not.  Their dump says exactly what it is, so take that.
+        bool rebuilt = std::ranges::any_of(conf.curr_hashes(), unpublished);
+        if (rebuilt)  // destroys `conf`
+            _slot(type, [&]<typename T>(std::unique_ptr<T>& slot) {
+                slot = std::make_unique<T>(seed.ed25519_secret(), stored);
+                out = slot.get();
+            });
+        if ((rebuilt || out->seqno() != before) &&
+            std::ranges::find(_changed, out->storage_namespace()) == _changed.end())
+            _changed.push_back(out->storage_namespace());
+    }
+
+    // Once dumped, a dirty state is visible to the other process, which may build on it; amending
+    // it in place would give it a new hash under the same seqno, and their copy of the old one
+    // would then replay its stale values over ours.  Serialising it into a message ends the
+    // amending: the next change starts a new seqno.  push() also hands over the hashes it
+    // supersedes, which the real push then deletes.
+    if (out->is_dirty()) {
+        auto [seqno, msgs, obsolete] = out->push();
+        auto& held = _obsolete[type];
+        held.insert(held.end(), obsolete.begin(), obsolete.end());
+    }
+    auto dump = out->dump();
+    c.prepared_exec(
             R"(
 INSERT INTO config_dumps (pubkey, type, data) VALUES (?, ?, ?)
 ON CONFLICT (pubkey, type) DO UPDATE SET data = excluded.data
 )",
             core.globals.session_id(),
-            conf.encryption_domain(),
-            conf.dump());
+            type,
+            dump);
+    _known_dumps[type] = std::move(dump);
+}
+
+std::vector<config::Namespace> Configs::reload_if_changed() {
+    assert(on_loop());
+    std::vector<config::Namespace> reloaded;
+    if (!_loaded)
+        return reloaded;
+
+    auto seed = core.globals.account_seed();
+    for (auto [type, data] : conn().prepared_results<std::string, sqlite::blob>(
+                 "SELECT type, data FROM config_dumps WHERE pubkey = ?",
+                 core.globals.session_id())) {
+        std::vector<std::byte> now{data.begin(), data.end()};
+        auto it = _known_dumps.find(type);
+        if (it != _known_dumps.end() && it->second == now)
+            continue;
+        config::ConfigBase* conf = nullptr;
+        _slot(type, [&]<typename T>(std::unique_ptr<T>& slot) {
+            slot = std::make_unique<T>(seed.ed25519_secret(), std::span<const std::byte>{now});
+            conf = slot.get();
+        });
+        if (!conf)
+            continue;
+        log::info(cat, "Reloaded config {}: another process changed its dump", type);
+        reloaded.push_back(conf->storage_namespace());
+        _known_dumps[type] = std::move(now);
+    }
+    for (auto ns : reloaded)
+        if (std::ranges::find(_changed, ns) == _changed.end())
+            _changed.push_back(ns);
+    if (!reloaded.empty())
+        _schedule_settle();
+    return reloaded;
 }
 
 void Configs::store_dumps() {
-    for (auto* conf : all())
+    auto confs = all();
+    if (std::ranges::none_of(confs, [](auto* conf) { return conf->needs_dump(); }))
+        return;
+
+    // One write transaction across every comparison and write in _store, which would be worth
+    // nothing if another process could write in between.  A caller's open transaction is joined.
+    auto c = conn();
+    std::optional<SQLite::Transaction> tx;
+    if (sqlite3_get_autocommit(c.sql.getHandle()))
+        tx.emplace(c.sql, SQLite::TransactionBehavior::IMMEDIATE);
+    for (auto* conf : confs)
         _store(*conf);
+    if (tx)
+        tx->commit();
 }
 
 Configs::Batch::Batch(Configs& configs) : _configs{configs} {
@@ -355,7 +497,8 @@ void Configs::push_now() {
     // _load(), so this is the one path that could otherwise skip the check entirely.
     assert(on_loop());
 
-    if (_push_in_flight)
+    // Resuming pushes whatever changed meanwhile; see `Core::resume_storage`.
+    if (_push_in_flight || core.storage_suspended())
         return;
     _send_push();
 }
@@ -413,7 +556,14 @@ void Configs::_send_push() {
             requests.push_back({{"method", "store"}, {"params", std::move(params)}});
         }
 
-        obsolete.insert(obsolete.end(), superseded.begin(), superseded.end());
+        // With whatever `_store` serialising it superseded, less the placeholders standing in for a
+        // state that was never stored anywhere.
+        auto& held = _obsolete[std::string{conf->encryption_domain()}];
+        superseded.insert(superseded.end(), held.begin(), held.end());
+        held.clear();
+        for (auto& hash : superseded)
+            if (!unpublished(hash))
+                obsolete.push_back(std::move(hash));
     }
 
     if (pending.empty())
