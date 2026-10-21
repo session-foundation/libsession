@@ -3779,3 +3779,73 @@ TEST_CASE(
     CHECK(std::filesystem::is_empty(out.path));
     CHECK(partial_cache_files(dir.path).empty());
 }
+
+namespace {
+// A MockNetwork whose uploads stay in flight until it is torn down, which then completes them -- as
+// a real Network completes whatever its transport still holds when it is destroyed: mostly failed,
+// but one that finished in the moments before can still succeed.
+struct HoldingNetwork : MockNetwork {
+    HoldingNetwork(bool succeed) : MockNetwork{network::config::Config{}}, succeed{succeed} {}
+
+    bool succeed;
+    std::vector<network::FileUploadRequest> held;
+
+    void upload_file(network::FileUploadRequest request, std::span<const std::byte>) override {
+        held.push_back(std::move(request));
+    }
+
+    ~HoldingNetwork() override {
+        for (auto& r : held) {
+            if (!r.on_complete)
+                continue;
+            if (succeed)
+                r.on_complete(
+                        std::pair{network::file_metadata{"1", 17, {}, {}}, cleared_b32{}}, false);
+            else
+                r.on_complete(network::ERROR_REQUEST_CANCELLED, false);
+        }
+    }
+};
+}  // namespace
+
+TEST_CASE("Client: destroyed with an upload in flight", "[client][attachments][threads]") {
+    // An upload's completion posts onto Client's own queue, and Core's teardown of the network is
+    // what completes it.  ~Client stops that queue and only then closes the network, so whatever
+    // the network completes as it goes is dropped: a failure would otherwise land on a queue that
+    // no longer exists, and a success run against a network that is no longer there.
+    auto dir = std::filesystem::temp_directory_path() / random::unique_id("test_upload_close", 7);
+    std::filesystem::create_directories(dir);
+    auto photo = dir / "beach.png";
+    std::ofstream{photo, std::ios::binary} << "not really a file";
+
+    for (bool succeed : {false, true}) {
+        CAPTURE(succeed);
+        for (int round = 0; round < 3; round++) {
+            TempClient c;
+            auto net = std::make_unique<HoldingNetwork>(succeed);
+            auto* raw = net.get();
+            raw->core = &c->core;
+            c->core.set_network(std::move(net));
+
+            auto me = own_sid(*c);
+            TestHelper::seed_pfs_nak(c->core, me);
+            c->send_message(
+                    ConversationId::dm(me),
+                    {.attachments = {OutgoingAttachment{.path = photo}}},
+                    await);
+
+            // The upload starts once the message is stored; wait until the network is holding it.
+            bool holding = false;
+            for (int i = 0; i < 200 && !holding; i++) {
+                holding = c->core.call_get([&] { return !raw->held.empty(); });
+                if (!holding)
+                    std::this_thread::sleep_for(5ms);
+            }
+            REQUIRE(holding);
+
+            c.client.reset();
+        }
+    }
+
+    std::filesystem::remove_all(dir);
+}
