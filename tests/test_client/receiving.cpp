@@ -852,3 +852,113 @@ TEST_CASE("Client: a sender's picture arrives with their message", "[client][rec
         CHECK(entry->profile_picture.key == key);
     }
 }
+
+TEST_CASE(
+        "Client: a message a locked database cannot store holds the retrieve cursor before it",
+        "[client][receive][poll]") {
+    TempClient c;
+    auto* net = attach_mock_network(c->core);
+    net->current_node.remote_pubkey[0] = std::byte{0x01};
+    const auto& node = net->current_node.remote_pubkey;
+    constexpr int16_t dm_ns = static_cast<int16_t>(config::Namespace::Default);
+
+    SenderKeys sender;
+    approve(*c, sender.session_id);
+    std::vector<std::pair<std::string, std::vector<std::byte>>> batch{
+            {"h1", encode_dm(*c, sender, "one", from_epoch_ms(5000))},
+            {"h2", encode_dm(*c, sender, "two", from_epoch_ms(6000))},
+            {"h3", encode_dm(*c, sender, "three", from_epoch_ms(7000))}};
+
+    auto bodies = [&] {
+        std::vector<std::string> out;
+        auto convo = c->conversation(ConversationId::dm(sender.session_id), await);
+        if (convo)
+            for (const auto& m : convo->messages(await))
+                out.push_back(m.body);
+        std::ranges::sort(out);
+        return out;
+    };
+    // Answers a poll with the whole batch.
+    auto answer_poll = [&] {
+        net->sent_requests.clear();
+        TestHelper::poll(c->core);
+        REQUIRE(net->sent_requests.size() == 1);
+        auto request = *net->sent_requests[0].request.body;
+        auto reply = net->sent_requests[0].callback;
+        reply(true, false, 200, {}, retrieve_response(request, dm_ns, batch).dump());
+        TestHelper::drain(c->core);
+    };
+
+    // The first message arrives on its own and is stored, which puts the cursor on it.
+    auto full = batch;
+    batch.resize(1);
+    answer_poll();
+    REQUIRE(bodies() == std::vector<std::string>{"one"});
+    REQUIRE(TestHelper::namespace_last_hash(c->core, dm_ns, node) == "h1");
+
+    // Then another connection holds the write lock, as the app and an extension sharing the
+    // database can, for longer than the busy timeout.  The node answers from the start of the
+    // batch, as one without our cursor would: the first message's store already fails, so nothing
+    // is taken and the cursor stays where it was.  Nothing went out after the answer either:
+    // neither a continuation nor a subscription, which would stop the polling that is to fetch the
+    // rest.
+    batch = full;
+    auto blocker = c->core.database().unique_conn();
+    blocker.sql.exec("BEGIN IMMEDIATE");
+    answer_poll();
+
+    CHECK(bodies() == std::vector<std::string>{"one"});
+    CHECK(TestHelper::namespace_last_hash(c->core, dm_ns, node) == "h1");
+    CHECK(net->sent_requests.size() == 1);
+
+    // Once the lock is released, the next poll brings in the rest, and the stored first message
+    // dedupes.
+    blocker.sql.exec("ROLLBACK");
+    answer_poll();
+
+    CHECK(bodies() == std::vector<std::string>{"one", "three", "two"});
+    CHECK(TestHelper::namespace_last_hash(c->core, dm_ns, node) == "h3");
+}
+
+TEST_CASE(
+        "Client: a message that can never be stored is dropped rather than holding the cursor",
+        "[client][receive][poll]") {
+    TempClient c;
+    auto* net = attach_mock_network(c->core);
+    net->current_node.remote_pubkey[0] = std::byte{0x01};
+    const auto& node = net->current_node.remote_pubkey;
+    constexpr int16_t dm_ns = static_cast<int16_t>(config::Namespace::Default);
+
+    SenderKeys sender;
+    approve(*c, sender.session_id);
+    std::vector<std::pair<std::string, std::vector<std::byte>>> batch{
+            {"h1", encode_dm(*c, sender, "one", from_epoch_ms(5000))},
+            {"h2", encode_dm(*c, sender, "two", from_epoch_ms(6000))},
+            {"h3", encode_dm(*c, sender, "three", from_epoch_ms(7000))}};
+
+    // The second message's store fails on a constraint, which no later attempt gets past: the
+    // message itself is what fails, as a future constraint or a malformed field might make it.
+    c->core.loop().call_get([&] {
+        c->core.database().conn().sql.exec(R"(
+            CREATE TRIGGER fail_h2 BEFORE INSERT ON messages WHEN NEW.swarm_hash = 'h2'
+            BEGIN SELECT RAISE(ABORT, 'injected store failure'); END
+        )");
+        return 0;
+    });
+
+    TestHelper::poll(c->core);
+    REQUIRE(net->sent_requests.size() == 1);
+    auto request = *net->sent_requests[0].request.body;
+    net->sent_requests[0].callback(
+            true, false, 200, {}, retrieve_response(request, dm_ns, batch).dump());
+    TestHelper::drain(c->core);
+
+    // It is dropped as taken, so the one behind it is stored and the cursor moves past both.
+    std::vector<std::string> stored;
+    for (const auto& m :
+         c->conversation(ConversationId::dm(sender.session_id), await)->messages(await))
+        stored.push_back(m.body);
+    std::ranges::sort(stored);
+    CHECK(stored == std::vector<std::string>{"one", "three"});
+    CHECK(TestHelper::namespace_last_hash(c->core, dm_ns, node) == "h3");
+}

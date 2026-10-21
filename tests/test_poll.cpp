@@ -38,27 +38,14 @@ static std::vector<int16_t> namespaces_in(std::span<const std::byte> request_bod
     return out;
 }
 
-// A batch response shaped to the request: one result per subrequest, carrying a single message in
-// the one that asked for `ns` and nothing in the rest.
+// A batch response shaped to the request, carrying a single message in the subrequest that asked
+// for `ns` and nothing in the rest.
 static nlohmann::json make_response(
         std::span<const std::byte> request_body,
         int16_t ns,
         std::vector<std::byte> msg_data,
         std::string hash) {
-    auto batch = parse_json(request_body);
-    auto results = nlohmann::json::array();
-    for (const auto& r : batch["requests"]) {
-        nlohmann::json body;
-        body["messages"] = nlohmann::json::array();
-        if (r["params"]["namespace"] == ns) {
-            nlohmann::json item;
-            item["data"] = oxenc::to_base64(msg_data);
-            item["hash"] = hash;
-            body["messages"].push_back(std::move(item));
-        }
-        results.push_back({{"code", 200}, {"body", std::move(body)}});
-    }
-    return nlohmann::json{{"results", std::move(results)}};
+    return retrieve_response(request_body, ns, {{std::move(hash), std::move(msg_data)}});
 }
 
 TEST_CASE("Core automatic polling", "[core][poll]") {

@@ -158,6 +158,12 @@ struct callbacks {
     /// decrypted.  The message is passed as an rvalue reference: the callback may move from it
     /// (e.g. to take ownership of the content vector) or simply read it in place.
     ///
+    /// Throwing says the message was not taken -- typically that storing it failed -- and it is
+    /// then delivered again: a poll does not move the retrieve cursor past it, and the rest of its
+    /// batch is left to come back with it.  The callback must therefore tolerate seeing a message
+    /// it has already handled.  Throw only for a failure a later attempt can get past, such as the
+    /// database being busy; a message that throws every time holds back everything behind it.
+    ///
     /// Parameters:
     /// - msg -- the decrypted message data
     std::function<void(ReceivedMessage&& msg)> message_received;

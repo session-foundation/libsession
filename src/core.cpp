@@ -753,8 +753,8 @@ void Core::_absorb_profile_answer(
     // Final, even where the member said it was holding more.  This is a one-shot fetch rather than
     // a poll that continues: the cursor recorded below is what lets the ordinary poll pick up
     // anything left, and a handler told to wait for a final that never comes would wait for ever.
-    receive_messages(messages, config::Namespace::UserProfile, true);
-    _record_swarm_cursor(node, config::Namespace::UserProfile, messages);
+    auto handled = receive_messages(messages, config::Namespace::UserProfile, true);
+    _record_swarm_cursor(node, config::Namespace::UserProfile, messages.first(handled));
 }
 
 /// Reports the fan-out's result, once.  Whichever of the grace timer and the last answer comes
@@ -888,10 +888,10 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
 /// each cursor is individually plausible, and what it costs shows up much later as a namespace that
 /// re-fetches for ever or one that skips past messages, depending which way it landed.
 ///
-/// Called only once the batch has been handled: the swarm filters on last_hash, so advancing past
-/// messages that threw would drop them permanently.  Handling and then dying before this point
-/// re-delivers the batch instead, which is why message handlers must tolerate seeing a message
-/// twice.
+/// Called only once the batch has been handled, and only with the messages that were: the swarm
+/// filters on last_hash, so advancing past a message its handler refused would drop it permanently.
+/// Handling and then dying before this point re-delivers the batch instead, which is why message
+/// handlers must tolerate seeing a message twice.
 void Core::_record_swarm_cursor(
         const network::ed25519_pubkey& node_pubkey,
         config::Namespace ns,
@@ -960,6 +960,10 @@ void Core::_handle_poll_response(
     // continued in place because the cursor each one resumes from is written below.
     std::vector<config::Namespace> unfinished;
 
+    // Whether a handler refused a message, leaving its namespace's cursor short of what the node
+    // returned.
+    bool refused = false;
+
     try {
         auto json = nlohmann::json::parse(body);
         auto it = json.find("results");
@@ -980,15 +984,26 @@ void Core::_handle_poll_response(
             if (!got)
                 continue;
 
-            const auto& swarm_messages = got->messages;
-            receive_messages(swarm_messages, ns, !got->more);
-            if (got->more)
+            std::span<const SwarmMessage> swarm_messages{got->messages};
+            auto handled = receive_messages(swarm_messages, ns, !got->more);
+            _record_swarm_cursor(sn_pubkey, ns, swarm_messages.first(handled));
+            if (handled < swarm_messages.size())
+                refused = true;
+            else if (got->more)
                 unfinished.push_back(ns);
-
-            _record_swarm_cursor(sn_pubkey, ns, swarm_messages);
         }
     } catch (const std::exception& e) {
         log::warning(cat, "Failed to parse poll response: {}", e.what());
+        return;
+    }
+
+    // The refused message is fetched again by the next poll, which resumes from the cursor left in
+    // front of it.  So no continuation, which would only ask again straight away, and above all no
+    // subscription: that stops the polling, and the message would then wait for the subscription
+    // to drop.  For the same reason one already held -- this can be the poll that follows
+    // subscribing -- is given up.
+    if (refused) {
+        _drop_subscription("a retrieved message was not taken");
         return;
     }
 
@@ -1295,7 +1310,10 @@ void Core::_handle_server_push(std::string_view endpoint, std::span<const std::b
     SwarmMessage msg{
             to_span(data), std::move(hash), from_epoch_ms(timestamp), from_epoch_ms(expiry)};
 
-    receive_messages({&msg, 1}, static_cast<config::Namespace>(ns_val), true);
+    // A refused push is retrieved again once polling resumes, from a cursor that no push ever
+    // moved.  But polling is stopped for as long as the subscription lasts, so it has to go.
+    if (receive_messages({&msg, 1}, static_cast<config::Namespace>(ns_val), true) == 0)
+        _drop_subscription("a pushed message was not taken");
 }
 
 PfsKeyStatus Core::prefetch_pfs_keys(std::span<const std::byte, 33> session_id) {
@@ -1904,9 +1922,9 @@ int64_t Core::send_dm(
             force_v2);
 }
 
-void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
+size_t Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
     if (!callbacks.message_received && !callbacks.message_decrypt_failed)
-        return;
+        return messages.size();
 
     auto seed = globals.account_seed();
     auto session_id = globals.session_id();
@@ -1917,13 +1935,23 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
     // Ed25519 secret key used for v1 envelope decryption.
     auto ed_sec = seed.ed25519_secret();
 
+    // A message the callback throws on was not taken, and neither is anything after it: see
+    // `callbacks::message_received`.  Nothing past it is handed over, since each would have to be
+    // refused in turn -- a busy database fails every one of them, a busy timeout apiece.
+    bool refused = false;
     auto fire_received = [&](ReceivedMessage out) {
         if (!callbacks.message_received)
             return;
+        auto hash = out.hash;
         try {
             callbacks.message_received(std::move(out));
         } catch (const std::exception& e) {
-            log::error(cat, "message_received callback threw: {}", e.what());
+            log::warning(
+                    cat,
+                    "Message {} was not taken, leaving it to retrieve again: {}",
+                    hash,
+                    e.what());
+            refused = true;
         }
     };
 
@@ -1937,7 +1965,12 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
         }
     };
 
+    size_t reached = 0;
     for (const auto& msg : messages) {
+        if (refused)
+            break;
+        reached++;
+
         auto data = msg.data;
         if (data.empty()) {
             fire_fail(msg, MessageDecryptFailure::bad_format);
@@ -2037,13 +2070,16 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
             }
         }
     }
+
+    // `reached` counts the refused message itself.
+    return refused ? reached - 1 : reached;
 }
 
-void Core::receive_messages(
+size_t Core::receive_messages(
         std::span<const SwarmMessage> messages, config::Namespace ns, bool is_final) {
     using config::Namespace;
     switch (ns) {
-        case Namespace::Default: _handle_direct_messages(messages); break;
+        case Namespace::Default: return _handle_direct_messages(messages);
         case Namespace::Devices: devices.parse_device_messages(messages, is_final); break;
         case Namespace::AccountPubkeys: devices.parse_account_pubkeys(messages, is_final); break;
         case Namespace::UserProfile:
@@ -2056,6 +2092,7 @@ void Core::receive_messages(
                     "receive_messages: ignoring unhandled namespace {}",
                     static_cast<int16_t>(ns));
     }
+    return messages.size();
 }
 
 void Core::apply_migrations() {

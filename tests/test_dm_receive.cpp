@@ -399,16 +399,16 @@ TEST_CASE(
 // ── Callback exception safety ────────────────────────────────────────────────────────────────────
 
 TEST_CASE(
-        "_handle_direct_messages: exception in message_received is swallowed and processing "
-        "continues",
+        "_handle_direct_messages: a message the callback throws on holds back the rest",
         "[core][dm]") {
     SenderKeys sender;
 
-    int call_count = 0;
+    std::vector<std::string> offered;
     callbacks cbs;
-    cbs.message_received = [&](ReceivedMessage&&) {
-        ++call_count;
-        throw std::runtime_error("deliberate test exception");
+    cbs.message_received = [&](ReceivedMessage&& m) {
+        offered.push_back(m.hash);
+        if (m.hash == "h2")
+            throw std::runtime_error("deliberate test exception");
     };
 
     TempCore recipient{cbs};
@@ -420,12 +420,18 @@ TEST_CASE(
     constexpr auto plaintext = "7801"_hex_b;
     auto e1 = encode_dm_v1(plaintext, sender.ed_sk, clock_now_ms(), recip_session_id, std::nullopt);
     auto e2 = encode_dm_v1(plaintext, sender.ed_sk, clock_now_ms(), recip_session_id, std::nullopt);
+    auto e3 = encode_dm_v1(plaintext, sender.ed_sk, clock_now_ms(), recip_session_id, std::nullopt);
 
     OwnedMessage om1{std::span{e1}, "h1"};
     OwnedMessage om2{std::span{e2}, "h2"};
-    std::array<SwarmMessage, 2> msgs{om1.msg, om2.msg};
+    OwnedMessage om3{std::span{e3}, "h3"};
+    std::array<SwarmMessage, 3> msgs{om1.msg, om2.msg, om3.msg};
 
-    // The thrown exception must not propagate, and both messages must reach the callback.
-    CHECK_NOTHROW(recipient->receive_messages(msgs, config::Namespace::Default, true));
-    CHECK(call_count == 2);
+    // The exception does not propagate.  It marks the message as not taken, so it and everything
+    // after it are left to be delivered again: only the first counts as handled, and the third is
+    // never offered.
+    size_t handled = 0;
+    CHECK_NOTHROW(handled = recipient->receive_messages(msgs, config::Namespace::Default, true));
+    CHECK(handled == 1);
+    CHECK(offered == std::vector<std::string>{"h1", "h2"});
 }

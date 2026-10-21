@@ -1,6 +1,8 @@
+#include <SQLiteCpp/Exception.h>
 #include <SQLiteCpp/Transaction.h>
 #include <SessionProtos.pb.h>
 #include <oxenc/hex.h>
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <charconv>
@@ -372,6 +374,20 @@ static std::optional<int64_t> find_conversation(sqlite::Connection& c, const Con
             "SELECT id FROM conversations WHERE {} = ?"_format(kind.column), *subject);
 }
 
+// Whether storing a received message failed because the database cannot be written right now --
+// busy or locked by another connection, full, or failing I/O -- rather than because of the message.
+// Only that kind of failure can pass on a later attempt, so only that kind is worth holding the
+// retrieve cursor for.
+static bool store_can_retry(const SQLite::Exception& e) {
+    switch (e.getErrorCode() & 0xff) {
+        case SQLITE_BUSY:
+        case SQLITE_LOCKED:
+        case SQLITE_FULL:
+        case SQLITE_IOERR: return true;
+        default: return false;
+    }
+}
+
 core::callbacks Client::_core_callbacks() {
     // Capturing `this` here is safe despite running in Core's member-init list: every callback we
     // install can only fire from receive_messages(), send_dm(), or a config merge, none of which
@@ -383,10 +399,22 @@ core::callbacks Client::_core_callbacks() {
     // re-reporting it there.
     core::callbacks cb;
 
-    // Persist first, then notify: a throwing callback is a bug Core can only log, so Client must
-    // never rely on an exception to reject a batch.
+    // Persist first, then notify.  A throw here is Core's cue to deliver the message again rather
+    // than move its cursor past it, and a message that throws every time holds back everything
+    // behind it until it expires off the swarm.  So only a database that cannot be written right
+    // now is let through (see `store_can_retry`); any other failure is the message's own, and it is
+    // dropped as taken.
     cb.message_received = [this](core::ReceivedMessage&& msg) {
-        _on_message_received(std::move(msg));
+        auto hash = msg.hash;
+        try {
+            _on_message_received(std::move(msg));
+        } catch (const SQLite::Exception& e) {
+            if (store_can_retry(e))
+                throw;
+            log::error(cat, "Dropping message {}: storing it failed: {}", hash, e.what());
+        } catch (const std::exception& e) {
+            log::error(cat, "Dropping message {}: handling it failed: {}", hash, e.what());
+        }
     };
 
     cb.message_send_status = [this](int64_t id,
@@ -6258,8 +6286,9 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
             approved_them = outgoing && contact_changed;
         }
 
-        // Delivery is at-least-once -- the swarm cursor advances per batch, so a crash mid-batch
-        // re-delivers it -- and either unique index is enough to recognise the redelivery.
+        // Delivery is at-least-once -- the swarm cursor advances per batch and stops short of a
+        // message whose store threw, so a crash mid-batch or a failed store re-delivers it -- and
+        // either unique index is enough to recognise the redelivery.
         //
         // The msgid index is what also catches our own message coming back off our own swarm, which
         // the swarm hash cannot: that copy is stored before it has one.  A sender that set no msgid
