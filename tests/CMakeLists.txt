@@ -44,7 +44,11 @@ set(LIB_SESSION_UTESTS_SOURCES
     test_group_info.cpp
     test_group_members.cpp
     test_hash.cpp
+    test_image_jpeg.cpp
+    test_image_platform.cpp
+    test_image_probe.cpp
     test_image_thumbhash.cpp
+    test_image_vips.cpp
     #test_logging.cpp  # Handled separately, see below
     test_multi_encrypt.cpp
     test_mnemonics.cpp
@@ -90,7 +94,15 @@ target_link_libraries(test_libs INTERFACE
     nlohmann_json::nlohmann_json
     oxen::logging)
 
-target_link_libraries(test_libs INTERFACE libsession::network)
+target_link_libraries(test_libs INTERFACE
+    libsession::network
+    libsession::image
+    # The image tests inspect libvips and libheif directly to confirm what libsession::image did.
+    sessiondep::vips
+    sessiondep::libheif)
+if(SESSION_ENABLE_JPEGLI)
+    target_compile_definitions(test_libs INTERFACE SESSION_ENABLE_JPEGLI)
+endif()
 
 add_executable(testAll main.cpp ${LIB_SESSION_UTESTS_SOURCES})
 target_include_directories(testAll PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
