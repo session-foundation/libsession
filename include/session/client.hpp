@@ -542,6 +542,22 @@ class Client {
     /// database's: with an unencrypted database the key sits in plaintext beside them.
     void set_cache_dir(std::filesystem::path dir);
 
+    /// Suspends this Client's database before the process is suspended: see
+    /// `core::Core::suspend_storage`, which this wraps and whose arguments and result these are.
+    /// On top of Core's, no attachment download starts while suspended.
+    ///
+    /// Work already under way -- a send, an upload or a download whose answer arrives while
+    /// suspended -- waits and finishes once resumed.  A blocking call made into this Client while
+    /// suspended is refused instead, with `sqlite::database_suspended`: it would otherwise wait for
+    /// a resume that the calling thread may be the one to make.  A call taking a callback is
+    /// queued, and answered once resumed.  Blocking; not to be called on Core's loop.
+    sqlite::Database::suspend_result suspend_storage(
+            std::chrono::milliseconds wait, bool interrupt = false, bool checkpoint = false);
+
+    /// Lifts `suspend_storage`: Core resumes, and attachment downloads start again.  Safe to call
+    /// when not suspended.
+    void resume_storage();
+
     /// A conversation's picture, decrypted and ready to decode.
     ///
     /// Served from the cache when it is there, and fetched, decrypted and cached when it is not.
@@ -1724,7 +1740,17 @@ class Client {
     /// By value, for the same reason as Core's: a reference returned here has escaped the loop.
     template <typename F>
     auto call_get(F&& f) {
-        return _jq.call_get(std::forward<F>(f));
+        // From off the loop, refused while storage is suspended (see `suspend_storage`): before it
+        // is queued, and again when it runs, since a suspend landing in between would otherwise
+        // hold the job with the caller blocked on it.
+        const bool off_loop = !core.loop().inside();
+        if (off_loop)
+            core.refuse_while_suspended();
+        return _jq.call_get([this, off_loop, &f] {
+            if (off_loop)
+                core.refuse_while_suspended();
+            return f();
+        });
     }
 
     // Client's own queue on Core's loop, rather than the loop's shared one, so that work deferred
