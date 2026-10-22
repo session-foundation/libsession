@@ -1079,6 +1079,35 @@ void Network::_launch_next_clock_out_of_sync_request(
             });
 }
 
+std::optional<std::chrono::milliseconds> detail::resync_offset(
+        std::span<const std::optional<std::chrono::milliseconds>> measured,
+        std::chrono::milliseconds min_offset) {
+    std::vector<std::chrono::milliseconds> offsets;
+    for (const auto& offset : measured)
+        if (offset)
+            offsets.push_back(*offset);
+
+    if (offsets.empty())
+        return std::nullopt;
+
+    std::sort(offsets.begin(), offsets.end());
+    const auto mid = offsets.size() / 2;
+    auto median = (offsets.size() % 2 == 1) ? offsets[mid] : (offsets[mid - 1] + offsets[mid]) / 2;
+
+    // The nodes' clocks are no better than a device keeping its own time, and two clients that
+    // applied slightly different offsets order each other's messages wrongly: a reply can sort
+    // ahead of the message it answers.  Only an offset too large to be such noise is applied.
+    if (std::chrono::abs(median) < min_offset) {
+        log::info(
+                cat,
+                "Median network offset {}ms is within {}ms of the device clock; not applying it.",
+                median.count(),
+                min_offset.count());
+        return 0ms;
+    }
+    return median;
+}
+
 void Network::_on_clock_resync_complete(const uint8_t /*total_requests*/) {
 
     auto raw_results = std::move(_clock_resync_results);
@@ -1092,38 +1121,17 @@ void Network::_on_clock_resync_complete(const uint8_t /*total_requests*/) {
             refresh_id,
             raw_results.size());
 
-    // Filter and sort the offsets and find the median
-    std::vector<std::chrono::milliseconds> result;
-
-    for (const auto& opt : raw_results)
-        if (opt)
-            result.push_back(*opt);
-
-    const auto count = result.size();
-
     // If we got a successful response then we should update the network offset
-    if (count > 0) {
-        std::chrono::milliseconds median_offset;
-        std::sort(result.begin(), result.end());
-
-        if (count % 2 == 1)
-            median_offset = result[count / 2];
-        else {
-            auto mid_index = (count / 2);
-            auto middle_values_sum = (result[mid_index - 1] + result[mid_index]);
-            median_offset = (middle_values_sum / 2);
-        }
-
-        AdjustedClock::set_offset(median_offset);
+    if (auto offset = detail::resync_offset(raw_results, config.min_network_offset)) {
+        AdjustedClock::set_offset(*offset);
         _last_successful_clock_resync = std::chrono::steady_clock::now();
-        log::info(
-                cat, "[Request {}] Network offset set to: {}ms", refresh_id, median_offset.count());
+        log::info(cat, "[Request {}] Network offset set to: {}ms", refresh_id, offset->count());
 
         // Trigger the network info changed callback to update the client
         if (on_network_info_changed) {
             auto versions = _fork_versions.load();
 
-            on_network_info_changed(median_offset, versions.hardfork, versions.softfork);
+            on_network_info_changed(*offset, versions.hardfork, versions.softfork);
         }
     }
 

@@ -4,6 +4,7 @@
 #include <limits>
 #include <optional>
 #include <oxen/quic.hpp>
+#include <span>
 
 #include "session/clock.hpp"
 #include "session/network/backends/session_file_server.hpp"
@@ -22,7 +23,15 @@ namespace session::network {
 
 namespace detail {
     class RequestQueue;
-}
+
+    /// The offset a clock resync applies, given what each of its requests measured (nullopt for
+    /// one that failed): the median of the measurements, or zero when that is smaller than
+    /// `min_offset` in either direction.  nullopt when every request failed, which leaves the
+    /// current offset in place.
+    std::optional<std::chrono::milliseconds> resync_offset(
+            std::span<const std::optional<std::chrono::milliseconds>> measured,
+            std::chrono::milliseconds min_offset);
+}  // namespace detail
 
 namespace fs = std::filesystem;  // NOLINT(misc-unused-alias-decls)
 
@@ -100,7 +109,7 @@ class Network {
     virtual ~Network();
 
     bool has_retrieved_time_offset() const {
-        return (_last_successful_clock_resync == std::chrono::steady_clock::time_point{});
+        return (_last_successful_clock_resync != std::chrono::steady_clock::time_point{});
     };
     std::chrono::milliseconds network_time_offset() const {
         return std::chrono::duration_cast<std::chrono::milliseconds>(AdjustedClock::get_offset());

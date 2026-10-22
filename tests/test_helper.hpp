@@ -395,6 +395,17 @@ class FakeRouter : public network::IRouter {
 
 class TestHelper {
   public:
+    /// Completes a clock resync on `net`'s loop as though its requests had measured `measured`
+    /// (nullopt for one that failed), without sending any.
+    static void finish_clock_resync(
+            network::Network& net, std::vector<std::optional<std::chrono::milliseconds>> measured) {
+        net._loop->call_get([&] {
+            net._current_clock_resync_id = "test";
+            net._clock_resync_results = std::move(measured);
+            net._on_clock_resync_complete(static_cast<uint8_t>(net._clock_resync_results.size()));
+        });
+    }
+
     /// Polls the way the ticker does: on the loop.
     ///
     /// Not `core._poll()` on the caller's thread.  A poll reaches component state, which is the
