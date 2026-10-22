@@ -1,3 +1,4 @@
+#include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <session/core.hpp>
 
@@ -48,6 +49,57 @@ TEST_CASE(
 
     std::error_code ec;
     std::filesystem::remove(path, ec);
+}
+
+TEST_CASE(
+        "apply_migrations: two Cores opening a database with a migration pending",
+        "[core][schema][threads]") {
+    // The app and its notification extension can open the same file at once just after an update,
+    // both with the same migration pending.  Unless each reads what is applied only once it holds
+    // the write lock, the one that waited applies again what the other just committed -- here a
+    // CREATE TABLE, failing on a table that already exists.  Repeated because whether both read
+    // before either commits is up to the scheduler.
+    for (int round = 0; round < 20; round++) {
+        INFO("round " << round);
+        auto path = std::filesystem::temp_directory_path() /
+                    fmt::format("{}.db", session::random::unique_id("test_schema", 7));
+        {
+            Core core{path};
+        }
+
+        // Spun on rather than a latch, which the macOS deployment target does not have
+        std::atomic<int> starting{2};
+        std::exception_ptr errs[2];
+        auto open = [&](std::exception_ptr& err) {
+            try {
+                for (--starting; starting;) {
+                }
+                Core core{path, schema_extension{"testext", session::test::schema::MIGRATIONS}};
+            } catch (...) {
+                err = std::current_exception();
+            }
+        };
+        std::thread ta{[&] { open(errs[0]); }};
+        std::thread tb{[&] { open(errs[1]); }};
+        ta.join();
+        tb.join();
+
+        for (auto& err : errs)
+            if (err)
+                std::rethrow_exception(err);
+
+        {
+            Core core{path, schema_extension{"testext", session::test::schema::MIGRATIONS}};
+            CHECK(table_exists(core, "ext_thing"));
+            CHECK(TestHelper::migration_applied(core, "testext:000_ext_thing"));
+        }
+        // With every Core gone, the last connection's close has checkpointed and removed these:
+        // one still here is a connection something left open.
+        CHECK_FALSE(std::filesystem::exists(path.string() + "-wal"));
+        CHECK_FALSE(std::filesystem::exists(path.string() + "-shm"));
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
 }
 
 TEST_CASE("schema_extension: migrations order by name, not filename", "[core][schema]") {

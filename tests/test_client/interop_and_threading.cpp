@@ -135,3 +135,45 @@ TEST_CASE("Client: reads are safe while messages arrive on another thread", "[cl
     CHECK(reads > 0);  // the reader really did run alongside, rather than after
     CHECK(c->conversation(convo, await)->messages(N + 10, await).size() == N);
 }
+
+TEST_CASE("Client: two Clients on one database both store what they receive", "[client][threads]") {
+    // Another process on the same file -- a notification extension, say -- is another connection
+    // that commits whenever it likes.  A transaction that reads before it writes has its snapshot
+    // overtaken by such a commit, and the write then fails at once with SQLITE_BUSY: waiting cannot
+    // help a stale snapshot, so the busy timeout is never consulted.  Each store here reads first
+    // (is the sender blocked, does the conversation exist), so with two receiving at once that is
+    // a lost message unless the write lock is taken when the transaction begins.
+    TempClient a;
+    auto b = std::make_unique<Client>(a.path);
+    SenderKeys sender;
+
+    constexpr int N = 200;
+    std::exception_ptr a_err, b_err;
+    auto receive_into = [&](Client& c, std::string_view tag, int offset, std::exception_ptr& err) {
+        try {
+            for (int i = 1; i <= N; i++)
+                deliver(c,
+                        sender,
+                        "{}{}"_format(tag, i),
+                        from_epoch_ms((offset + i) * 1000),
+                        "{}{}"_format(tag, i));
+        } catch (...) {
+            err = std::current_exception();
+        }
+    };
+    std::thread ta{[&] { receive_into(*a, "a", 0, a_err); }};
+    std::thread tb{[&] { receive_into(*b, "b", N, b_err); }};
+    ta.join();
+    tb.join();
+    b.reset();
+
+    if (a_err)
+        std::rethrow_exception(a_err);
+    if (b_err)
+        std::rethrow_exception(b_err);
+
+    auto stored = a->core.loop().call_get([&] {
+        return a->core.database().conn().prepared_get<int64_t>("SELECT count(*) FROM messages");
+    });
+    CHECK(stored == 2 * N);
+}

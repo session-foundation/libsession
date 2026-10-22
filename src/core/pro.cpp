@@ -39,7 +39,7 @@ void Pro::update_revocations(
     auto now = session::clock_now_s().time_since_epoch().count();
 
     auto c = conn();
-    SQLite::Transaction tx{c.sql};
+    auto tx = c.begin_immediate();
 
     // Upsert each listed revocation, (re)setting its last-seen time to now.
     for (auto st =

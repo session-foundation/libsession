@@ -1395,7 +1395,7 @@ bool Core::_store_pfs_keys(
         std::span<const std::byte, 1184> mlkem768_pub) {
     auto now_s = epoch_seconds(clock_now_s());
     auto conn = db.conn();
-    SQLite::Transaction tx{conn.sql};
+    auto tx = conn.begin_immediate();
 
     bool is_unchanged = conn.prepared_maybe_get<int>(
                                     R"(
@@ -2061,7 +2061,32 @@ void Core::receive_messages(
 void Core::apply_migrations() {
     auto cat = log::Cat("schema");
 
+    // Checked before anything is applied, so that a mistake here cannot roll Core's own migrations
+    // back with it
+    std::unordered_set<std::string_view> owners;
+    for (const auto& ext : _schema_extensions) {
+        if (ext.owner.empty() || ext.owner.find(':') != std::string_view::npos)
+            throw std::invalid_argument{
+                    "schema_extension owner must be non-empty and must not contain ':' (got '{}')"_format(
+                            ext.owner)};
+        if (!owners.insert(ext.owner).second)
+            throw std::invalid_argument{
+                    "duplicate schema_extension owner '{}': migration names would collide"_format(
+                            ext.owner)};
+    }
+
     auto conn = db.conn();
+
+    // One transaction for every migration, holding the write lock from BEGIN: another process on
+    // the same file -- the app and its notification extension, opening together just after an
+    // update -- may be applying the same ones, and with the lock held throughout, what is read here
+    // as applied stays true until this commits.  It also makes an upgrade all-or-nothing.
+    //
+    // The cost is that the other process waits out the whole run, rather than one migration at a
+    // time, so a run outlasting its busy timeout makes its open fail with SQLITE_BUSY.  Migrations
+    // run inside this transaction, so they must not begin one of their own.
+    auto tx = conn.begin_immediate();
+
     exec_query(conn.sql, R"(
 CREATE TABLE IF NOT EXISTS migrations_applied (
     name TEXT PRIMARY KEY NOT NULL
@@ -2074,6 +2099,10 @@ CREATE TABLE IF NOT EXISTS migrations_applied (
         while (st.executeStep())
             applied.insert(get<std::string>(st));
     }
+    auto record = [&](std::string key) {
+        conn.prepared_exec("INSERT INTO migrations_applied (name) VALUES (?)", key);
+        applied.insert(std::move(key));
+    };
 
     log::debug(cat, "Checking schema migrations");
 
@@ -2111,16 +2140,11 @@ CREATE TABLE IF NOT EXISTS migrations_applied (
             try {
                 log::info(
                         cat, "Creating {} schema from full_schema", owner.empty() ? "core" : owner);
-
-                SQLite::Transaction tx{conn.sql};
-
                 conn.sql.exec(std::string{full_schema});
-                conn.prepared_exec("INSERT INTO migrations_applied (name) VALUES (?)", created_key);
+                record(created_key);
                 for (const auto& m : migrations)
-                    conn.prepared_exec(
-                            "INSERT INTO migrations_applied (name) VALUES (?)", key_for(m.name));
-
-                tx.commit();
+                    record(key_for(m.name));
+                return;
             } catch (const std::exception& e) {
                 log::critical(
                         cat,
@@ -2129,7 +2153,6 @@ CREATE TABLE IF NOT EXISTS migrations_applied (
                         e.what());
                 throw;
             }
-            return;
         }
 
         for (const auto& [name, apply] : migrations) {
@@ -2141,13 +2164,8 @@ CREATE TABLE IF NOT EXISTS migrations_applied (
 
             try {
                 log::info(cat, "Applying database schema migration {}", key);
-
-                SQLite::Transaction tx{conn.sql};
-
                 apply(conn, *this);
-                conn.prepared_exec("INSERT INTO migrations_applied (name) VALUES (?)", key);
-
-                tx.commit();
+                record(key);
             } catch (const std::exception& e) {
                 log::critical(cat, "Database schema migration '{}' failed: {}", key, e.what());
                 throw;
@@ -2156,21 +2174,11 @@ CREATE TABLE IF NOT EXISTS migrations_applied (
     };
 
     apply_set("", schema::MIGRATIONS, schema::FULL_SCHEMA);
-
-    std::unordered_set<std::string_view> owners;
-    for (const auto& ext : _schema_extensions) {
-        if (ext.owner.empty() || ext.owner.find(':') != std::string_view::npos)
-            throw std::invalid_argument{
-                    "schema_extension owner must be non-empty and must not contain ':' (got '{}')"_format(
-                            ext.owner)};
-        if (!owners.insert(ext.owner).second)
-            throw std::invalid_argument{
-                    "duplicate schema_extension owner '{}': migration names would collide"_format(
-                            ext.owner)};
+    for (const auto& ext : _schema_extensions)
         apply_set(ext.owner, ext.migrations, ext.full_schema);
-    }
     _schema_extensions.clear();
 
+    tx.commit();
     log::debug(cat, "All schema migrations are applied");
 }
 
