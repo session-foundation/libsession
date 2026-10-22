@@ -589,7 +589,8 @@ TEST_CASE("Streaming Encryptor", "[attachments][encryptor]") {
         size_t src_pos = 0;
         auto key = enc.start_encryption([&](std::span<std::byte> buf) -> size_t {
             size_t avail = std::min(buf.size(), data.size() - src_pos);
-            std::memcpy(buf.data(), data.data() + src_pos, avail);
+            if (avail > 0)
+                std::memcpy(buf.data(), data.data() + src_pos, avail);
             src_pos += avail;
             return avail;
         });

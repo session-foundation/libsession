@@ -131,6 +131,19 @@ secretstream_xchacha20poly1305_init_push_with_nonce(
     return st;
 }
 
+// A pull source over `data` for `start_encryption`, advancing `pos`.  The copy is skipped once
+// nothing is left: an empty span's data() may be null, and memcpy's pointers must not be, even
+// for 0 bytes.
+static auto read_from(std::span<const std::byte> data, size_t& pos) {
+    return [data, &pos](std::span<std::byte> buf) -> size_t {
+        size_t avail = std::min(buf.size(), data.size() - pos);
+        if (avail > 0)
+            std::memcpy(buf.data(), data.data() + pos, avail);
+        pos += avail;
+        return avail;
+    };
+}
+
 // Helper: creates an Encryptor from in-memory data, encrypts, and writes output into a span.
 static std::pair<cleared_b32, size_t> encrypt_to_span(
         std::span<const std::byte> seed,
@@ -142,14 +155,7 @@ static std::pair<cleared_b32, size_t> encrypt_to_span(
     enc.update_key(data);
 
     size_t pos = 0;
-    auto key = enc.start_encryption(
-            [&](std::span<std::byte> buf) -> size_t {
-                size_t avail = std::min(buf.size(), data.size() - pos);
-                std::memcpy(buf.data(), data.data() + pos, avail);
-                pos += avail;
-                return avail;
-            },
-            allow_large);
+    auto key = enc.start_encryption(read_from(data, pos), allow_large);
 
     size_t written = 0;
     for (auto chunk = enc.next(); !chunk.empty(); chunk = enc.next()) {
@@ -231,14 +237,7 @@ cleared_b32 encrypt(
     enc.update_key(data);
 
     size_t pos = 0;
-    auto key = enc.start_encryption(
-            [&](std::span<std::byte> buf) -> size_t {
-                size_t avail = std::min(buf.size(), data.size() - pos);
-                std::memcpy(buf.data(), data.data() + pos, avail);
-                pos += avail;
-                return avail;
-            },
-            allow_large);
+    auto key = enc.start_encryption(read_from(data, pos), allow_large);
 
     try {
         std::ofstream out;
