@@ -1,5 +1,6 @@
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators_range.hpp>
 #include <catch2/matchers/catch_matchers_exception.hpp>
@@ -750,7 +751,7 @@ TEST_CASE("Streaming Encryptor", "[attachments][encryptor]") {
         size_t src_pos = 0;
         auto key = enc.start_encryption([&](std::span<std::byte> buf) -> size_t {
             size_t avail = std::min(buf.size(), data.size() - src_pos);
-            std::memcpy(buf.data(), data.data() + src_pos, avail);
+            std::ranges::copy(std::span{data}.subspan(src_pos, avail), buf.begin());
             src_pos += avail;
             return avail;
         });
