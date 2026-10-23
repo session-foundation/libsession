@@ -48,25 +48,18 @@ static nlohmann::json make_response(
     auto batch = parse_json(request_body);
     auto results = nlohmann::json::array();
     for (const auto& r : batch["requests"]) {
-        nlohmann::json body;
-        body["messages"] = nlohmann::json::array();
-        if (r["params"]["namespace"] == ns) {
-            nlohmann::json item;
-            item["data"] = oxenc::to_base64(msg_data);
-            item["hash"] = hash;
-            body["messages"].push_back(std::move(item));
-        }
+        auto body = retrieved_body();
+        if (r["params"]["namespace"] == ns)
+            body["messages"].push_back(retrieved_message(msg_data, hash));
         results.push_back({{"code", 200}, {"body", std::move(body)}});
     }
     return nlohmann::json{{"results", std::move(results)}};
 }
 
 TEST_CASE("Core automatic polling", "[core][poll]") {
-    bool received = false;
+    DeviceEventsRecorder events;
     core::callbacks cbs;
-    cbs.device_link_request = [&](int,
-                                  const core::device::Info&,
-                                  std::span<const std::string_view>) { received = true; };
+    cbs.devices = &events;
 
     TempCore core{cbs};
     auto* mock_net = attach_mock_network(*core);
@@ -113,7 +106,7 @@ TEST_CASE("Core automatic polling", "[core][poll]") {
         std::ranges::copy(std::as_bytes(seed_acc.seed()), seed_bytes.begin());
     }
     TempCore linker{core::predefined_seed{std::span<const std::byte, 32>{seed_bytes}}};
-    auto outer_msg = linker->devices.build_link_request(await).message;
+    auto outer_msg = TestHelper::build_link_request(*linker, *core).message;
 
     sent.callback(
             true, false, 200, {}, make_response(*sent.request.body, 21, outer_msg, "hash1").dump());
@@ -122,7 +115,7 @@ TEST_CASE("Core automatic polling", "[core][poll]") {
     // Verify last_hash was stored under this specific node's pubkey.
     CHECK(TestHelper::namespace_last_hash(*core, 21, mock_net->current_node.remote_pubkey) ==
           "hash1");
-    CHECK(received);
+    CHECK(events.added.size() == 1);
 
     // Poll again with the same node — should include last_hash in the Devices subrequest.
     mock_net->sent_requests.clear();
@@ -207,6 +200,50 @@ TEST_CASE(
     }
 }
 
+TEST_CASE("Poll: a cursor entry keeps the expiry whichever answer gave one", "[core][poll]") {
+    TempCore c;
+    auto* mock_net = attach_mock_network(*c);
+    network::service_node node;
+    node.remote_pubkey[0] = std::byte{0xAA};
+    mock_net->current_node = node;
+
+    // One poll, answered with `hash` and that expiry -- or none, as a node that does not say.
+    auto poll_answering = [&](const std::string& hash, std::optional<sys_ms> expiration) {
+        mock_net->sent_requests.clear();
+        TestHelper::poll(*c);
+        REQUIRE(mock_net->sent_requests.size() == 1);
+        auto& req = mock_net->sent_requests[0];
+        auto response = make_response(*req.request.body, 21, {std::byte{0x01}}, hash);
+        for (auto& result : response["results"])
+            for (auto& msg : result["body"]["messages"]) {
+                if (expiration)
+                    msg["expiration"] = epoch_ms(*expiration);
+                else
+                    msg.erase("expiration");
+            }
+        req.callback(true, false, 200, {}, response.dump());
+        TestHelper::drain(*c);
+    };
+    auto expiry_of = [&](std::string_view hash) {
+        return TestHelper::swarm_hash_expiry(*c, 21, node.remote_pubkey, hash);
+    };
+    auto later = clock_now_ms() + std::chrono::hours{1};
+
+    SECTION("one first seen without an expiry learns it") {
+        poll_answering("h1", std::nullopt);
+        REQUIRE_FALSE(expiry_of("h1"));
+        poll_answering("h1", later);
+        CHECK(expiry_of("h1") == epoch_ms(later));
+    }
+
+    SECTION("a known one survives an answer without one") {
+        poll_answering("h1", later);
+        REQUIRE(expiry_of("h1") == epoch_ms(later));
+        poll_answering("h1", std::nullopt);
+        CHECK(expiry_of("h1") == epoch_ms(later));
+    }
+}
+
 TEST_CASE("Poll: the sync cursor advances only after the batch is handled", "[core][poll]") {
     // Attached below, once there is a Core to own it; the callback that reads it does not run
     // until then either.
@@ -219,13 +256,14 @@ TEST_CASE("Poll: the sync cursor advances only after the batch is handled", "[co
     // Observe the stored cursor from inside the handler.  If it has already advanced by the time
     // the batch is being handled, then a handler that fails -- or a crash at that moment -- loses
     // the batch permanently, because the swarm filters on last_hash.
+    DeviceEventsRecorder events;
+    events.on_added = [&](const core::device::LinkRequest&) {
+        called = true;
+        hash_during_callback = TestHelper::namespace_last_hash(
+                *core_ptr, 21, mock_net->current_node.remote_pubkey);
+    };
     core::callbacks cbs;
-    cbs.device_link_request =
-            [&](int, const core::device::Info&, std::span<const std::string_view>) {
-                called = true;
-                hash_during_callback = TestHelper::namespace_last_hash(
-                        *core_ptr, 21, mock_net->current_node.remote_pubkey);
-            };
+    cbs.devices = &events;
 
     TempCore core{cbs};
     core_ptr = &*core;
@@ -238,7 +276,7 @@ TEST_CASE("Poll: the sync cursor advances only after the batch is handled", "[co
         std::ranges::copy(std::as_bytes(seed_acc.seed()), seed_bytes.begin());
     }
     TempCore linker{core::predefined_seed{std::span<const std::byte, 32>{seed_bytes}}};
-    auto outer_msg = linker->devices.build_link_request(await).message;
+    auto outer_msg = TestHelper::build_link_request(*linker, *core).message;
 
     TestHelper::poll(*core);
     REQUIRE(mock_net->sent_requests.size() == 1);
@@ -261,7 +299,7 @@ static nlohmann::json make_empty_response(std::span<const std::byte> request_bod
     auto batch = parse_json(request_body);
     auto results = nlohmann::json::array();
     for (size_t i = 0; i < batch["requests"].size(); i++)
-        results.push_back({{"code", 200}, {"body", {{"messages", nlohmann::json::array()}}}});
+        results.push_back({{"code", 200}, {"body", retrieved_body()}});
     return nlohmann::json{{"results", std::move(results)}};
 }
 
@@ -276,10 +314,9 @@ static void set_more(
 }
 
 TEST_CASE("Poll: a truncated namespace is continued before it is reported final", "[core][poll]") {
-    int calls = 0;
+    DeviceEventsRecorder events;
     core::callbacks cbs;
-    cbs.device_link_request =
-            [&](int, const core::device::Info&, std::span<const std::string_view>) { calls++; };
+    cbs.devices = &events;
 
     TempCore core{cbs};
     auto* mock_net = attach_mock_network(*core);
@@ -291,7 +328,7 @@ TEST_CASE("Poll: a truncated namespace is continued before it is reported final"
         std::ranges::copy(std::as_bytes(seed_acc.seed()), seed_bytes.begin());
     }
     TempCore linker{core::predefined_seed{std::span<const std::byte, 32>{seed_bytes}}};
-    auto outer_msg = linker->devices.build_link_request(await).message;
+    auto outer_msg = TestHelper::build_link_request(*linker, *core).message;
 
     TestHelper::poll(*core);
     REQUIRE(mock_net->sent_requests.size() == 1);
@@ -308,20 +345,21 @@ TEST_CASE("Poll: a truncated namespace is continued before it is reported final"
     TestHelper::drain(*core);
 
     // The request is stored, but the batch was not final, so nothing has been reported yet.
-    CHECK(calls == 0);
+    CHECK(events.added.empty());
 
-    REQUIRE(mock_net->sent_requests.size() == 2);
-    auto second = *mock_net->sent_requests[1].request.body;
+    auto sent = polls(*mock_net);
+    REQUIRE(sent.size() == 2);
+    auto second = *sent[1]->request.body;
     CHECK(namespaces_in(second) == std::vector<int16_t>{21});
     CHECK(params_for(second, 21)["last_hash"] == "hash1");
 
     // Nothing left behind it: an empty answer is still an answer, and is what makes the batch
     // final.
-    auto reply2 = mock_net->sent_requests[1].callback;
+    auto reply2 = sent[1]->callback;
     reply2(true, false, 200, {}, make_empty_response(second).dump());
     TestHelper::drain(*core);
 
-    CHECK(calls == 1);
+    CHECK(events.added.size() == 1);
 }
 
 TEST_CASE("Poll: `more` with nothing returned does not continue", "[core][poll]") {
@@ -340,5 +378,178 @@ TEST_CASE("Poll: `more` with nothing returned does not continue", "[core][poll]"
     TestHelper::drain(*core);
 
     // There is no new hash to move the cursor to, so another round would ask the same question.
-    CHECK(mock_net->sent_requests.size() == 1);
+    // Counting polls rather than requests: a completed fetch also pushes whatever the group owes,
+    // which a fresh account always does.
+    CHECK(polls(*mock_net).size() == 1);
+}
+
+// Answers the poll for namespace 21 with nothing, which is what makes the fetch final and is what
+// the group push hangs off.
+static void finish_poll(core::Core& core, MockNetwork& net) {
+    auto p = polls(net);
+    REQUIRE(!p.empty());
+    auto& last = *p.back();
+    auto body = *last.request.body;
+    auto reply = last.callback;
+    reply(true, false, 200, {}, make_empty_response(body).dump());
+    TestHelper::drain(core);
+}
+
+TEST_CASE(
+        "Devices: a completed fetch pushes the group, and the next push replaces it",
+        "[core][poll][devices]") {
+    TempCore core;
+    auto* mock_net = attach_mock_network(*core);
+
+    // A generated account registers itself and mints its first account key seed, so a push is owed
+    // from the start and nothing has to dirty it first.
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+
+    auto sent = pushes(*mock_net);
+    REQUIRE(sent.size() == 1);
+    auto reqs = push_requests(*sent[0]);
+
+    // The group message and, beside it, the account's key for contacts -- a new account has PFS/PQ
+    // from the start -- and no delete: there is no earlier message of ours to replace yet.
+    REQUIRE(reqs.size() == 2);
+    CHECK(reqs[0]["method"] == "store");
+    CHECK(reqs[0]["params"]["namespace"] == 21);
+    CHECK(reqs[0]["params"]["ttl"] ==
+          std::chrono::milliseconds{core::Devices::DEVICE_GROUP_TTL}.count());
+    CHECK(reqs[1]["method"] == "store");
+    CHECK(reqs[1]["params"]["namespace"] == -21);
+    CHECK(reqs[1]["params"]["ttl"] ==
+          std::chrono::milliseconds{core::Devices::ACCOUNT_PUBKEY_TTL}.count());
+
+    auto confirm = sent[0]->callback;
+    confirm(true,
+            false,
+            200,
+            {},
+            nlohmann::json{{"results",
+                            {{{"code", 200}, {"body", {{"hash", "group1"}}}},
+                             {{"code", 200}, {"body", {{"hash", "pubkey1"}}}}}}}
+                    .dump());
+    TestHelper::drain(*core);
+    CHECK_FALSE(core->devices.needs_push().account_pubkey);
+
+    // Confirmed, so nothing is owed and a second fetch pushes nothing.
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+    CHECK(pushes(*mock_net).size() == 1);
+
+    // Dirty it again: our own record changed, so the group has something new to say.
+    core::device::Info info{};
+    info.type = core::device::Type::Session_CLI;
+    info.description = "a second thing to say";
+    core->devices.update_info(info, await);
+
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+
+    sent = pushes(*mock_net);
+    REQUIRE(sent.size() == 2);
+    reqs = push_requests(*sent[1]);
+
+    // The store, then a delete naming what the first push left in the swarm.  Namespace 21 keeps
+    // every message, so without this the old one sits there for its whole TTL.  No key this time:
+    // the swarm has the current one.
+    REQUIRE(reqs.size() == 2);
+    CHECK(reqs[0]["method"] == "store");
+    CHECK(reqs[1]["method"] == "delete");
+    CHECK(reqs[1]["params"]["messages"] == nlohmann::json::array({"group1"}));
+}
+
+TEST_CASE(
+        "Devices: a push obsoletes what it merged, not only what it wrote",
+        "[core][poll][devices]") {
+    TempCore core;
+    auto* mock_net = attach_mock_network(*core);
+
+    // A snapshot from another device, arriving under a hash of its own.  A "G" carries the whole
+    // group rather than its author's part of it, so once we have taken its contents in, the message
+    // we push next says everything it said -- which is what makes it redundant, whoever wrote it.
+    auto theirs = core->devices.build_device_group_message().message;
+    TestHelper::receive_device_group_message(core->devices, theirs, "theirs1");
+
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+
+    auto sent = pushes(*mock_net);
+    REQUIRE(sent.size() == 1);
+    auto reqs = push_requests(*sent[0]);
+
+    // The group message, the account's key, then the delete.
+    REQUIRE(reqs.size() == 3);
+    CHECK(reqs[0]["method"] == "store");
+    CHECK(reqs[0]["params"]["namespace"] == 21);
+    CHECK(reqs[2]["method"] == "delete");
+    CHECK(reqs[2]["params"]["messages"] == nlohmann::json::array({"theirs1"}));
+}
+
+TEST_CASE(
+        "Devices: a key minted while a push is in flight is still owed", "[core][poll][devices]") {
+    TempCore core;
+    auto* mock_net = attach_mock_network(*core);
+
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+
+    auto sent = pushes(*mock_net);
+    REQUIRE(sent.size() == 1);
+    auto confirm = sent[0]->callback;
+
+    // Between the message being built and the swarm answering.  This seed is in no message that has
+    // been sent, so confirming the one in flight must not mark it distributed -- no other device
+    // would ever receive it, and messages encrypted to it would be undecryptable for them.
+    core->devices.rotate_account_keys();
+
+    confirm(true,
+            false,
+            200,
+            {},
+            nlohmann::json{{"results", {{{"code", 200}, {"body", {{"hash", "group1"}}}}}}}.dump());
+    TestHelper::drain(*core);
+
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+
+    CHECK(pushes(*mock_net).size() == 2);
+}
+
+TEST_CASE("Poll: a poll that fails while subscribed is retried by Core itself", "[core][poll]") {
+    TempCore core;
+    auto* net = attach_push_network(*core);
+    TestHelper::poll(*core);
+    REQUIRE(subscribe(*net));
+    REQUIRE_FALSE(TestHelper::polling(*core));
+    auto retry_in = [&]() -> std::chrono::milliseconds {
+        auto due = TestHelper::poll_retry_due(*core);
+        return due ? std::chrono::ceil<std::chrono::seconds>(*due - clock_now_ms()) : 0ms;
+    };
+
+    // The poll sent on subscribing fails, and nothing would poll again: the retry is Core's.
+    REQUIRE(answer_batch(*net, {}, false));
+    CHECK(retry_in() == core::Core::POLL_RETRY_FIRST);
+
+    // A full poll, whatever failed; failing again, the next waits twice as long.
+    TestHelper::fire_poll_retry(*core);
+    REQUIRE(polls(*net).size() == 1);
+    CHECK(namespaces_in(*polls(*net)[0]->request.body).size() > 1);
+    REQUIRE(answer_batch(*net, {}, false));
+    CHECK(retry_in() == 2 * core::Core::POLL_RETRY_FIRST);
+
+    // Answered: nothing more to retry, and a fetch failing after that waits only the first again.
+    TestHelper::fire_poll_retry(*core);
+    REQUIRE(answer_batch(*net));
+    CHECK_FALSE(TestHelper::poll_retry_due(*core));
+    TestHelper::fetch(*core, {config::Namespace::Devices}, nullptr);
+    REQUIRE(answer_batch(*net, {}, false));
+    CHECK(retry_in() == core::Core::POLL_RETRY_FIRST);
+
+    // The subscription lost, polling takes over, and polling retries for itself.
+    net->on_connection_lost(net->current_node.remote_pubkey);
+    CHECK(TestHelper::polling(*core));
+    CHECK_FALSE(TestHelper::poll_retry_due(*core));
 }

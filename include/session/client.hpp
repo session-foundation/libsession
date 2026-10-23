@@ -70,7 +70,10 @@ namespace session::client {
 
 using namespace std::literals;
 
-class Client {
+// Privately a DeviceEvents so that what Core reports can be relayed through the dispatcher.  A base
+// rather than a member because Core holds it by pointer: a base is constructed before `core` and
+// destroyed after it, which a member only is by virtue of where it is declared.
+class Client : private core::DeviceEvents {
     friend class session::TestHelper;  // for unit tests
 
     // A conversation *is* part of Client's interface, split off rather than added to: what these
@@ -768,6 +771,7 @@ class Client {
     struct EarlyStatus {
         core::MessageSendStatus status;
         std::optional<std::string> swarm_hash;
+        std::optional<core::MessageEncryption> encryption;
     };
     std::unordered_map<int64_t, EarlyStatus> _early_status;
 
@@ -777,6 +781,17 @@ class Client {
     // the message itself.  Tracked rather than merely unregistered so that a late status does not
     // accumulate in _early_status forever.
     std::unordered_map<int64_t, int64_t> _sync_sends;  // core send id -> client message id
+
+    // Sync copies not sent yet, by the Core send id of their recipient copy: each waits until that
+    // copy has been encrypted, so that it can carry how (`DataMessage.syncEncryption`), or until
+    // that send ends without being encrypted at all.  Serialised, since only the source file sees
+    // the protobuf types.
+    struct PendingSync {
+        int64_t client_id;
+        std::string synced;
+        sys_ms timestamp;
+    };
+    std::unordered_map<int64_t, PendingSync> _pending_syncs;
 
     // Sends whose outcome nobody is waiting for -- the media-saved notification is the only one so
     // far.  Tracked rather than left unregistered so that their statuses are dropped as they
@@ -1436,8 +1451,9 @@ class Client {
             const SessionProtos::DataExtractionNotification& note,
             sys_ms when);
 
-    // Hands a stored message to Core: the recipient's copy and, unless it is a note to self, the
-    // copy for our own swarm.  Shared by the plain and attachment-carrying sends.
+    // Hands a stored message to Core: the recipient's copy, and -- unless it is a note to self --
+    // the copy for our own swarm, once `_release_sync` lets it go.  Shared by the plain and
+    // attachment-carrying sends.
     void _dispatch_sends(
             int64_t client_id,
             const ConversationId& id,
@@ -1445,6 +1461,13 @@ class Client {
             const SessionProtos::Content& synced,
             sys_ms now,
             bool to_self);
+
+    // Sends the sync copy waiting on the recipient copy `core_id`, if `status` decides it: an
+    // encryption reported, which the copy then carries, or a send that ended without one.
+    void _release_sync(
+            int64_t core_id,
+            core::MessageSendStatus status,
+            std::optional<core::MessageEncryption> encryption);
 
     // Runs `work` on the loop thread, logging rather than propagating anything it throws: an
     // exception escaping there has no caller to reach and would take the loop with it.
@@ -1468,11 +1491,18 @@ class Client {
     core::callbacks _core_callbacks();
     void _init();
 
+    void link_request_added(core::device::LinkRequest request) override;
+    void link_request_ended(int reqid, core::device::LinkRequestEnd why) override;
+    void devices_replaced(core::device::map devices) override;
+    void device_membership_changed(core::device::Info device) override;
+    void membership_changed(core::device::Membership membership) override;
+
     void _on_message_received(core::ReceivedMessage&& msg);
     void _on_send_status(
             int64_t core_id,
             core::MessageSendStatus status,
-            std::optional<std::string_view> swarm_hash);
+            std::optional<std::string_view> swarm_hash,
+            std::optional<core::MessageEncryption> encryption);
 
     // Applies what a config merge changed to the tables that answer queries about it.
     //
@@ -1585,11 +1615,14 @@ class Client {
 
     // `swarm_hash` is recorded against the message only when it names a copy in our own swarm; the
     // caller passes nullopt for the copy sent to someone else, whose hash is meaningless here.
+    // `encryption` is recorded only from the copy sent to the recipient: the sync copy's is how it
+    // was encrypted to us, which says nothing about the message.
     void _apply_send_status(
             int64_t client_id,
             core::MessageSendStatus status,
             bool sync,
-            std::optional<std::string_view> swarm_hash);
+            std::optional<std::string_view> swarm_hash,
+            std::optional<core::MessageEncryption> encryption = std::nullopt);
 
     // Runs `invoke` against the application's handlers, swallowing and logging anything it throws:
     // a broken listener is not something a data model can do anything about.

@@ -81,7 +81,7 @@ TEST_CASE("_handle_direct_messages: v1 receive", "[core][dm]") {
     CHECK(msg.hash == "hash_v1");
     CHECK(msg.timestamp == from_epoch_ms(1234));
     CHECK(msg.expiry == from_epoch_ms(9999));
-    CHECK(msg.version == 1);
+    CHECK(msg.encryption == MessageEncryption::v1);
     CHECK(msg.sender_session_id == sender.session_id);
     CHECK(std::ranges::equal(msg.content, plaintext));
     CHECK_FALSE(msg.pro_signature.has_value());
@@ -121,11 +121,10 @@ TEST_CASE("_handle_direct_messages: v2 receive", "[core][dm]") {
     CHECK(msg.hash == "hash_v2");
     CHECK(msg.timestamp == from_epoch_ms(5678));
     CHECK(msg.expiry == from_epoch_ms(8888));
-    CHECK(msg.version == 2);
+    CHECK(msg.encryption == MessageEncryption::v2_pfs);
     CHECK(msg.sender_session_id == sender.session_id);
     CHECK(std::ranges::equal(msg.content, content));
     CHECK_FALSE(msg.pro_signature.has_value());
-    CHECK(msg.pfs_encrypted);
 }
 
 // ── Failure paths ────────────────────────────────────────────────────────────────────────────────
@@ -256,11 +255,10 @@ TEST_CASE("_handle_direct_messages: v2 non-PFS fallback receive", "[core][dm]") 
     CHECK(msg.hash == "hash_nopfs");
     CHECK(msg.timestamp == from_epoch_ms(3333));
     CHECK(msg.expiry == from_epoch_ms(7777));
-    CHECK(msg.version == 2);
+    CHECK(msg.encryption == MessageEncryption::v2_basic);
     CHECK(msg.sender_session_id == sender.session_id);
     CHECK(std::ranges::equal(msg.content, content));
     CHECK_FALSE(msg.pro_signature.has_value());
-    CHECK_FALSE(msg.pfs_encrypted);
 }
 
 TEST_CASE(
@@ -315,7 +313,7 @@ TEST_CASE(
     REQUIRE(failures.empty());
     REQUIRE(received.size() == 1);
     CHECK(std::ranges::equal(received[0].content, content));
-    CHECK_FALSE(received[0].pfs_encrypted);
+    CHECK(received[0].encryption == MessageEncryption::v2_basic);
 }
 
 // ── PFS ki-prefix collision within the loop ──────────────────────────────────────────────────────
@@ -393,7 +391,7 @@ TEST_CASE(
     REQUIRE(failures.empty());
     REQUIRE(received.size() == 1);
     CHECK(std::ranges::equal(received[0].content, content));
-    CHECK(received[0].pfs_encrypted);
+    CHECK(received[0].encryption == MessageEncryption::v2_pfs);
 }
 
 // ── Callback exception safety ────────────────────────────────────────────────────────────────────

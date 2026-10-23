@@ -223,7 +223,13 @@ CREATE TABLE messages (
     -- protobuf, so this is recoverable if that is ever revisited.
     reply_author INTEGER REFERENCES accounts(id),
     reply_timestamp INTEGER,
-    reply_msgid INTEGER
+    reply_msgid INTEGER,
+
+    -- How the message was encrypted, as a core::MessageEncryption value (1 = v1, 2 = v2 without
+    -- PFS, 3 = v2 with PFS+PQ): for an incoming message what its envelope used; for an outgoing
+    -- one what it was sent to its recipient with.  NULL for an outgoing message not yet encrypted,
+    -- and for one a linked device sent whose sync copy did not say.
+    encryption INTEGER
 ) STRICT;
 
 -- Delivery is at-least-once, so a redelivered message must not duplicate.  This also catches what

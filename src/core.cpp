@@ -30,6 +30,7 @@
 
 #include "core/swarm_request.hpp"
 #include "session/config/namespaces.hpp"
+#include "session/config/user_profile.hpp"
 #include "session/core/component.hpp"
 
 namespace session::core {
@@ -122,7 +123,7 @@ Core::~Core() {
     // would reach it; stopping `_jq` below cancels them too, but only once the Network is already
     // gone.  On the loop because the ids are only ever touched there.
     call_get([this] {
-        for (auto* timer : {&_poll_timer, &_sub_timer, &_probe_timer})
+        for (auto* timer : {&_poll_timer, &_sub_timer, &_probe_timer, &_poll_retry_timer})
             _remove_timer(*timer);
     });
 
@@ -236,6 +237,10 @@ void Core::_update_polling() {
         _poll_timer = _jq.add_timer(_poll_interval, [this] { _poll(); });
     else if (!_network)
         _remove_timer(_poll_timer);
+
+    // Polling again retries for itself; without a network there is nothing to retry with.
+    if (_poll_timer || !_network)
+        _cancel_poll_retry();
 }
 
 void Core::set_poll_interval(std::chrono::milliseconds interval) {
@@ -333,7 +338,8 @@ namespace {
             if (auto t = msg.find("timestamp"); t != msg.end() && t->is_number_integer())
                 swarm_msg.timestamp = from_epoch_ms(t->get<int64_t>());
 
-            if (auto e = msg.find("expiry"); e != msg.end() && e->is_number_integer())
+            // "expiration" in a retrieve, though a store or expire reply calls it "expiry".
+            if (auto e = msg.find("expiration"); e != msg.end() && e->is_number_integer())
                 swarm_msg.expiry = from_epoch_ms(e->get<int64_t>());
 
             got.messages.push_back(std::move(swarm_msg));
@@ -606,6 +612,45 @@ void Core::_poll() {
     _send_poll({POLL_NAMESPACES.begin(), POLL_NAMESPACES.end()}, 0, std::nullopt);
 }
 
+void Core::_poll_settled(bool ok) {
+    if (ok)
+        _poll_backoff = POLL_RETRY_FIRST;
+    else
+        _arm_poll_retry();
+}
+
+void Core::_arm_poll_retry() {
+    // Once a subscription has stopped the polling nothing else would poll again: the notification
+    // that prompted a fetch is spent, and a message the failed request would have fetched -- an
+    // admission, a pushed group message, one stored between draining and subscribing -- would wait
+    // for a restart.  The fetches some callers schedule for themselves (a push retry, the -21
+    // re-read) predate this, and are redundant with it rather than needed.
+    if (_poll_timer || !_network || _poll_retry_due)
+        return;
+    if (!_poll_retry_timer)
+        _poll_retry_timer = _jq.add_wakeable([this] {
+            _jq.stop(_poll_retry_timer);
+            _poll_retry_due.reset();
+            if (_poll_timer || !_network)
+                return;
+            log::debug(cat, "Retrying the swarm poll that failed");
+            // A full poll rather than whatever failed: it covers that, and anything else lost.
+            // How it ends comes back through _poll_settled like any poll's.
+            _send_poll({POLL_NAMESPACES.begin(), POLL_NAMESPACES.end()}, 0, std::nullopt);
+        });
+    log::info(cat, "A swarm poll failed while not polling; polling again in {}", _poll_backoff);
+    _poll_retry_due = clock_now_ms() + _poll_backoff;
+    _jq.repeat(_poll_retry_timer, _poll_backoff);
+    _poll_backoff = std::min(_poll_backoff * 2, POLL_RETRY_MAX);
+}
+
+void Core::_cancel_poll_retry() {
+    if (_poll_retry_timer)
+        _jq.stop(_poll_retry_timer);
+    _poll_retry_due.reset();
+    _poll_backoff = POLL_RETRY_FIRST;
+}
+
 void Core::fetch_user_profile(std::function<void(bool found)> done) {
     // Non-owning: the Network is ours alone, and callbacks below must not keep it alive -- doing so
     // could make the loop thread the last owner and run ~Network there.
@@ -666,6 +711,23 @@ void Core::fetch_user_profile(std::function<void(bool found)> done) {
             }
         });
     });
+}
+
+void Core::enable_pfs() {
+    call_get([this] {
+        auto& profile = configs.user_profile();
+        if (profile.get_min_message_version() < 2)
+            profile.set_min_message_version(2);
+        devices._push_soon();
+    });
+}
+
+bool Core::pfs_enabled() {
+    return call_get([this] { return _pfs_enabled(); });
+}
+
+bool Core::_pfs_enabled() {
+    return configs.user_profile().get_min_message_version() >= 2;
 }
 
 /// The body of a profile retrieve: one namespace, and no cursor.
@@ -773,17 +835,33 @@ void Core::_conclude_profile_fetch(ProfileFanOut& state) {
         state.done(state.found);
 }
 
+void Core::_fetch(std::vector<config::Namespace> namespaces, std::function<void(bool)> done) {
+    auto& waiting = _fetches[namespaces];
+    waiting.push_back(std::move(done));
+    if (waiting.size() > 1)
+        return;
+
+    // Taken out before any is called, since one may well fetch again.
+    _send_poll(namespaces, 0, std::nullopt, [this, namespaces](bool fetched) {
+        auto joined = _fetches.extract(namespaces);
+        for (auto& f : joined.mapped())
+            if (f)
+                f(fetched);
+    });
+}
+
 void Core::_send_poll(
         std::vector<config::Namespace> namespaces,
         int round,
-        std::optional<network::service_node> node) {
+        std::optional<network::service_node> node,
+        std::function<void(bool)> done) {
     _swarm_request(
             globals.pubkey_x25519(),
             "batch",
             [this, namespaces](const network::service_node& n) {
                 return _build_poll_body(n, namespaces);
             },
-            [this, namespaces, round](SwarmResponse res) mutable {
+            [this, namespaces, round, done = std::move(done)](SwarmResponse res) mutable {
                 if (!res.ok() || !res.body) {
                     log::warning(
                             cat,
@@ -791,6 +869,9 @@ void Core::_send_poll(
                             res.timeout ? "timed out"
                             : res.body  ? *res.body
                                         : "request failed");
+                    _poll_settled(false);
+                    if (done)
+                        done(false);
                     return;
                 }
 
@@ -799,7 +880,12 @@ void Core::_send_poll(
                 // the subscription that a drained poll goes on to make.
                 _swarm_node = res.node;
 
-                _handle_poll_response(res.node, std::move(namespaces), std::move(*res.body), round);
+                _handle_poll_response(
+                        res.node,
+                        std::move(namespaces),
+                        std::move(*res.body),
+                        round,
+                        std::move(done));
             },
             std::move(node));
 }
@@ -911,13 +997,17 @@ void Core::_record_swarm_cursor(
     auto node_id =
             conn.prepared_get<int64_t>("SELECT id FROM swarm_nodes WHERE pubkey = ?", node_pubkey);
 
+    // The later of the two expiries, or whichever one exists: SQLite's multi-argument max() is NULL
+    // if any argument is, which alone would keep an unknown (NULL) expiry unknown for good, and let
+    // an answer without one erase what an earlier answer said.
     for (const auto& m : messages) {
         if (m.hash.empty())
             continue;
         conn.prepared_exec(
                 R"(
 INSERT INTO swarm_hashes (namespace, node, hash, expiry) VALUES (?, ?, ?, ?)
-ON CONFLICT(namespace, node, hash) DO UPDATE SET expiry = max(expiry, excluded.expiry)
+ON CONFLICT(namespace, node, hash) DO UPDATE
+   SET expiry = coalesce(max(expiry, excluded.expiry), excluded.expiry, expiry)
 )",
                 ns_val,
                 node_id,
@@ -952,9 +1042,19 @@ void Core::_handle_poll_response(
         network::service_node node,
         std::vector<config::Namespace> namespaces,
         std::string body,
-        int round) {
+        int round,
+        std::function<void(bool)> done) {
 
     const auto& sn_pubkey = node.remote_pubkey;
+    // A namespace the node did not answer is a failure for retrying's sake -- whatever it held is
+    // still to be fetched -- though the namespaces that were answered are drained, which is what
+    // `done` reports.
+    bool all_answered = true;
+    auto finish = [this, &done, &all_answered](bool drained) {
+        _poll_settled(drained && all_answered);
+        if (done)
+            done(drained);
+    };
 
     // Namespaces the node says it has more of, to continue in another round.  Collected rather than
     // continued in place because the cursor each one resumes from is written below.
@@ -964,7 +1064,7 @@ void Core::_handle_poll_response(
         auto json = nlohmann::json::parse(body);
         auto it = json.find("results");
         if (it == json.end() || !it->is_array())
-            return;
+            return finish(false);
 
         // One poll can carry several config namespaces, and each merge would otherwise dump on its
         // way out.  Nothing reads those intermediate states, so hold them until the whole response
@@ -972,13 +1072,17 @@ void Core::_handle_poll_response(
         auto configs_held = configs.batch();
 
         auto& results = *it;
+        if (results.size() < namespaces.size())
+            all_answered = false;
         for (size_t i = 0; i < namespaces.size() && i < results.size(); ++i) {
             auto ns = namespaces[i];
             auto ns_val = static_cast<int16_t>(ns);
 
             auto got = decode_retrieved(results[i], ns_val);
-            if (!got)
+            if (!got) {
+                all_answered = false;
                 continue;
+            }
 
             const auto& swarm_messages = got->messages;
             receive_messages(swarm_messages, ns, !got->more);
@@ -989,7 +1093,7 @@ void Core::_handle_poll_response(
         }
     } catch (const std::exception& e) {
         log::warning(cat, "Failed to parse poll response: {}", e.what());
-        return;
+        return finish(false);
     }
 
     // Nothing reports more, so this node's namespaces are drained and its cursors are current --
@@ -997,9 +1101,10 @@ void Core::_handle_poll_response(
     // retrieve and the subscription taking effect would be lost.
     if (unfinished.empty()) {
         _maybe_subscribe(node);
-        return;
+        return finish(true);
     }
 
+    // As drained as a node that never stops saying "more" lets it be.
     if (round + 1 >= POLL_MAX_ROUNDS) {
         log::warning(
                 cat,
@@ -1007,14 +1112,14 @@ void Core::_handle_poll_response(
                 sn_pubkey.hex(),
                 POLL_MAX_ROUNDS,
                 unfinished.size());
-        return;
+        return finish(true);
     }
 
     // Named rather than chosen afresh: the cursor these resume from is this node's, so the
     // continuation has to go back to the same one.  If it has since become unusable the swarm
     // request falls back to choosing normally, and the round starts over from that member's
     // cursor rather than resuming from one it never issued.
-    _send_poll(std::move(unfinished), round + 1, std::move(node));
+    _send_poll(std::move(unfinished), round + 1, std::move(node), std::move(done));
 }
 
 std::optional<network::PathInfo> Core::current_swarm_path() const {
@@ -1298,68 +1403,155 @@ void Core::_handle_server_push(std::string_view endpoint, std::span<const std::b
     receive_messages({&msg, 1}, static_cast<config::Namespace>(ns_val), true);
 }
 
-PfsKeyStatus Core::prefetch_pfs_keys(std::span<const std::byte, 33> session_id) {
-    // Non-owning: the Network is ours alone, and callbacks below must not keep it alive -- doing so
-    // could make the loop thread the last owner and run ~Network there.
-    auto* net = _network.get();
-    if (!net)
+namespace {
+
+    using mlkem768_pubkey = std::array<std::byte, MLKEM768_PUBLICKEYBYTES>;
+
+    // A contact's pfs_key_cache row.  The keys and confirmed_at are present or absent together, as
+    // the table's CHECKs require.
+    struct PfsCacheRow {
+        std::chrono::sys_seconds checked_at;
+        std::optional<std::chrono::sys_seconds> confirmed_at;
+        std::chrono::sys_seconds cache_expiry;
+        std::optional<b32> x25519_pub;
+        std::optional<mlkem768_pubkey> mlkem768_pub;
+
+        bool has_key() const { return x25519_pub.has_value(); }
+
+        void drop_key() {
+            confirmed_at.reset();
+            x25519_pub.reset();
+            mlkem768_pub.reset();
+        }
+
+        // The one place the cache's rule is read; see PfsKeyState.
+        PfsKeyState state() const {
+            bool due = clock_now_s() >= cache_expiry;
+            if (has_key())
+                return due ? PfsKeyState::refresh_due : PfsKeyState::usable;
+            return due ? PfsKeyState::none : PfsKeyState::nak;
+        }
+    };
+
+    std::optional<PfsCacheRow> read_pfs_row(
+            sqlite::Connection& conn, std::span<const std::byte, 33> session_id) {
+        using X = sqlite::blob_guts<b32>;
+        using M = sqlite::blob_guts<mlkem768_pubkey>;
+        auto row = conn.prepared_maybe_get<
+                int64_t,
+                std::optional<int64_t>,
+                int64_t,
+                std::optional<X>,
+                std::optional<M>>(
+                "SELECT checked_at, confirmed_at, cache_expiry, pubkey_x25519, pubkey_mlkem768"
+                " FROM pfs_key_cache WHERE session_id = ?",
+                session_id);
+        if (!row)
+            return std::nullopt;
+        auto& [checked_at, confirmed_at, cache_expiry, pk_x, pk_m] = *row;
+        PfsCacheRow r{
+                .checked_at = from_epoch_s(checked_at), .cache_expiry = from_epoch_s(cache_expiry)};
+        if (confirmed_at && pk_x && pk_m) {
+            r.confirmed_at = from_epoch_s(*confirmed_at);
+            r.x25519_pub = static_cast<const b32&>(*pk_x);
+            r.mlkem768_pub = static_cast<const mlkem768_pubkey&>(*pk_m);
+        }
+        return r;
+    }
+
+    void write_pfs_row(
+            sqlite::Connection& conn,
+            std::span<const std::byte, 33> session_id,
+            const PfsCacheRow& r) {
+        conn.prepared_exec(
+                "INSERT OR REPLACE INTO pfs_key_cache (session_id, checked_at, confirmed_at,"
+                " cache_expiry, pubkey_x25519, pubkey_mlkem768) VALUES (?, ?, ?, ?, ?, ?)",
+                session_id,
+                epoch_seconds(r.checked_at),
+                r.confirmed_at ? std::optional{epoch_seconds(*r.confirmed_at)} : std::nullopt,
+                epoch_seconds(r.cache_expiry),
+                r.x25519_pub,
+                r.mlkem768_pub);
+    }
+
+    // Reads `session_id`'s row, has `update` say what it becomes, and writes that back, as one
+    // transaction.  IMMEDIATE because it reads before writing: a deferred transaction that has read
+    // cannot wait for the write lock -- SQLite fails the upgrade at once with SQLITE_BUSY rather
+    // than calling the busy handler -- so any other connection's write in that moment fails it.
+    template <std::invocable<const std::optional<PfsCacheRow>&> F>
+    void update_pfs_row(
+            sqlite::Connection& conn, std::span<const std::byte, 33> session_id, F&& update) {
+        SQLite::Transaction tx{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+        write_pfs_row(conn, session_id, update(read_pfs_row(conn, session_id)));
+        tx.commit();
+    }
+
+    PfsKeyState pfs_key_state(const std::optional<PfsCacheRow>& row) {
+        return row ? row->state() : PfsKeyState::none;
+    }
+
+    bool lookup_due(PfsKeyState state) {
+        return state == PfsKeyState::none || state == PfsKeyState::refresh_due;
+    }
+
+    // Matches the pending sends to `recipient`, which must outlive the predicate.
+    auto sends_to(std::span<const std::byte, 33> recipient) {
+        return [recipient](const auto& pending) {
+            return std::ranges::equal(pending.recipient, recipient);
+        };
+    }
+
+}  // namespace
+
+PfsKeyState Core::prefetch_pfs_keys(std::span<const std::byte, 33> session_id) {
+    if (!_network)
         throw std::logic_error{"prefetch_pfs_keys called without a network object"};
 
-    // One copy of session_id for async use; subsequently moved into lambdas.
     b33 sid;
     std::ranges::copy(session_id, sid.begin());
+    auto conn = db.conn();
+    auto state = pfs_key_state(read_pfs_row(conn, sid));
+    if (lookup_due(state)) {
+        log::debug(cat, "prefetch_pfs_keys: a lookup of {} is due", session_id);
+        call_get([this, &sid] { _fetch_pfs_keys(sid); });
+    }
+    return state;
+}
 
-    // Skip the fetch if the cached entry is still fresh, or a recent NAK suppresses retrying.
-    // Otherwise determine whether we have a stale (but usable) key or no key at all.
-    auto status = PfsKeyStatus::fetching;
-    {
-        auto conn = db.conn();
-        if (auto row = conn.prepared_maybe_get<std::optional<int64_t>, std::optional<int64_t>>(
-                    "SELECT fetched_at, nak_at FROM pfs_key_cache WHERE session_id = ?", sid)) {
-            auto [fetched_at, nak_at] = *row;
-            if (fetched_at) {
-                auto age = clock_now_s() - from_epoch_s(*fetched_at);
-                if (age < PFS_KEY_FRESH_DURATION) {
-                    log::debug(
-                            cat,
-                            "prefetch_pfs_keys: cached key for {} is still fresh ({} old), "
-                            "skipping",
-                            session_id,
-                            age);
-                    return PfsKeyStatus::fresh;
-                }
-                log::debug(
-                        cat,
-                        "prefetch_pfs_keys: cached key for {} is stale ({} old), re-fetching",
-                        session_id,
-                        age);
-                status = PfsKeyStatus::stale;
-            } else if (nak_at) {
-                auto age = clock_now_s() - from_epoch_s(*nak_at);
-                if (age < PFS_KEY_NAK_DURATION) {
-                    log::debug(
-                            cat,
-                            "prefetch_pfs_keys: recent NAK for {} ({} old), skipping",
-                            session_id,
-                            age);
-                    return PfsKeyStatus::nak;
-                }
-                log::debug(
-                        cat,
-                        "prefetch_pfs_keys: expired NAK for {} ({} old), re-fetching",
-                        session_id,
-                        age);
-            }
-        } else {
-            log::debug(cat, "prefetch_pfs_keys: no cached key for {}, fetching", session_id);
-        }
+PfsKeyInfo Core::pfs_key_info(std::span<const std::byte, 33> session_id) {
+    b33 sid;
+    std::ranges::copy(session_id, sid.begin());
+    PfsKeyInfo info{.fetching = call_get([this, &sid] { return _pfs_fetching.contains(sid); })};
+    auto conn = db.conn();
+    auto row = read_pfs_row(conn, sid);
+    if (!row)
+        return info;
+    info.state = row->state();
+    info.x25519_pub = row->x25519_pub;
+    info.mlkem768_pub = row->mlkem768_pub;
+    info.checked_at = row->checked_at;
+    info.confirmed_at = row->confirmed_at;
+    info.cache_expiry = row->cache_expiry;
+    return info;
+}
+
+void Core::refetch_pfs_keys(std::span<const std::byte, 33> session_id) {
+    if (!_network)
+        throw std::logic_error{"refetch_pfs_keys called without a network object"};
+    b33 sid;
+    std::ranges::copy(session_id, sid.begin());
+    call_get([this, &sid] { _fetch_pfs_keys(sid); });
+}
+
+void Core::_fetch_pfs_keys(const b33& session_id) {
+    if (!_pfs_fetching.insert(session_id).second) {
+        log::debug(cat, "PFS key fetch for {} already in flight; joining it", session_id);
+        return;
     }
 
     // The swarm is indexed by the x25519 pubkey — the session_id without its 0x05 prefix.
     network::x25519_pubkey x25519_pub;
-    std::ranges::copy(session_id.subspan<1>(), x25519_pub.begin());
-
-    auto now_ms = epoch_ms(clock_now_ms());
+    std::ranges::copy(std::span{session_id}.subspan<1>(), x25519_pub.begin());
 
     // AccountPubkeys (-21) allows unauthenticated retrieve: no signature needed.
     nlohmann::json params = {
@@ -1371,7 +1563,7 @@ PfsKeyStatus Core::prefetch_pfs_keys(std::span<const std::byte, 33> session_id) 
             x25519_pub,
             "retrieve",
             [body = params.dump()](const network::service_node&) { return to_vector(body); },
-            [this, sid = std::move(sid)](SwarmResponse res) {
+            [this, sid = session_id](SwarmResponse res) {
                 if (!res.ok() || !res.body) {
                     log::warning(
                             cat,
@@ -1386,83 +1578,99 @@ PfsKeyStatus Core::prefetch_pfs_keys(std::span<const std::byte, 33> session_id) 
 
                 return _handle_pfs_response(sid, std::move(*res.body));
             });
-    return status;
 }
 
 bool Core::_store_pfs_keys(
         std::span<const std::byte, 33> session_id,
         std::span<const std::byte, 32> x25519_pub,
         std::span<const std::byte, 1184> mlkem768_pub) {
-    auto now_s = epoch_seconds(clock_now_s());
+    auto now = clock_now_s();
+    bool changed = false;
     auto conn = db.conn();
-    SQLite::Transaction tx{conn.sql};
-
-    bool is_unchanged = conn.prepared_maybe_get<int>(
-                                    R"(
-SELECT 1 FROM pfs_key_cache
-WHERE session_id = ? AND pubkey_x25519 = ? AND pubkey_mlkem768 = ?
-)",
-                                    session_id,
-                                    x25519_pub,
-                                    mlkem768_pub)
-                                .has_value();
-
-    conn.prepared_exec(
-            R"(
-INSERT INTO pfs_key_cache (session_id, fetched_at, nak_at, pubkey_x25519, pubkey_mlkem768)
-VALUES (?, ?, NULL, ?, ?)
-ON CONFLICT(session_id) DO UPDATE SET
-    fetched_at = excluded.fetched_at,
-    pubkey_x25519 = excluded.pubkey_x25519,
-    pubkey_mlkem768 = excluded.pubkey_mlkem768
-)",
-            session_id,
-            now_s,
-            x25519_pub,
-            mlkem768_pub);
-    tx.commit();
-    return !is_unchanged;
+    update_pfs_row(conn, session_id, [&](const std::optional<PfsCacheRow>& held) {
+        changed = !held || !held->has_key() || !std::ranges::equal(*held->x25519_pub, x25519_pub) ||
+                  !std::ranges::equal(*held->mlkem768_pub, mlkem768_pub);
+        PfsCacheRow row{
+                .checked_at = now,
+                .confirmed_at = now,
+                .cache_expiry = now + PFS_KEY_REFRESH,
+                .x25519_pub = b32{},
+                .mlkem768_pub = mlkem768_pubkey{}};
+        std::ranges::copy(x25519_pub, row.x25519_pub->begin());
+        std::ranges::copy(mlkem768_pub, row.mlkem768_pub->begin());
+        return row;
+    });
+    return changed;
 }
 
-void Core::_store_pfs_nak(std::span<const std::byte, 33> session_id) {
-    auto now_s = epoch_seconds(clock_now_s());
-    db.conn().prepared_exec(
-            R"(
-INSERT INTO pfs_key_cache (session_id, fetched_at, nak_at, pubkey_x25519, pubkey_mlkem768)
-VALUES (?, NULL, ?, NULL, NULL)
-ON CONFLICT(session_id) DO UPDATE SET nak_at = excluded.nak_at
-)",
-            session_id,
-            now_s);
+void Core::_store_pfs_empty(std::span<const std::byte, 33> session_id) {
+    auto now = clock_now_s();
+    auto conn = db.conn();
+    update_pfs_row(conn, session_id, [&](const std::optional<PfsCacheRow>& held) {
+        auto row = held.value_or(PfsCacheRow{});
+        if (row.has_key() && now - *row.confirmed_at < PFS_KEY_EMPTY_GRACE)
+            row.confirmed_at = now;
+        else
+            row.drop_key();
+        row.checked_at = now;
+        row.cache_expiry = now + PFS_KEY_EMPTY_HOLD;
+        return row;
+    });
 }
 
-void Core::_handle_pfs_response(std::span<const std::byte, 33> sid, std::string body) {
+void Core::_cache_own_pfs_key(
+        std::span<const std::byte, 32> x25519_pub, std::span<const std::byte, 1184> mlkem768_pub) {
     try {
+        _store_pfs_keys(globals.session_id(), x25519_pub, mlkem768_pub);
+    } catch (const std::exception& e) {
+        log::warning(cat, "Unable to cache our own published account key: {}", e.what());
+    }
+}
+
+bool Core::_store_pfs_failed(std::span<const std::byte, 33> session_id) {
+    auto now = clock_now_s();
+    bool usable = false;
+    auto conn = db.conn();
+    update_pfs_row(conn, session_id, [&](const std::optional<PfsCacheRow>& held) {
+        // A new row records only that a lookup was made: created already due, so that the state
+        // stays `none`.  A keyless row's expiry is left alone, since what an earlier empty answer
+        // said still holds.  A held key past the grace is made due at once: a refetch can fail
+        // inside its expiry.
+        auto row = held.value_or(PfsCacheRow{.cache_expiry = now});
+        usable = row.has_key() && now - *row.confirmed_at < PFS_KEY_FAILED_GRACE;
+        if (usable)
+            row.cache_expiry = now + PFS_KEY_FAILED_HOLD;
+        else if (row.has_key())
+            row.cache_expiry = std::min(row.cache_expiry, now);
+        row.checked_at = now;
+        return row;
+    });
+    return usable;
+}
+
+namespace {
+
+    struct AccountPubkeys {
+        b32 x25519;
+        mlkem768_pubkey mlkem768;
+    };
+
+    // The last validly signed keys in a retrieve of `sid`'s AccountPubkeys namespace, or nullopt
+    // when it holds none.  Throws when the response cannot be read at all, which is a failed lookup
+    // rather than an empty one.
+    std::optional<AccountPubkeys> parse_account_pubkeys(
+            std::span<const std::byte, 33> sid, std::string_view body) {
         auto json = nlohmann::json::parse(body);
         auto msgs_it = json.find("messages");
-        if (msgs_it == json.end() || !msgs_it->is_array()) {
-            log::warning(
-                    cat,
-                    "prefetch_pfs_keys: response missing or invalid "
-                    "'messages' array");
-            return;
-        }
+        if (msgs_it == json.end() || !msgs_it->is_array())
+            throw std::runtime_error{"response missing or invalid 'messages' array"};
 
-        // Strip the 0x05 prefix to get the x25519 pubkey for
-        // signature verification.
         auto x25519_pub = sid.subspan<1>();
-
-        // Track the most recently valid pubkeys seen across all messages.
-        std::optional<std::array<std::byte, 32>> pk_x25519;
-        std::optional<std::array<std::byte, MLKEM768_PUBLICKEYBYTES>> pk_mlkem768;
-
+        std::optional<AccountPubkeys> found;
         for (const auto& msg : *msgs_it) {
             auto data_it = msg.find("data");
             if (data_it == msg.end() || !data_it->is_string()) {
-                log::warning(
-                        cat,
-                        "prefetch_pfs_keys: message missing or "
-                        "non-string 'data' field");
+                log::warning(cat, "PFS key fetch: message missing or non-string 'data' field");
                 continue;
             }
             auto b64 = data_it->get<std::string_view>();
@@ -1481,32 +1689,33 @@ void Core::_handle_pfs_response(std::span<const std::byte, 33> sid, std::string 
                                 !xed25519::verify(sig.first<64>(), x25519_pub, b))
                                 throw std::runtime_error{"signature verification failed"};
                         });
-                std::ranges::copy(X, pk_x25519.emplace().begin());
-                std::ranges::copy(M, pk_mlkem768.emplace().begin());
+                auto& keys = found.emplace();
+                std::ranges::copy(X, keys.x25519.begin());
+                std::ranges::copy(M, keys.mlkem768.begin());
             } catch (const std::exception& e) {
-                log::warning(
-                        cat,
-                        "Ignoring malformed remote account pubkey "
-                        "message: {}",
-                        e.what());
+                log::warning(cat, "Ignoring malformed remote account pubkey message: {}", e.what());
             }
         }
-
-        if (!pk_x25519 || !pk_mlkem768) {
-            log::debug(
-                    cat,
-                    "prefetch_pfs_keys: no valid account pubkey message "
-                    "found in response");
-            _store_pfs_nak(sid);
-            _pfs_fetch_done(sid, PfsKeyFetch::not_found);
-            return;
-        }
-
-        bool changed = _store_pfs_keys(sid, *pk_x25519, *pk_mlkem768);
-        _pfs_fetch_done(sid, changed ? PfsKeyFetch::new_key : PfsKeyFetch::unchanged);
-    } catch (const std::exception& e) {
-        log::warning(cat, "Failed to process PFS key fetch response: {}", e.what());
+        return found;
     }
+
+}  // namespace
+
+void Core::_handle_pfs_response(std::span<const std::byte, 33> sid, std::string body) {
+    auto result = PfsKeyFetch::failed;
+    try {
+        if (auto keys = parse_account_pubkeys(sid, body)) {
+            result = _store_pfs_keys(sid, keys->x25519, keys->mlkem768) ? PfsKeyFetch::new_key
+                                                                        : PfsKeyFetch::unchanged;
+        } else {
+            log::debug(cat, "PFS key fetch: no valid account pubkey message for {}", sid);
+            _store_pfs_empty(sid);
+            result = PfsKeyFetch::not_found;
+        }
+    } catch (const std::exception& e) {
+        log::warning(cat, "Failed to process PFS key fetch response for {}: {}", sid, e.what());
+    }
+    _pfs_fetch_done(sid, result);
 }
 
 void Core::delete_from_swarm(
@@ -1679,58 +1888,43 @@ void Core::_do_send_dm(
         const ed25519::OptionalPrivKeySpan& pro_privkey,
         std::chrono::milliseconds ttl,
         bool force_v2) {
-    auto fire_status = [&](MessageSendStatus status) {
+    auto fire_status = [&](MessageSendStatus status,
+                           std::optional<MessageEncryption> encryption = std::nullopt) {
         if (callbacks.message_send_status) {
             try {
-                callbacks.message_send_status(message_id, status, std::nullopt);
+                callbacks.message_send_status(message_id, status, std::nullopt, encryption);
             } catch (const std::exception& e) {
                 log::error(cat, "message_send_status callback threw: {}", e.what());
             }
         }
     };
 
-    // Look up cached PFS keys for the recipient.
-    using X = sqlite::blob_guts<b32>;
-    using M = sqlite::blob_guts<std::array<std::byte, 1184>>;
-    auto row = db.conn()
-                       .prepared_maybe_get<
-                               std::optional<int64_t>,
-                               std::optional<int64_t>,
-                               std::optional<X>,
-                               std::optional<M>>(
-                               "SELECT fetched_at, nak_at, pubkey_x25519, pubkey_mlkem768"
-                               " FROM pfs_key_cache WHERE session_id = ?",
-                               recipient);
-
-    const b32* pfs_x25519 = nullptr;
-    const std::array<std::byte, 1184>* pfs_mlkem768 = nullptr;
-    if (row) {
-        auto& [fetched_at, nak_at, pk_x, pk_m] = *row;
-        if (fetched_at && pk_x && pk_m) {
-            pfs_x25519 = &static_cast<const b32&>(*pk_x);
-            pfs_mlkem768 = &static_cast<const std::array<std::byte, 1184>&>(*pk_m);
-        }
-    }
+    // Whatever key the row holds is one the rule says to send with: send_dm sends at once only when
+    // the row is `usable` or `nak`, and _pfs_fetch_done releases a waiting send only once the
+    // lookup's outcome has left it holding a key to use, or none.
+    auto conn = db.conn();
+    auto row = read_pfs_row(conn, recipient);
+    bool pfs = row && row->has_key();
 
     // Encrypt the message.  v2 (PFS or nopfs) produces the complete wire format directly
     // (0x00 0x02 | ki | E | mlkem_ct | encrypted_inner) — no protobuf wrapping.  v1 uses
     // encode_dm_v1 which wraps in Envelope + WebSocketMessage protobufs.
     std::vector<std::byte> payload;
+    MessageEncryption encryption;
     try {
         auto seed = globals.account_seed();
         auto ed_sec = seed.ed25519_secret();
 
-        std::string_view version;
-        if (pfs_x25519) {
+        if (pfs) {
             payload = encrypt_for_recipient_v2(
-                    ed_sec, recipient, *pfs_x25519, *pfs_mlkem768, content, pro_privkey);
-            version = "v2 PFS";
+                    ed_sec, recipient, *row->x25519_pub, *row->mlkem768_pub, content, pro_privkey);
+            encryption = MessageEncryption::v2_pfs;
         } else if (force_v2) {
             payload = encrypt_for_recipient_v2_nopfs(ed_sec, recipient, content, pro_privkey);
-            version = "v2 nopfs";
+            encryption = MessageEncryption::v2_basic;
         } else {
             payload = encode_dm_v1(content, ed_sec, sent_timestamp, recipient, pro_privkey);
-            version = "v1";
+            encryption = MessageEncryption::v1;
         }
 
         log::debug(
@@ -1738,7 +1932,9 @@ void Core::_do_send_dm(
                 "send_dm: message {} encrypted for {} as {} ({}B)",
                 message_id,
                 oxenc::to_hex(recipient),
-                version,
+                encryption == MessageEncryption::v2_pfs     ? "v2 PFS"
+                : encryption == MessageEncryption::v2_basic ? "v2 nopfs"
+                                                            : "v1",
                 payload.size());
     } catch (const std::exception& e) {
         log::warning(cat, "send_dm: encryption failed for message {}: {}", message_id, e.what());
@@ -1747,21 +1943,23 @@ void Core::_do_send_dm(
     }
 
     // Dispatch to swarm.
-    fire_status(MessageSendStatus::sending);
+    fire_status(MessageSendStatus::sending, encryption);
     try {
         _send_to_swarm(
                 recipient,
                 config::Namespace::Default,
                 std::move(payload),
                 ttl,
-                [this, message_id](bool success, std::optional<std::string_view> swarm_hash) {
+                [this, message_id, encryption](
+                        bool success, std::optional<std::string_view> swarm_hash) {
                     if (callbacks.message_send_status) {
                         try {
                             callbacks.message_send_status(
                                     message_id,
                                     success ? MessageSendStatus::success
                                             : MessageSendStatus::network_error,
-                                    swarm_hash);
+                                    swarm_hash,
+                                    success ? std::optional{encryption} : std::nullopt);
                         } catch (const std::exception& e) {
                             log::error(cat, "message_send_status callback threw: {}", e.what());
                         }
@@ -1773,6 +1971,22 @@ void Core::_do_send_dm(
 }
 
 void Core::_pfs_fetch_done(std::span<const std::byte, 33> session_id, PfsKeyFetch result) {
+    b33 sid;
+    std::ranges::copy(session_id, sid.begin());
+
+    // Recorded before the lookup stops counting as in flight, so that nothing reads the row a
+    // lookup is about to replace as though none were coming.
+    bool release = true;
+    if (result == PfsKeyFetch::failed) {
+        try {
+            release = _store_pfs_failed(sid);
+        } catch (const std::exception& e) {
+            log::error(cat, "Unable to record a failed PFS key fetch for {}: {}", sid, e.what());
+            release = false;
+        }
+    }
+    _pfs_fetching.erase(sid);
+
     if (callbacks.pfs_keys_fetched) {
         try {
             callbacks.pfs_keys_fetched(session_id, result);
@@ -1781,28 +1995,89 @@ void Core::_pfs_fetch_done(std::span<const std::byte, 33> session_id, PfsKeyFetc
             log::error(cat, "pfs_keys_fetched callback threw: {}", e.what());
         }
     }
-    _flush_pending_sends(session_id);
+
+    if (release) {
+        _pfs_retries.erase(sid);
+        _flush_pending_sends(session_id);
+    } else {
+        _schedule_pfs_retry(sid);
+    }
+}
+
+void Core::_schedule_pfs_retry(const b33& session_id) {
+    // Ids rather than the sends, since a status callback may queue another send.
+    std::vector<int64_t> waiting;
+    for (const auto& p : _pending_sends | std::views::filter(sends_to(session_id)))
+        waiting.push_back(p.id);
+    if (waiting.empty()) {
+        _pfs_retries.erase(session_id);
+        return;
+    }
+    if (callbacks.message_send_status)
+        for (auto id : waiting) {
+            try {
+                callbacks.message_send_status(
+                        id, MessageSendStatus::retrying, std::nullopt, std::nullopt);
+            } catch (const std::exception& e) {
+                log::error(cat, "message_send_status callback threw: {}", e.what());
+            }
+        }
+
+    auto& retry = _pfs_retries[session_id];
+    if (retry.due)
+        return;
+    log::info(
+            cat,
+            "PFS key fetch for {} failed with sends waiting on it; retrying in {}",
+            session_id,
+            retry.backoff);
+    auto due = clock_now_ms() + retry.backoff;
+    retry.due = due;
+    // A retry superseded meanwhile -- by a lookup that succeeded, or one fired early -- finds a
+    // different `due`, or none, and does nothing.
+    _jq.call_later(retry.backoff, [this, session_id, due] {
+        if (auto it = _pfs_retries.find(session_id);
+            it != _pfs_retries.end() && it->second.due == due)
+            _retry_pfs_fetch(session_id);
+    });
+    retry.backoff = std::min(retry.backoff * 2, PFS_FETCH_RETRY_MAX);
+}
+
+void Core::_retry_pfs_fetch(const b33& session_id) {
+    auto it = _pfs_retries.find(session_id);
+    if (it == _pfs_retries.end())
+        return;
+    it->second.due.reset();
+    if (std::ranges::none_of(_pending_sends, sends_to(session_id))) {
+        _pfs_retries.erase(it);
+        return;
+    }
+    log::debug(cat, "Retrying the PFS key fetch for {}", session_id);
+    _fetch_pfs_keys(session_id);
 }
 
 void Core::_flush_pending_sends(std::span<const std::byte, 33> session_id) {
-    auto it = _pending_sends.begin();
-    while (it != _pending_sends.end()) {
-        if (std::ranges::equal(it->recipient, session_id)) {
-            auto pending = std::move(*it);
+    // Taken out before any is sent: a send's status callback may queue another.
+    std::vector<PendingSend> ready;
+    auto is_ready = sends_to(session_id);
+    for (auto it = _pending_sends.begin(); it != _pending_sends.end();) {
+        if (is_ready(*it)) {
+            ready.push_back(std::move(*it));
             it = _pending_sends.erase(it);
-            _do_send_dm(
-                    pending.id,
-                    pending.recipient,
-                    pending.content,
-                    pending.sent_timestamp,
-                    pending.pro_privkey ? ed25519::OptionalPrivKeySpan{*pending.pro_privkey}
-                                        : ed25519::OptionalPrivKeySpan{},
-                    pending.ttl,
-                    pending.force_v2);
         } else {
             ++it;
         }
     }
+    for (auto& pending : ready)
+        _do_send_dm(
+                pending.id,
+                pending.recipient,
+                pending.content,
+                pending.sent_timestamp,
+                pending.pro_privkey ? ed25519::OptionalPrivKeySpan{*pending.pro_privkey}
+                                    : ed25519::OptionalPrivKeySpan{},
+                pending.ttl,
+                pending.force_v2);
 }
 
 int64_t Core::send_dm(
@@ -1812,39 +2087,31 @@ int64_t Core::send_dm(
         const ed25519::OptionalPrivKeySpan& pro_privkey,
         std::chrono::milliseconds ttl,
         bool force_v2) {
-    auto id = _next_message_id++;
+    // On the loop, which owns the pending sends and the lookups they wait on.
+    return call_get([&] {
+        auto id = _next_message_id++;
 
-    log::debug(
-            cat,
-            "send_dm: message {} to {} ({}B content)",
-            id,
-            oxenc::to_hex(recipient_session_id),
-            content.size());
+        log::debug(
+                cat,
+                "send_dm: message {} to {} ({}B content)",
+                id,
+                oxenc::to_hex(recipient_session_id),
+                content.size());
 
-    // Check cache state to decide whether we can send immediately or must queue.
-    auto conn = db.conn();
-    auto row = conn.prepared_maybe_get<std::optional<int64_t>, std::optional<int64_t>>(
-            "SELECT fetched_at, nak_at FROM pfs_key_cache WHERE session_id = ?",
-            recipient_session_id);
+        auto conn = db.conn();
+        if (!lookup_due(pfs_key_state(read_pfs_row(conn, recipient_session_id)))) {
+            _do_send_dm(
+                    id, recipient_session_id, content, sent_timestamp, pro_privkey, ttl, force_v2);
+            return id;
+        }
+        if (!_network) {
+            if (callbacks.message_send_status)
+                callbacks.message_send_status(
+                        id, MessageSendStatus::no_network, std::nullopt, std::nullopt);
+            return id;
+        }
 
-    bool have_cached_key = false;
-    bool is_nak = false;
-
-    if (row) {
-        auto& [fetched_at, nak_at] = *row;
-        if (fetched_at)
-            have_cached_key = true;
-        else if (nak_at)
-            is_nak = true;
-    }
-
-    if (have_cached_key || is_nak) {
-        // Can send immediately: either we have keys (use v2 PFS) or it's a NAK (use v1 or v2
-        // nopfs).
-        _do_send_dm(id, recipient_session_id, content, sent_timestamp, pro_privkey, ttl, force_v2);
-    } else if (_network) {
-        // No cache entry at all: need to fetch keys first.  Queue the send and initiate a
-        // prefetch; _pfs_fetch_done() releases it when the fetch settles, whatever the outcome.
+        // _pfs_fetch_done releases it once the lookup's outcome says how to encrypt it.
         PendingSend pending;
         pending.id = id;
         std::ranges::copy(recipient_session_id, pending.recipient.begin());
@@ -1858,17 +2125,22 @@ int64_t Core::send_dm(
         pending.force_v2 = force_v2;
         _pending_sends.push_back(std::move(pending));
 
+        // One arriving while a failed lookup's retry is scheduled waits for that retry, so that a
+        // burst of sends cannot undo the backoff.
+        b33 sid;
+        std::ranges::copy(recipient_session_id, sid.begin());
+        auto retry = _pfs_retries.find(sid);
+        bool join_retry = retry != _pfs_retries.end() && retry->second.due;
         if (callbacks.message_send_status)
-            callbacks.message_send_status(id, MessageSendStatus::awaiting_keys, std::nullopt);
-
-        prefetch_pfs_keys(recipient_session_id);
-    } else {
-        // No cache and no network: fire immediate failure.
-        if (callbacks.message_send_status)
-            callbacks.message_send_status(id, MessageSendStatus::no_network, std::nullopt);
-    }
-
-    return id;
+            callbacks.message_send_status(
+                    id,
+                    join_retry ? MessageSendStatus::retrying : MessageSendStatus::awaiting_keys,
+                    std::nullopt,
+                    std::nullopt);
+        if (!join_retry)
+            _fetch_pfs_keys(sid);
+        return id;
+    });
 }
 
 int64_t Core::send_dm(
@@ -1973,10 +2245,9 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
                     out.timestamp = msg.timestamp;
                     out.expiry = msg.expiry;
                     out.sender_session_id = result.sender_session_id;
-                    out.version = 2;
+                    out.encryption = MessageEncryption::v2_pfs;
                     out.content = std::move(result.content);
                     out.pro_signature = result.pro_signature;
-                    out.pfs_encrypted = true;
                     fire_received(std::move(out));
                     decrypted = true;
                     break;
@@ -2000,10 +2271,9 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
                     out.timestamp = msg.timestamp;
                     out.expiry = msg.expiry;
                     out.sender_session_id = result.sender_session_id;
-                    out.version = 2;
+                    out.encryption = MessageEncryption::v2_basic;
                     out.content = std::move(result.content);
                     out.pro_signature = result.pro_signature;
-                    // pfs_encrypted remains false (default)
                     fire_received(std::move(out));
                 } catch (const DecryptV2Error&) {
                     // Non-PFS fallback also failed: message cannot be read.
@@ -2023,7 +2293,7 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
                 out.hash = msg.hash;
                 out.timestamp = msg.timestamp;
                 out.expiry = msg.expiry;
-                out.version = 1;
+                out.encryption = MessageEncryption::v1;
                 // Reconstruct the 33-byte (0x05-prefixed) session ID from the x25519 pubkey.
                 out.sender_session_id[0] = std::byte{0x05};
                 std::ranges::copy(decoded.sender_x25519_pubkey, out.sender_session_id.begin() + 1);
@@ -2037,6 +2307,116 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
             }
         }
     }
+}
+
+void Core::_swarm_push(
+        std::vector<SwarmStore> stores,
+        std::vector<std::string> obsolete,
+        std::function<void(std::optional<std::vector<SwarmStoreResult>>)> done) {
+
+    // A caller's bug: every caller has something to send by the time it gets here.  Logged as well
+    // as asserted, since the assert is gone from a release build; and `done` is not called either
+    // way, which is what the caller would see.
+    if (stores.empty() && obsolete.empty()) {
+        log::error(cat, "_swarm_push called with nothing to store and nothing to delete");
+        assert(false);
+        return;
+    }
+
+    auto now_ms = epoch_ms(clock_now_ms());
+    auto pubkey_hex = globals.session_id_hex();
+    auto ed25519_hex = globals.pubkey_ed25519().hex();
+
+    auto sign = [this](std::string_view value) {
+        b64 sig;
+        auto seed = globals.account_seed();
+        ed25519::sign(sig, seed.ed25519_secret(), std::as_bytes(std::span{value}));
+        return "{:b}"_format(sig);
+    };
+
+    auto requests = nlohmann::json::array();
+    for (const auto& s : stores) {
+        auto ns_val = static_cast<int16_t>(s.ns);
+        nlohmann::json params = {
+                {"pubkey", pubkey_hex},
+                {"namespace", ns_val},
+                {"data", "{:b}"_format(s.data)},
+                {"timestamp", now_ms},
+                {"ttl", s.ttl.count()},
+                {"pubkey_ed25519", ed25519_hex},
+                {"sig_timestamp", now_ms},
+                {"signature", sign(ns_signature_value("store", ns_val, now_ms))},
+        };
+        requests.push_back({{"method", "store"}, {"params", std::move(params)}});
+    }
+
+    // Last, and one subrequest for all of them: they go to the same pubkey's swarm, and putting the
+    // delete after every store is what stops a message being dropped before its replacement exists.
+    if (!obsolete.empty()) {
+        nlohmann::json params = {
+                {"pubkey", pubkey_hex},
+                {"pubkey_ed25519", ed25519_hex},
+                {"messages", obsolete},
+                // Signed over the hashes in the order they are sent, so the two must not be
+                // reordered independently.
+                {"signature", sign(delete_signature_value(obsolete))},
+        };
+        requests.push_back({{"method", "delete"}, {"params", std::move(params)}});
+    }
+
+    auto body = to_vector<std::byte>(nlohmann::json{{"requests", std::move(requests)}}.dump());
+
+    log::debug(
+            cat,
+            "Pushing {} message(s) to the swarm, obsoleting {}",
+            stores.size(),
+            obsolete.size());
+
+    // Unlike a poll's, this body does not depend on which member it goes to.
+    _swarm_request(
+            globals.pubkey_x25519(),
+            "sequence",
+            [body = std::move(body)](const network::service_node&) { return body; },
+            [count = stores.size(), done = std::move(done)](SwarmResponse res) {
+                if (!done)
+                    return;
+
+                if (!res.ok() || !res.body) {
+                    log::warning(
+                            cat,
+                            "Swarm push failed ({}): {}",
+                            res.timeout ? "timed out" : "status {}"_format(res.status_code),
+                            res.body.value_or("no response body"));
+                    return done(std::nullopt);
+                }
+
+                std::vector<SwarmStoreResult> out(count);
+                try {
+                    auto json = nlohmann::json::parse(*res.body);
+                    auto results = json.find("results");
+                    if (results == json.end() || !results->is_array()) {
+                        log::warning(cat, "Swarm push response carried no results");
+                        return done(std::nullopt);
+                    }
+
+                    for (size_t i = 0; i < count && i < results->size(); i++) {
+                        const auto& r = (*results)[i];
+                        auto code = r.find("code");
+                        auto b = r.find("body");
+                        if (code == r.end() || code->get<int>() != 200 || b == r.end())
+                            continue;
+                        auto h = b->find("hash");
+                        if (h == b->end() || !h->is_string())
+                            continue;
+                        out[i] = {.stored = true, .hash = h->get<std::string>()};
+                    }
+                } catch (const std::exception& e) {
+                    log::warning(cat, "Could not read swarm push response: {}", e.what());
+                    return done(std::nullopt);
+                }
+
+                done(std::move(out));
+            });
 }
 
 void Core::receive_messages(

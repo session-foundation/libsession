@@ -9,6 +9,16 @@ using namespace std::literals;
 // Default timeout for live network operations.
 static constexpr auto LIVE_TIMEOUT = 30s;
 
+// What `core` holds of `sid`'s keys once a lookup of them has completed.
+static std::optional<core::PfsKeyInfo> wait_for_lookup(core::Core& core, const b33& sid) {
+    return wait_for(
+            [&] {
+                auto info = core.pfs_key_info(sid);
+                return info.checked_at && !info.fetching ? std::optional{info} : std::nullopt;
+            },
+            LIVE_TIMEOUT);
+}
+
 TEST_CASE("Live: PFS key prefetch returns NAK for account with no published keys", "[live][pfs]") {
     // Core A is a fresh account that has never published its AccountPubkeys to the swarm.
     // Core B fetches keys for Core A's session id and should receive a NAK (empty namespace).
@@ -20,12 +30,11 @@ TEST_CASE("Live: PFS key prefetch returns NAK for account with no published keys
 
     core_b->prefetch_pfs_keys(sid_a);
 
-    auto entry = wait_for(
-            [&] { return session::TestHelper::pfs_cache_entry(*core_b, sid_a); }, LIVE_TIMEOUT);
-    REQUIRE(entry.has_value());
-    // NAK: fetch completed but no keys were present.
-    CHECK_FALSE(entry->fetched_at.has_value());
-    CHECK(entry->nak_at.has_value());
+    auto info = wait_for_lookup(*core_b, sid_a);
+    REQUIRE(info);
+    CHECK(info->state == core::PfsKeyState::nak);
+    CHECK_FALSE(info->confirmed_at);
+    CHECK_FALSE(info->x25519_pub);
 }
 
 TEST_CASE("Live: PFS key prefetch retrieves keys after store to swarm", "[live][pfs]") {
@@ -42,18 +51,14 @@ TEST_CASE("Live: PFS key prefetch retrieves keys after store to swarm", "[live][
 
     core_b->prefetch_pfs_keys(sid_a);
 
-    auto entry = wait_for(
-            [&] { return session::TestHelper::pfs_cache_entry(*core_b, sid_a); }, LIVE_TIMEOUT);
-    REQUIRE(entry.has_value());
-    // Successful fetch: keys present, no NAK.
-    REQUIRE(entry->fetched_at.has_value());
-    CHECK_FALSE(entry->nak_at.has_value());
+    auto info = wait_for_lookup(*core_b, sid_a);
+    REQUIRE(info);
+    CHECK(info->state == core::PfsKeyState::usable);
+    CHECK(info->confirmed_at == info->checked_at);
 
     // The fetched pubkeys must match what Core A has as its active account keys.
     auto [expected_x25519, expected_mlkem768] =
             session::TestHelper::active_account_pubkeys(*core_a);
-    REQUIRE(entry->pubkey_x25519.has_value());
-    REQUIRE(entry->pubkey_mlkem768.has_value());
-    CHECK(*entry->pubkey_x25519 == expected_x25519);
-    CHECK(*entry->pubkey_mlkem768 == expected_mlkem768);
+    CHECK(info->x25519_pub == expected_x25519);
+    CHECK(info->mlkem768_pub == expected_mlkem768);
 }

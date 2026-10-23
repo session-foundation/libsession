@@ -129,6 +129,7 @@ TEST_CASE("Configs: a fresh account starts with its defaults", "[core][configs]"
         // shared -- the account's other devices have to be told, or they would each invent their
         // own answer.
         CHECK(c->configs.user_profile().get_nts_priority() == -1);
+        CHECK(c->configs.user_profile().get_min_message_version() == 2);
         CHECK(c->configs.needs_push());
         CHECK(stored_dumps(c) == 1);
 
@@ -139,6 +140,32 @@ TEST_CASE("Configs: a fresh account starts with its defaults", "[core][configs]"
         settle_new_account(c);
         CHECK_FALSE(c->configs.needs_push());
     });
+}
+
+TEST_CASE("Configs: enabling PFS/PQ raises the account's lowest version, once", "[core][configs]") {
+    std::array<std::byte, 32> seed;
+    random::fill(seed);
+    TempCore c{core::predefined_seed{std::span<const std::byte, 32>{seed}}};
+
+    // Restored, so not enabled, and nothing owed.
+    CHECK_FALSE(c->pfs_enabled());
+    TestHelper::on_loop(*c, [&] { REQUIRE_FALSE(c->configs.needs_push()); });
+
+    // Enabled, which is a config change like any other, owed to the account's other devices.
+    c->enable_pfs();
+    CHECK(c->pfs_enabled());
+    TestHelper::on_loop(*c, [&] {
+        CHECK(c->configs.user_profile().get_min_message_version() == 2);
+        CHECK(c->configs.needs_push());
+    });
+
+    // Again, and on an account already past it: nothing to do, and never a step down.
+    c->enable_pfs();
+    TestHelper::on_loop(*c, [&] { c->configs.user_profile().set_min_message_version(3); });
+    c->enable_pfs();
+    CHECK(c->pfs_enabled());
+    TestHelper::on_loop(
+            *c, [&] { CHECK(c->configs.user_profile().get_min_message_version() == 3); });
 }
 
 TEST_CASE("Configs: a namespace names exactly one config", "[core][configs]") {

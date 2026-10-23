@@ -7,6 +7,7 @@
 #include <session/client/attachment.hpp>
 #include <session/client/conversation_id.hpp>
 #include <session/clock.hpp>
+#include <session/core/message_encryption.hpp>
 #include <session/util.hpp>
 #include <string>
 #include <vector>
@@ -173,6 +174,12 @@ struct Message {
     /// Unset on an incoming message, and on a note to self, where the recipient's swarm is our own
     /// and `send_state` already describes the only send there was.
     std::optional<SendState> sync_send_state;
+
+    /// How the message was encrypted.  For an incoming message, what its envelope used.  For an
+    /// outgoing one, what it was sent to its recipient with: unset until Core has encrypted it --
+    /// which can wait on fetching the recipient's keys -- and unset for a message from before this
+    /// was recorded.
+    std::optional<core::MessageEncryption> encryption;
 
     /// Swarm-assigned hash of the copy of this message held in *our own* swarm: for an incoming
     /// message the one we retrieved, and for an outgoing one the copy we deposit for our other

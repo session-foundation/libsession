@@ -30,6 +30,65 @@ TEST_CASE("Client: a received DM creates a conversation and a message", "[client
     CHECK_FALSE(c->message(msgs[0].id + 1000, await).has_value());
 }
 
+TEST_CASE("Client: a received message records how it was encrypted", "[client][receive]") {
+    TempClient c;
+    SenderKeys sender;
+    approve(*c, sender.session_id);
+
+    auto encryption = GENERATE(
+            core::MessageEncryption::v1,
+            core::MessageEncryption::v2_basic,
+            core::MessageEncryption::v2_pfs);
+    deliver(*c,
+            sender,
+            "hello there",
+            from_epoch_ms(5000),
+            "hash1",
+            "",
+            std::nullopt,
+            nullptr,
+            std::nullopt,
+            encryption);
+
+    auto msgs = c->conversation(ConversationId::dm(sender.session_id), await)->messages(await);
+    REQUIRE(msgs.size() == 1);
+    CHECK(msgs[0].encryption == encryption);
+}
+
+TEST_CASE("Client: a sent message records how it went to its recipient", "[client][send]") {
+    TempClient c;
+    auto* net = attach_mock_network(c->core);
+    TestHelper::seed_pfs_nak(c->core, own_sid(*c));
+
+    TempCore peer;
+    b33 peer_sid;
+    std::ranges::copy(peer->globals.session_id(), peer_sid.begin());
+    auto convo = ConversationId::dm(peer_sid);
+
+    SECTION("to a contact with no published keys: v1") {
+        TestHelper::seed_pfs_nak(c->core, peer_sid);
+        auto id = c->send_message(convo, {.body = "basic"}, await);
+        // Known once Core has encrypted it, which here is at once.
+        CHECK(c->message(id, await)->encryption == core::MessageEncryption::v1);
+    }
+
+    SECTION("to a contact with keys: PFS+PQ") {
+        peer->devices.active_account_keys();
+        auto [x25519, mlkem768] = TestHelper::active_account_pubkeys(*peer);
+        TestHelper::seed_pfs_cache(c->core, peer_sid, x25519, mlkem768);
+        auto id = c->send_message(convo, {.body = "pfs"}, await);
+        CHECK(c->message(id, await)->encryption == core::MessageEncryption::v2_pfs);
+    }
+
+    SECTION("waiting on the contact's keys: not known yet") {
+        auto id = c->send_message(convo, {.body = "waiting"}, await);
+        CHECK_FALSE(c->message(id, await)->encryption);
+    }
+
+    // The sync copy, encrypted to us, does not change it once answered.
+    accept_stores(*net);
+}
+
 TEST_CASE(
         "Client: our own sent message lands in the recipient's conversation", "[client][receive]") {
     TempClient c;

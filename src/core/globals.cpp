@@ -150,14 +150,22 @@ void Globals::_adopt_seed(const cleared_b32& seed, bool persist) {
     log::info(cat, "Initialized with Session ID: {}", _session_id_hex);
 }
 
-// Generates the 16-byte/128-bit seed that Session accounts use: 16 random bytes followed by 16
-// zeros.
-// FIXME: we should allow full 32-byte seeds here.
-static cleared_b32 generate_seed() {
-    cleared_b32 seed;
-    random::fill(std::span{seed}.first<16>());
-    std::memset(seed.data() + 16, 0, 16);
+// A 128-bit seed is the first 16 bytes of the 32, with the rest zero: that is what `seed_mnemonic`
+// recognises as encodable in 13 words.
+static cleared_b32 generate_seed(SeedSize size) {
+    cleared_b32 seed{};
+    if (size == SeedSize::Bits128)
+        random::fill(std::span{seed}.first<16>());
+    else
+        random::fill(seed);
     return seed;
+}
+
+void Globals::_adopt_new_account(SeedSize size) {
+    log::info(cat, "Generated new Session account seed");
+    _adopt_seed(generate_seed(size), true);
+    core.configs.initialise_new_account();
+    core.devices._mark_group_owed();
 }
 
 void Globals::init() {
@@ -171,10 +179,7 @@ void Globals::init() {
         _adopt_seed(*_predefined_seed, true);
         _predefined_seed.reset();  // Clear now that it has been consumed
     } else if (!_defer_account) {
-        log::info(cat, "Generated new Session account seed");
-        _adopt_seed(generate_seed(), true);
-        core.configs.initialise_new_account();
-        _mark_new_account();
+        _adopt_new_account(SeedSize::Bits128);
     } else {
         // defer_account, and nothing stored: the application chooses an identity before this
         // account can do anything.  Nothing else in Core needs the seed at init time -- Devices
@@ -185,37 +190,27 @@ void Globals::init() {
     tx.commit();
 }
 
-void Globals::create_account(result_function<> cb) {
-    async([this] { _create_account(); }, std::move(cb));
+void Globals::create_account(SeedSize size, result_function<> cb) {
+    async([this, size] { _create_account(size); }, std::move(cb));
 }
 
-void Globals::create_account(await_t) {
-    jq().call_get([this] { _create_account(); });
+void Globals::create_account(SeedSize size, await_t) {
+    jq().call_get([this, size] { _create_account(size); });
 }
 
-void Globals::_create_account() {
+void Globals::_create_account(SeedSize size) {
     assert(on_loop());
     if (_have_account)
         throw std::logic_error{"This account already has an identity"};
     auto c = conn();
     SQLite::Transaction tx{c.sql};
-    log::info(cat, "Generated new Session account seed");
-    _adopt_seed(generate_seed(), true);
-    core.configs.initialise_new_account();
-    _mark_new_account();
+    _adopt_new_account(size);
     tx.commit();
 
     // After the commit, not inside it: establishing the group opens transactions of its own, and
     // this connection is thread-unique, so nesting would fail.  Safe to defer -- the flag written
     // above is what survives a crash here, and Devices::init() acts on it next time.
     core.devices.establish_group();
-}
-
-// A generated account owes a device group; a restored one does not, since it may already have one
-// belonging to devices that are simply offline.  Recorded rather than acted on here because Devices
-// initialises after this component and has no device id yet during init.
-void Globals::_mark_new_account() {
-    core.devices._mark_group_owed();
 }
 
 void Globals::restore_account(predefined_seed seed, result_function<> cb) {

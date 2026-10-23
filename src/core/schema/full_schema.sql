@@ -8,26 +8,40 @@
 -- Table storing all the device group info
 CREATE TABLE devices (
     id INTEGER PRIMARY KEY NOT NULL,
-    unique_id BLOB UNIQUE NOT NULL CHECK(length(unique_id) == 32),
+    unique_id BLOB UNIQUE NOT NULL CHECK(length(unique_id) == 16),
 
-    -- Membership rank: 0 unregistered, 1 pending, 2 registered, 3 kicked.  Ordered least to most
-    -- authoritative because merging compares (state, seqno) as a row value -- see device::State.
-    state INTEGER NOT NULL CHECK(state >= 0 AND state <= 3),
-    processing INTEGER,  -- non-null during batch processing: 1=new link request, 2=newly registered, 3=newly removed
+    -- Membership rank: 0 unregistered, 1 pending, 2 registered, 3 left, 4 kicked.  Ordered least to
+    -- most authoritative because merging compares (state, seqno) as a row value -- see
+    -- device::State.
+    state INTEGER NOT NULL CHECK(state >= 0 AND state <= 4),
+    -- For our own row, that of the record the swarm holds for us (0 for none yet), which the next
+    -- record we publish counts on from: our row mirrors the swarm, and is never what we publish.
     seqno INTEGER NOT NULL DEFAULT 1,
-    pushed_seqno INTEGER,         -- seqno of the last confirmed device group push; NULL = never pushed
-    broadcast_needed INTEGER NOT NULL DEFAULT 0,  -- 1 when a state transition (registered/removed) needs broadcasting
+    -- Nonzero while a state transition this device made (registered/removed) has yet to go out in
+    -- a push of ours: a generation, bumped each time one is owed, so that a confirmed push clears
+    -- it only if nothing was owed again while it was in flight.
+    broadcast_needed INTEGER NOT NULL DEFAULT 0,
     timestamp INTEGER NOT NULL,
-    kicked_timestamp INTEGER,  -- set when the device was kicked from the device group
+    kicked_timestamp INTEGER CHECK(kicked_timestamp > 0),  -- when the device was removed, or left
+    -- 1 for a device this one removed, which is what has it replace at once an account key the
+    -- removed device turns out to hold, where every other member waits a jittered while: only the
+    -- remover knows it is one, so its zero delay collides with nobody's.
+    removed_by_us INTEGER NOT NULL DEFAULT 0 CHECK(removed_by_us IN (0, 1)),
     device_type TEXT NOT NULL, -- typically a/i/d (Android/iOS/Desktop), but can be anything
     description TEXT NOT NULL, -- freeform device description
     version INTEGER NOT NULL, -- = 1000000*V + 1000*v + p for version "V.v.p"
     pubkey_mlkem768 BLOB NOT NULL CHECK(length(pubkey_mlkem768) == 1184),
     pubkey_x25519 BLOB NOT NULL CHECK(length(pubkey_x25519) == 32),
 
-    -- A kick is the one state that carries a timestamp, and is meaningless without one, so the two
-    -- are tied together here rather than left to each call site to remember.
-    CHECK((state == 3) == (kicked_timestamp IS NOT NULL))
+    -- Blake2b over the record as it was encoded, and the last term of the merge comparison: two
+    -- records at the same state and seqno are the same record unless their contents differ, and
+    -- without this the earlier arrival simply wins and two devices disagree forever.  Only a bug or
+    -- a forgery produces that, so the ordering only has to be consistent, not meaningful.
+    digest BLOB CHECK(digest IS NULL OR length(digest) == 8),
+
+    -- The two tombstone states are the only ones that carry a timestamp, and are meaningless without
+    -- one, so the two are tied together here rather than left to each call site to remember.
+    CHECK((state >= 3) == (kicked_timestamp IS NOT NULL))
 ) STRICT;
 
 -- This table holds any extra info not captured by the above.  The data is stored as key/value pairs
@@ -49,14 +63,128 @@ CREATE TABLE device_unknown (
 -- the short authentication string emoji are derived (stored to avoid re-running the expensive
 -- hash on every display).
 CREATE TABLE device_link_requests (
-    -- The `reqid` the application is given to tell requests apart, and to match a request to the
-    -- device_added that follows it.  AUTOINCREMENT because rows go -- accepted, or aged out -- and
-    -- without it the next request would take the id of the newest one gone, so an application
-    -- still holding that id would take one device's request for another's.
+    -- What the `reqid` an application is given maps to, for as long as this run holds it.
+    -- AUTOINCREMENT because rows are deleted, and without it the next request would take the id of
+    -- the newest one gone, and with it anything still held against that id: the reqid an
+    -- application knows the old request by, and whether that request has ended.
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    device INTEGER UNIQUE NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    -- Not unique: a device that asks twice gets two rows.  This is the log of requests this device
+    -- saw, not the set of requests outstanding, so a superseded or answered one stays readable.
+    device INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     received_at INTEGER NOT NULL,  -- unix timestamp of when this request was stored locally
-    sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16)  -- 16-byte Argon2id output for SAS display
+    -- When the swarm said it would drop the message.  Authoritative for the deadline shown to a
+    -- user: a request published shortly before we polled has less time left than its full TTL, and
+    -- counting from received_at would show a countdown that outlives the request itself.
+    expires_at INTEGER NOT NULL,
+    -- 0 pending, 1 accepted, 2 ignored, 3 superseded.  Expiry is deliberately not among them: it is
+    -- `status = 0 AND expires_at <= now`, so there is no flag to fall out of step with the
+    -- timestamp that decides it.
+    status INTEGER NOT NULL DEFAULT 0 CHECK(status >= 0 AND status <= 3),
+    sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16),  -- 16-byte Argon2id output for SAS display
+    -- The swarm's hash for the message the request arrived in, which is what deleting it from the
+    -- swarm names.
+    hash TEXT NOT NULL,
+    -- The device record the request asks to have admitted, bt-encoded as it was signed.  Kept here
+    -- rather than read from `devices` because a device already in the group keeps the record it has
+    -- there, keys and all, until a request replacing it is accepted.
+    info BLOB NOT NULL,
+    -- 1 if the device was already in the group when it asked, so accepting replaces its record.
+    replaces INTEGER NOT NULL DEFAULT 0 CHECK(replaces IN (0, 1))
+) STRICT;
+CREATE INDEX device_link_requests_device ON device_link_requests(device);
+
+-- Device group messages whose contents we have taken in, and which our own next push therefore
+-- makes redundant.
+--
+-- A "G" is not one device's contribution but a complete snapshot of the whole group as its author
+-- saw it, so obsolescence has nothing to do with who wrote it: once we have merged one, the message
+-- we push next carries everything it said, and a device that never fetched it gets the same content
+-- from ours.  Leaving them costs a copy per push per device for the full 30-day TTL, and leaves a
+-- device that goes away permanently littering the namespace with snapshots nobody can clear.
+--
+-- Only messages we could decrypt are ever listed.  One we cannot read belongs to a group we are not
+-- in, and our push carries none of it -- deleting that would destroy another group's state rather
+-- than tidy up our own.
+CREATE TABLE device_group_merged (
+    hash TEXT PRIMARY KEY NOT NULL
+) STRICT;
+
+-- The device groups this device has seen messages from in the swarm, its own included: what a device
+-- asking to join chooses among, and what tells a device that another group exists alongside its own.
+-- One row per group, kept up to date from the newest of its messages seen.
+--
+-- Kept rather than worked out afresh at each fetch, because fetches are incremental: a message is
+-- delivered once, by the fetch after it arrives, and a group whose devices are quiet would otherwise
+-- vanish from view at the next restart.
+CREATE TABLE device_groups (
+    group_id BLOB PRIMARY KEY NOT NULL CHECK(length(group_id) == 8),
+    -- The X25519 half of the group's account key, as its newest message published it: what a link
+    -- request asking to join the group is encrypted to.
+    link_x25519 BLOB NOT NULL CHECK(length(link_x25519) == 32),
+    seen_at INTEGER NOT NULL,     -- signed time of the newest message seen, unix seconds
+    -- The latest expiry among the messages seen, unix seconds.  The group is in the swarm until
+    -- then, as far as fetching can tell: a deletion is not something a fetch reports.
+    expires_at INTEGER NOT NULL
+) STRICT;
+
+-- The swarm hashes of the group messages seen, every group's: what dissolving a group deletes from
+-- the swarm.  Kept until the swarm drops each message, after which there is nothing to delete.
+CREATE TABLE device_group_messages (
+    hash TEXT PRIMARY KEY NOT NULL,
+    group_id BLOB NOT NULL CHECK(length(group_id) == 8),
+    expires_at INTEGER NOT NULL  -- unix seconds
+) STRICT;
+CREATE INDEX device_group_messages_group ON device_group_messages(group_id);
+
+-- The groups this device knows to be dissolved, by a tombstone it saw or one it published.  A
+-- tombstone lives only as long as any message does, and this is what lets a device in a group that
+-- sees a dissolved group in the swarm again dissolve it again.  Kept for good, whatever group the
+-- device goes on to, except for a group it is itself admitted to: joining that is the user's
+-- later choice.
+CREATE TABLE device_dissolved_groups (
+    group_id BLOB PRIMARY KEY NOT NULL CHECK(length(group_id) == 8),
+    -- The signed time of the newest tombstone naming it, unix milliseconds: a message from the
+    -- group written later than this is the group back, where an older one is only left over.
+    dissolved_at INTEGER NOT NULL
+) STRICT;
+
+-- Pushes that outlive the state they were built from: a departure from a group this device has
+-- left, and a dissolution of another group.  Each row is the complete upload, written in the same
+-- transaction as the decision it announces, so that nothing the device forgets afterwards -- a
+-- group it left above all -- is needed to send it, and a push that fails, or never got to go before
+-- the device stopped, goes at the next fetch instead.  Deleted once the swarm confirms it, or unsent
+-- once it is older than a group message lives, when what it would replace has expired anyway.
+CREATE TABLE device_pending_pushes (
+    -- AUTOINCREMENT because a push in flight names its row, and a row dropped meanwhile must not
+    -- hand that id to a new one.
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    message BLOB,           -- the message to store, if any
+    obsolete BLOB NOT NULL, -- bt-encoded list of the swarm hashes to delete with it
+    created_at INTEGER NOT NULL
+) STRICT;
+
+-- The link requests this device has sent, so that a group message admitting it can be matched to
+-- the request it accepted, possibly after its deadline here has passed.  Only the newest is one the
+-- user can be shown, and so confirm; the SAS confirmed must be that very request's, since that is
+-- what the accepting device showed, and an admission matching none of them is not ours to take,
+-- since any holder of the account seed could have sent it.  The older ones are kept for as long as
+-- an admission on them could still arrive, so that the next request is stamped later than any of
+-- them and an admission on one can never be taken for the newest.
+CREATE TABLE device_own_requests (
+    id INTEGER PRIMARY KEY NOT NULL,
+    group_id BLOB NOT NULL CHECK(length(group_id) == 8),
+    -- With the X25519 key, what identifies the request in an admission: the record admitted is the
+    -- one the request carried.  Unique because each request is stamped later than the one before.
+    timestamp INTEGER UNIQUE NOT NULL,
+    pubkey_x25519 BLOB NOT NULL CHECK(length(pubkey_x25519) == 32),
+    sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16),
+    expires_at INTEGER,  -- when the swarm drops it; NULL until the swarm confirms storing it
+    -- A group message admitting us on this request, held until the user confirms the SAS through
+    -- confirm_link, with the hash it arrived with: a fetch delivers a message only once.  Its time
+    -- is the one signed inside it.
+    admission BLOB,
+    admission_hash TEXT,
+    CHECK((admission IS NULL) == (admission_hash IS NULL))
 ) STRICT;
 
 -- This table holds current and recent device private keys for *this* device, including the
@@ -80,7 +208,11 @@ END;
 -- group and have their public keys published for remote users to use to encrypt messages.
 -- Unlike device_privkeys, these keys are shared among all devices in the device group.
 CREATE TABLE device_account_keys (
-    id INTEGER PRIMARY KEY NOT NULL,
+    -- AUTOINCREMENT because a device group push names the rows it distributes, and confirming it
+    -- marks them distributed.  Leaving a group deletes every key, so without it a key minted while
+    -- that push was in flight would take a named id and be marked distributed by a message that
+    -- never carried it.
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     created INTEGER NOT NULL,
     rotated INTEGER, -- timestamp when a new key superceded this key
     distributed INTEGER NOT NULL DEFAULT 0,  -- 1 once this key's seed has been included in a confirmed device group push
@@ -109,6 +241,16 @@ BEGIN
           LIMIT 1) AS winner
     WHERE device_account_keys.rotated IS NULL AND device_account_keys.id != winner.id;
 END;
+
+-- The devices each account key has been delivered to, and so holds for good: a payload is
+-- encrypted to exactly the registered records it carries, so every payload carrying a key -- one
+-- this device merged, or pushed -- delivered it to each of them.  A key that reached a device no
+-- longer in the group is one that device can still use.
+CREATE TABLE device_account_key_recipients (
+    key INTEGER NOT NULL REFERENCES device_account_keys(id) ON DELETE CASCADE,
+    device BLOB NOT NULL CHECK(length(device) == 16),  -- the unique_id it was delivered to
+    PRIMARY KEY(key, device)
+) STRICT, WITHOUT ROWID;
 
 -- from 000_config_dumps.sql
 -- The serialised state of each config object, so a config survives a restart without being rebuilt
@@ -191,21 +333,27 @@ CREATE TABLE swarm_hashes (
 
 CREATE INDEX swarm_hashes_cursor ON swarm_hashes(namespace, node, id DESC);
 
--- Cache of remote account public keys (X25519 + ML-KEM-768) used for PFS+PQ message encryption.
--- Keys are considered fresh for PFS_KEY_FRESH_DURATION (24h) and expire after
--- PFS_KEY_EXPIRY_DURATION (48h); stale entries (24-48h old) are still usable as a fallback.
+-- What this device knows of a contact's account public keys (X25519 + ML-KEM-768), which PFS+PQ
+-- messages to them are encrypted to; see the spec's "Account keys" for the rule this keeps.  Until
+-- cache_expiry a send uses what the row says -- the keys, or none -- without looking again; past
+-- it, the next send or prefetch looks up first, and the outcome sets the row.
 --
--- nak_at is set whenever a successful fetch returns no valid keys, and is never cleared.  It
--- suppresses re-fetching for PFS_KEY_NAK_DURATION (1h) when no valid keys exist.  When valid
--- keys are present nak_at may coexist with them (the keys are still usable as a fallback).
+-- All times are unix seconds.  A row is written by every completed lookup, so checked_at is always
+-- set.  The keys and confirmed_at are present or absent together: confirmed_at is the last time a
+-- lookup said this key is current, by finding it or by finding nothing while it was recent enough
+-- still to be.  A keyless row within cache_expiry is a lookup that found nothing.
+--
 -- In SQLite, CHECK constraints with a NULL argument evaluate to NULL (not FALSE), so the length
 -- checks do not reject NULL pubkeys.
 CREATE TABLE pfs_key_cache (
     session_id BLOB NOT NULL PRIMARY KEY CHECK(length(session_id) = 33),
-    fetched_at INTEGER,           -- unix timestamp (seconds) of last fetch with valid keys; NULL if none
-    nak_at INTEGER,               -- unix timestamp of last fetch returning no keys; NULL if none
+    checked_at INTEGER NOT NULL,     -- when the last lookup completed, whatever it found
+    confirmed_at INTEGER,            -- when a lookup last said the keys below are current
+    cache_expiry INTEGER NOT NULL,   -- when the next lookup is due
     pubkey_x25519 BLOB CHECK(length(pubkey_x25519) = 32),
-    pubkey_mlkem768 BLOB CHECK(length(pubkey_mlkem768) = 1184)
+    pubkey_mlkem768 BLOB CHECK(length(pubkey_mlkem768) = 1184),
+    CHECK((pubkey_x25519 IS NULL) = (pubkey_mlkem768 IS NULL)),
+    CHECK((pubkey_x25519 IS NULL) = (confirmed_at IS NULL))
 ) STRICT;
 
 CREATE TABLE pro_revocations (

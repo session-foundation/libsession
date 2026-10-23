@@ -66,6 +66,9 @@ using namespace std::literals;
 ///     every push.  Note this is the *negative*: present means do not tell them.
 /// D - "delete attachments before" unix timestamp (seconds) for "Note to Self": as above but for
 ///     attachments alone, leaving the messages themselves.  Omitted when 0.
+/// v - the lowest message protocol version every device of this account can read.  Omitted means
+///     1.  Only ever raised: 2 is what lets the account publish PFS/PQ keys for contacts to encrypt
+///     to, which a device that cannot read such messages would then miss.
 class UserProfile : public ConfigBase {
   public:
     friend class UserProfileTester;
@@ -338,6 +341,33 @@ class UserProfile : public ConfigBase {
     /// Inputs:
     /// - `notify` -- false to stop telling senders that we saved their files.
     void set_notify_media_saved(bool notify);
+
+    /// API: user_profile/UserProfile::get_min_message_version
+    ///
+    /// The lowest message protocol version every device of this account can read: 1 for an account
+    /// that has never raised it, 2 once PFS/PQ is enabled -- which is what lets the account publish
+    /// the keys contacts encrypt PFS/PQ messages to.  Not a description of any one device: it is
+    /// what the account's devices, all of them, have been declared able to read.
+    ///
+    /// Inputs: None
+    ///
+    /// Outputs:
+    /// - `int` -- the version; 1 when unset.
+    int get_min_message_version() const;
+
+    /// API: user_profile/UserProfile::set_min_message_version
+    ///
+    /// Raises the above.  One-way: lowering it would not make the account readable by devices that
+    /// cannot read the newer messages, since contacts that have already fetched its keys go on
+    /// using them, so it is refused rather than half-honoured.  Setting the current value is a
+    /// no-op.  An application enables PFS/PQ through `Core::enable_pfs`, which also has the
+    /// account's keys published, rather than through this.
+    ///
+    /// Inputs:
+    /// - `version` -- the new lowest version; at least the current one.
+    ///
+    /// Throws std::invalid_argument if `version` is lower than the current value.
+    void set_min_message_version(int version);
 
     /// API: user_profile/UserProfile::get_profile_updated
     ///

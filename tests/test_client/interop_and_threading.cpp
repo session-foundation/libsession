@@ -72,6 +72,71 @@ TEST_CASE("Client: handlers arrive through the dispatcher", "[client][callbacks]
     CHECK(Recorder::messages(r.msg_added)[1].body == "direct");
 }
 
+TEST_CASE("Client: device events arrive through the dispatcher", "[client][callbacks][devices]") {
+    std::vector<std::function<void()>> queued;
+    DeviceEventsRecorder events;
+    callbacks cbs;
+    cbs.devices = &events;
+    TempClient c{std::move(cbs)};
+    c->set_dispatcher([&](std::function<void()> job) { queued.push_back(std::move(job)); });
+
+    // Renamed, and the group's record of this device renamed with it once a push carrying it is
+    // stored -- reported at the next fetch.
+    core::device::Info info{};
+    info.description = "renamed";
+    c->core.devices.update_info(info, await);
+    c->core.devices.mark_device_group_pushed(c->core.devices.build_device_group_message(), "h");
+    TestHelper::finish_fetch(c->core);
+    sync(*c);
+
+    CHECK(events.replaced.empty());
+    REQUIRE(!queued.empty());
+    for (auto& job : queued)
+        job();
+
+    auto self = c->core.devices.device_info(await).first;
+    REQUIRE(events.replaced.size() == 1);
+    CHECK(events.replaced[0].at(self.id).description == "renamed");
+}
+
+TEST_CASE("Client: a rogue account key arrives through the dispatcher", "[client][callbacks]") {
+    std::vector<std::function<void()>> queued;
+    int alerts = 0;
+    callbacks cbs;
+    cbs.rogue_account_key = [&alerts] { alerts++; };
+    TempClient c{std::move(cbs)};
+    c->set_dispatcher([&](std::function<void()> job) { queued.push_back(std::move(job)); });
+
+    TestHelper::fire_rogue_account_key(c->core);
+    sync(*c);
+    CHECK(alerts == 0);
+    REQUIRE(queued.size() == 1);
+    queued.front()();
+    CHECK(alerts == 1);
+}
+
+TEST_CASE(
+        "Client: a finished PFS key fetch arrives through the dispatcher", "[client][callbacks]") {
+    std::vector<std::function<void()>> queued;
+    std::vector<std::pair<b33, core::PfsKeyFetch>> fetched;
+    callbacks cbs;
+    cbs.pfs_keys_fetched = [&fetched](std::span<const std::byte, 33> sid, core::PfsKeyFetch r) {
+        b33 id;
+        std::ranges::copy(sid, id.begin());
+        fetched.emplace_back(id, r);
+    };
+    TempClient c{std::move(cbs)};
+    c->set_dispatcher([&](std::function<void()> job) { queued.push_back(std::move(job)); });
+
+    SenderKeys contact;
+    TestHelper::finish_pfs_fetch(c->core, contact.session_id, core::PfsKeyFetch::new_key);
+    sync(*c);
+    CHECK(fetched.empty());
+    REQUIRE(queued.size() == 1);
+    queued.front()();
+    CHECK(fetched == std::vector{std::pair{contact.session_id, core::PfsKeyFetch::new_key}});
+}
+
 TEST_CASE("Client: Core is usable directly through the Client", "[client][callbacks]") {
     TempClient c;
 

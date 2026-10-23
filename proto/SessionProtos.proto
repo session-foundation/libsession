@@ -322,6 +322,17 @@ message DataMessage {
   optional string                    syncTarget                     = 105;
   optional bool                      blocksCommunityMessageRequests = 106;
   optional GroupUpdateMessage        groupUpdateMessage             = 120;
+
+  // How the message was encrypted for its recipient, as a core::MessageEncryption value (1 = v1,
+  // 2 = v2 without PFS, 3 = v2 with PFS+PQ), for the account's other devices to show.  Set only on
+  // the copy deposited in our own swarm -- the one carrying syncTarget -- since that copy is
+  // encrypted to us, and its own envelope says nothing of what reached the recipient.  Never on the
+  // recipient's copy: it is the sender's record, not something to tell them.  An unknown value is
+  // ignored.
+  //
+  // Numbered far from Session's own additions to this message (101-106, 120): only libsession
+  // writes it, and a field Session's other clients add next must not be read as this one.
+  optional uint32                    syncEncryption                 = 1000;
 }
 
 message ReceiptMessage {

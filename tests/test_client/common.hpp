@@ -19,6 +19,7 @@
 #include <session/crypto/ed25519.hpp>
 #include <session/format.hpp>
 #include <session/random.hpp>
+#include <session/session_encrypt.hpp>
 #include <session/session_protocol.hpp>
 #include <thread>
 
@@ -130,7 +131,8 @@ inline void approve(Client& c, const b33& sid) {
     });
 }
 
-/// Builds, encrypts and delivers a v1 DM into `to` as if it had arrived from the swarm.
+/// Builds, encrypts and delivers a DM into `to` as if it had arrived from the swarm: as v1 unless
+/// `encryption` says otherwise, v2 with PFS+PQ being to `to`'s current account key.
 inline void deliver(
         Client& to,
         const SenderKeys& from,
@@ -140,7 +142,8 @@ inline void deliver(
         std::string_view display_name = "",
         std::optional<b33> sync_target = std::nullopt,
         const std::function<void(SessionProtos::DataMessage&)>& decorate = nullptr,
-        std::optional<int64_t> msgid = std::nullopt) {
+        std::optional<int64_t> msgid = std::nullopt,
+        core::MessageEncryption encryption = core::MessageEncryption::v1) {
     SessionProtos::Content content;
     content.set_sigtimestamp(static_cast<uint64_t>(ts.time_since_epoch().count()));
     if (msgid)
@@ -155,8 +158,22 @@ inline void deliver(
         decorate(*data);
 
     auto plaintext = content.SerializeAsString();
-    auto encoded = encode_dm_v1(
-            std::as_bytes(std::span{plaintext}), from.ed_sk, ts, own_sid(to), std::nullopt);
+    auto bytes = std::as_bytes(std::span{plaintext});
+    std::vector<std::byte> encoded;
+    switch (encryption) {
+        case core::MessageEncryption::v1:
+            encoded = encode_dm_v1(bytes, from.ed_sk, ts, own_sid(to), std::nullopt);
+            break;
+        case core::MessageEncryption::v2_basic:
+            encoded = encrypt_for_recipient_v2_nopfs(from.ed_sk, own_sid(to), bytes);
+            break;
+        case core::MessageEncryption::v2_pfs: {
+            to.core.devices.active_account_keys();
+            auto [x25519, mlkem768] = TestHelper::active_account_pubkeys(to.core);
+            encoded = encrypt_for_recipient_v2(from.ed_sk, own_sid(to), x25519, mlkem768, bytes);
+            break;
+        }
+    }
 
     core::SwarmMessage sm{encoded, std::move(hash), ts, from_epoch_ms(1'000'000'000'000)};
 

@@ -1,9 +1,9 @@
 #pragma once
-#include <chrono>
 #include <functional>
 #include <optional>
 #include <session/config/namespaces.hpp>
 #include <session/core/devices.hpp>
+#include <session/core/message_encryption.hpp>
 #include <session/core/swarm_message.hpp>
 #include <session/util.hpp>
 #include <span>
@@ -14,22 +14,60 @@ namespace session::core {
 
 class Core;
 
-/// Return value of prefetch_pfs_keys() describing the current cache state at the time of the call.
-enum class PfsKeyStatus {
-    fresh,     ///< A fresh cached key exists; no fetch was initiated
-    stale,     ///< A usable but stale key exists; a background re-fetch was initiated.
-               ///< The pfs_keys_fetched callback will fire when the fetch completes.
-    fetching,  ///< No usable key is cached; a background fetch was initiated.
-               ///< The pfs_keys_fetched callback will fire when the fetch completes.
-    nak,       ///< An unexpired NAK suppresses fetching; no usable key exists
+/// Where a contact's PFS/PQ keys stand on this device, by the rule the spec's "Account keys" sets
+/// out: until the cache entry's expiry a send uses what the entry says, and past it the next send
+/// or prefetch looks the keys up first.  Reported by `Core::pfs_key_info` and returned by
+/// `Core::prefetch_pfs_keys`.
+enum class PfsKeyState {
+    /// No key held, and no lookup answering for now: never looked up, a lookup that found nothing
+    /// longer ago than `Core::PFS_KEY_EMPTY_HOLD`, or one that failed.  A send looks up first and
+    /// waits for the answer.
+    none,
+    /// A key held, within the entry's expiry: sends are PFS/PQ encrypted with it, with no lookup.
+    usable,
+    /// A key held, past the entry's expiry: the next send or prefetch looks up first, and the key
+    /// is still used if the lookup brings no other -- after a failed lookup only within
+    /// `Core::PFS_KEY_FAILED_GRACE` of `confirmed_at`, and after one that found nothing only within
+    /// `Core::PFS_KEY_EMPTY_GRACE`.
+    refresh_due,
+    /// No key held, within the entry's expiry after a lookup that found none: sends use the
+    /// non-PFS encryption until then, with no lookup.
+    nak,
 };
 
-/// Result passed to the pfs_keys_fetched callback when a background fetch completes.
+/// What `Core::pfs_key_info` reports of a contact's PFS/PQ keys.
+///
+/// - `checked_at` is when the last lookup of this contact's keys completed, whatever it found: a
+///   key, nothing, or no answer at all because it failed.  With no key held it is what "checked
+///   <time>, no PFS/PQ keys" reports.
+/// - `confirmed_at` is the last time a lookup said this key is current: when it was fetched, or
+///   when a later lookup found nothing while the key was recent enough that the account cannot
+///   have replaced it (see `Core::PFS_KEY_EMPTY_GRACE`).  Set exactly when a key is held.
+/// - `cache_expiry` is when the next lookup is due.
+/// - `fetching` is whether a lookup of this contact is in flight, whatever started it: a prefetch,
+///   a refetch, or a send waiting on the keys.
+///
+/// The times are unset when no lookup of the contact has completed.  They are stamped by Core's
+/// clock (`session::clock_now`, which corrects for the network's offset from this machine's), so
+/// compare them with that and never with `std::chrono::system_clock`: the two can differ by however
+/// far off this machine's clock is.
+struct PfsKeyInfo {
+    PfsKeyState state = PfsKeyState::none;
+    /// The keys held, which sends encrypt to as `state` says; unset when none are.
+    std::optional<std::array<std::byte, 32>> x25519_pub;
+    std::optional<std::array<std::byte, 1184>> mlkem768_pub;
+    std::optional<std::chrono::sys_seconds> checked_at;
+    std::optional<std::chrono::sys_seconds> confirmed_at;
+    std::optional<std::chrono::sys_seconds> cache_expiry;
+    bool fetching = false;
+};
+
+/// Result passed to the pfs_keys_fetched callback when a lookup of a contact's keys completes.
 enum class PfsKeyFetch {
     new_key,    ///< A key was retrieved and stored (new or changed from the previous cache entry)
     unchanged,  ///< Keys were retrieved but match what was already cached
     not_found,  ///< The fetch succeeded but the remote account pubkey namespace held no valid keys
-    failed,     ///< The network request failed (swarm lookup or send_request)
+    failed,     ///< No answer: the request failed, or its response could not be read
 };
 
 /// Reason code passed to the message_decrypt_failed callback.
@@ -48,24 +86,81 @@ struct ReceivedMessage {
     sys_ms timestamp;                  ///< Server-reported upload timestamp
     sys_ms expiry;                     ///< Server-reported expiry timestamp
     b33 sender_session_id;             ///< 0x05-prefixed sender session ID
-    int version;                       ///< Protocol version: 1 or 2
+    MessageEncryption encryption;      ///< What its envelope used
     std::vector<std::byte> content;    ///< Decrypted protobuf-encoded payload
     std::optional<b64> pro_signature;  ///< Session Pro signature, if present
-    bool pfs_encrypted = false;        ///< True iff decrypted via PFS+PQ (X-Wing) key derivation;
-                                       ///< false for v1 messages and v2 non-PFS fallback messages.
 };
 
 /// Status of a send operation initiated by Core::send_dm().
 enum class MessageSendStatus {
     awaiting_keys,   ///< Waiting for a PFS+PQ pubkey fetch to complete before encrypting.
     sending,         ///< Encryption complete; the store request has been dispatched.
-    retrying,        ///< A previous send attempt failed; retrying.  (Not yet implemented:
-                     ///< currently a failed send goes directly to network_error.  TODO:
-                     ///< implement automatic retry with a maximum retry count.)
+    retrying,        ///< Still waiting for the recipient's keys after a lookup of them failed with
+                     ///< no key held to fall back on: the lookup is retried with backoff (see
+                     ///< `Core::PFS_FETCH_RETRY_FIRST`) for as long as the send waits.  A failed
+                     ///< store is not retried, and goes directly to network_error.
     success,         ///< The store request was accepted by a swarm node.
     network_error,   ///< The swarm lookup or store request failed (terminal).
     no_network,      ///< No network object is attached.
     encrypt_failed,  ///< Encryption failed (should not normally happen).
+};
+
+/// What a device linking interface answers to: the requests other devices send this account, and
+/// the account's devices themselves.
+///
+/// One interface rather than a handler each because they only work as a set.  A prompt opened by
+/// `link_request_added` has to be closed by `link_request_ended`, or it goes on showing the SAS of
+/// a request that has been replaced -- the substitution the SAS exists to catch -- so leaving any
+/// of these out has to be a compile error, not a quiet gap.
+///
+/// Everything here is reported once the fetch that caused it has been merged in full, so a handler
+/// never sees a half-applied state.  State to draw from initially is read the ordinary way, through
+/// `Devices::membership()`, `Devices::devices()` and `Devices::incoming_link_requests()`; these
+/// report what changes after.
+///
+/// Called on Core's event loop, so a method must not block.  One that throws is logged, and the
+/// others are still called; what it was told is not told again.
+class DeviceEvents {
+  public:
+    virtual ~DeviceEvents() = default;
+
+    /// Another device asked to join the account's device group.  The request whole, so a prompt
+    /// can be drawn from it without reading anything back.
+    ///
+    /// Once per request per session, and not at all for one the application has already been handed
+    /// by `incoming_link_requests()` -- so an application that reads nothing at startup is still
+    /// told of every request waiting, and one that does is not told twice.  Held back until the
+    /// first fetch from the swarm has been merged, since a request stored before shutting down may
+    /// have been accepted elsewhere or expired since.  Never for this device's own request.
+    virtual void link_request_added(device::LinkRequest request) = 0;
+
+    /// A request announced by `link_request_added` can no longer be answered, and whatever prompt
+    /// was drawn for it should close.  Not for a request this device accepted or ignored itself,
+    /// whose prompt closed when the user acted on it, nor on hearing afterwards that another device
+    /// accepted that same request too.
+    virtual void link_request_ended(int reqid, device::LinkRequestEnd why) = 0;
+
+    /// The account's devices changed: one joined, was removed, or changed how it describes itself.
+    /// The whole set, since one group message can change several at once: every device that is or
+    /// was in the group.  Not the ones asking to join, which arrive as link requests instead.
+    virtual void devices_replaced(device::map devices) = 0;
+
+    /// Another device joined the group, or stopped being in it: removed, or left of its own accord.
+    /// Its record as it now stands -- `state` says which (Registered, Kicked or Left), and `kicked`
+    /// when it went.  For a notice ("Alice's laptop was added"); `devices_replaced` follows for
+    /// redrawing the list.  Not for a change this device made itself through `accept_request` or
+    /// `remove_device`, nor for the members of a group this device has just been admitted to.
+    virtual void device_membership_changed(device::Info device) = 0;
+
+    /// Where this device stands, or the groups it can see, changed -- or became known with the
+    /// first fetch of this run; see device::Membership for what each value means.  So the same
+    /// value can arrive twice: a `Dissolved` device is told again when the group it can join
+    /// appears in `MembershipState::others`.  `Removed`, `Displaced`, `Dissolved`,
+    /// `Dropped` and `Forked` are the ones to alert on, and arrive as soon as the fetch that
+    /// reveals them is merged.  `Approved` is the one to bring up the confirmation on, wherever
+    /// the user is.  Not for the move to `Requesting` that `Devices::request_link` makes, nor back
+    /// from it when that call reports failure: the caller knows.  Never `Unknown`.
+    virtual void membership_changed(device::Membership membership) = 0;
 };
 
 /// Struct holding application callbacks to fire when libsession Core events happen to allow the
@@ -78,75 +173,13 @@ enum class MessageSendStatus {
 /// anything, and a handler that just reads pays nothing.
 struct callbacks {
 
-    /// Callback that is invoked when a device linking request is received for entry into the device
-    /// group.  This is expected to notify the user of the linking request, and ask them to confirm
-    /// it.  Generally this should be followed (after user interaction) by a call to one of the
-    /// core.devices methods: ignore_request(), accept_request(), delete_request() with the reqid
-    /// value.
-    ///
-    /// This may fire multiple times: it generally fires when the request first comes in, but
-    /// will also fire during startup if there is a still-active request that has not been
-    /// accepted, ignored, or deleted.  (This is so that Session a shutdown or crash does not
-    /// lose a device request).
-    ///
-    /// It may also not fire at all if the request has been superceded (such as being accepted
-    /// by a third device).
-    ///
-    /// This request is not fired for the devices own linking request, i.e. when this device is the
-    /// one requesting entry into a device group.
-    ///
-    /// If this callback is not set then new device link requests are ignored by this device.
-    ///
-    /// Parameters:
-    /// - reqid -- a unique identifier for this request that persists across Core restarts and can
-    ///   be used to correlate this request with a subsequent device_added callback.  Never reused,
-    ///   even once the request is accepted or expires, so a later request always has a new one.
-    /// - new_device -- the new device metadata included in the link request.
-    /// - sas -- a span of 21 string_views representing the short authentication string for this
-    ///   request.  The first 7 are the standard display; all 21 are available for the extended
-    ///   view.  Formatting and joining is left to the caller.
-    std::function<void(
-            int reqid, device::Info&& new_device, std::span<const std::string_view, 21> sas)>
-            device_link_request;
+    /// Device group and link request events; see DeviceEvents.  Null for an application with no
+    /// device linking of its own to show.  Must outlive the Core.
+    DeviceEvents* devices = nullptr;
 
-    /// Callback that is invoked when a new device has been linked to the account.  If a batch
-    /// of messages being processed includes both a device link request *and* an acceptance
-    /// (such as could happen if third device accepts the request) then only this, not the
-    /// request, will be fired.
-    ///
-    /// This callback is not fired if *this* is the device that has been added: see
-    /// device_self_added instead for that case.
-    ///
-    /// Note that this is fired once the new device is confirmed via stored swarm message, i.e.
-    /// it does not fire instantly upon calling `accept_request()`.
-    ///
-    /// Paramters:
-    /// - reqid -- if `on_device_link_request` had previously been called for this device, this
-    ///   value will be the same value, allowing the application to correlate linking requests and
-    ///   acceptance.  If there was no previous link request (such as when catching up on device
-    ///   updates performed by other account devices) then the value will be 0.
-    /// - new_device -- the metadata about the new device.
-    std::function<void(int reqid, device::Info&& new_device)> device_added;
-
-    /// Callback invoked when *this* device has been confirmed linked to the account by another
-    /// device.
-    std::function<void()> device_self_added;
-
-    /// Callback that is invoked if we determine that a device has been kicked out of the device
-    /// group, either initiated by this device or another device.  This does not, however, fire if
-    /// the *current* device gets kicked out; see device_self_removed for that.
-    ///
-    /// Parameters:
-    /// - removed_device -- the most recent info we have (locally) for the removed device.
-    std::function<void(device::Info&& removed_device)> device_removed;
-
-    /// Callback invoked when *this* device has been confirmed removed from the account (typically
-    /// from another device) from an incoming device group update.
-    std::function<void()> device_self_removed;
-
-    /// Callback invoked when a background PFS key fetch initiated by prefetch_pfs_keys() completes.
-    /// Not invoked for cache hits or NAK suppressions (i.e. only fires when prefetch_pfs_keys()
-    /// returns stale or fetching).
+    /// Callback invoked when a lookup of a contact's PFS/PQ keys completes, whatever started it: a
+    /// prefetch, a refetch, a send waiting on the keys, or a retry of a lookup that failed.  Not
+    /// invoked when the cache answered without one.
     ///
     /// Parameters:
     /// - session_id -- 33-byte session ID (0x05 prefix + X25519 pubkey) of the remote user
@@ -186,10 +219,13 @@ struct callbacks {
     /// - status -- the current state of the send
     /// - swarm_hash -- the hash the swarm assigned the stored message, on `success` and when the
     ///   storage server reported one.  Unset for every other status.
+    /// - encryption -- how the message was encrypted for the recipient it was sent to, on `sending`
+    ///   (when that is decided) and on `success`.  Unset for every other status.
     std::function<void(
             int64_t message_id,
             MessageSendStatus status,
-            std::optional<std::string_view> swarm_hash)>
+            std::optional<std::string_view> swarm_hash,
+            std::optional<MessageEncryption> encryption)>
             message_send_status;
 
     /// Callback fired when merging config messages from the swarm changed one or more of the
@@ -215,6 +251,27 @@ struct callbacks {
     /// - changed -- the namespaces whose configs the merge altered.  Valid only for the duration of
     ///   the call.
     std::function<void(std::span<const config::Namespace> changed)> configs_changed;
+
+    /// Callback fired when the account's key outbox (namespace -21) -- where contacts find the key
+    /// they encrypt PFS/PQ messages to -- holds a key that is not one of this account's.
+    ///
+    /// Only a holder of the account's seed can publish there, so it means someone other than the
+    /// account's own devices has the seed: tell the user, as for a forged Displaced alert, that the
+    /// recovery phrase is in someone else's hands (see the device groups guide).  Whether PFS/PQ is
+    /// enabled or not: a seed holder publishing a key need not have enabled it, and contacts
+    /// encrypt to whatever they find.  Where it is enabled, this device publishes the account's own
+    /// key over it straight away, if it is a member of its group in good standing.  Nothing is ever
+    /// deleted from -21, and the seed holder can publish again.
+    ///
+    /// Not decided on sight: a key another device of the account has just rotated to is in -21 a
+    /// moment before its group message reaches this device, so a key not yet known is checked again
+    /// after a fetch of the device group, and reported only if it is still unknown then.  May fire
+    /// more than once for the same key, if it is seen again.
+    ///
+    /// Only on a device that is a member of its group in good standing (`InGroup` or `Forked`): one
+    /// outside it holds none of the group's keys to compare against.  A device that becomes a
+    /// member fetches -21 again from the start, so a key published before then is still judged.
+    std::function<void()> rogue_account_key;
 };
 
 }  // namespace session::core

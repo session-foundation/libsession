@@ -30,6 +30,26 @@ inline nlohmann::json parse_json(std::span<const std::byte> body) {
     return nlohmann::json::parse(to_string_view(body));
 }
 
+/// One message as a storage server's `retrieve` lists it (oxenss `process_retrieve`): every field,
+/// every time, and `data` base64-encoded, as it is for a json request.  A real expiry by default:
+/// a link request takes it as its deadline, and a group is in view only until it.
+inline nlohmann::json retrieved_message(
+        std::span<const std::byte> data,
+        std::string_view hash,
+        sys_ms timestamp = clock_now_ms(),
+        sys_ms expiration = clock_now_ms() + std::chrono::minutes{10}) {
+    return {{"hash", hash},
+            {"timestamp", epoch_ms(timestamp)},
+            {"expiration", epoch_ms(expiration)},
+            {"data", oxenc::to_base64(to_string_view(data))}};
+}
+
+/// The body of a `retrieve` answer, as the server sends it: always both fields.
+inline nlohmann::json retrieved_body(
+        nlohmann::json messages = nlohmann::json::array(), bool more = false) {
+    return {{"messages", std::move(messages)}, {"more", more}};
+}
+
 /// A minimal in-process mock of network::Network for unit tests.
 /// Tests can set `current_node` to control which node get_swarm returns, and inspect
 /// `sent_requests` to observe outgoing requests and fire their callbacks.
@@ -227,6 +247,43 @@ inline size_t fail_downloads(MockNetwork& net, int16_t status = 404) {
     return pending.size();
 }
 
+/// Keeps everything a Core reports through DeviceEvents, in order.  Reports arrive on Core's loop,
+/// so a test reads these after draining it.  `on_added` runs inside the report itself, for a test
+/// that needs to look at the state it is reported in.
+struct DeviceEventsRecorder : core::DeviceEvents {
+    std::function<void(const core::device::LinkRequest&)> on_added;
+
+    std::vector<core::device::LinkRequest> added;
+    std::vector<std::pair<int, core::device::LinkRequestEnd>> ended;
+    std::vector<core::device::map> replaced;
+    std::vector<core::device::Membership> membership;
+    std::vector<core::device::Info> members;
+    std::vector<std::string> order;  // which of them, as they arrived
+
+    void link_request_added(core::device::LinkRequest request) override {
+        if (on_added)
+            on_added(request);
+        order.push_back("added");
+        added.push_back(std::move(request));
+    }
+    void link_request_ended(int reqid, core::device::LinkRequestEnd why) override {
+        order.push_back("ended");
+        ended.emplace_back(reqid, why);
+    }
+    void devices_replaced(core::device::map devices) override {
+        order.push_back("replaced");
+        replaced.push_back(std::move(devices));
+    }
+    void membership_changed(core::device::Membership m) override {
+        order.push_back("membership");
+        membership.push_back(m);
+    }
+    void device_membership_changed(core::device::Info device) override {
+        order.push_back("member");
+        members.push_back(std::move(device));
+    }
+};
+
 /// The store requests a MockNetwork has captured, in the order they were sent.  Filtered rather
 /// than taken wholesale because a Core with a network attached also fetches PFS keys, so a test
 /// that asked for a send finds retrieves in the list it never asked for.
@@ -236,6 +293,36 @@ inline std::vector<MockNetwork::SentRequest*> stores(MockNetwork& net) {
         if (r.request.endpoint == "store")
             found.push_back(&r);
     return found;
+}
+
+/// The swarm polls a MockNetwork has captured.  Filtered rather than taken wholesale for the same
+/// reason as `stores()`: a poll is a "batch" of retrieves and a push is a "sequence", so a test
+/// that counts requests to check how many times it polled also counts whatever the poll went on to
+/// send.
+inline std::vector<MockNetwork::SentRequest*> polls(MockNetwork& net) {
+    std::vector<MockNetwork::SentRequest*> found;
+    for (auto& r : net.sent_requests)
+        if (r.request.endpoint == "batch")
+            found.push_back(&r);
+    return found;
+}
+
+/// The swarm pushes a MockNetwork has captured.  A push is a "sequence" of store subrequests
+/// followed by at most one delete, so its payload is inside the body rather than in the request
+/// itself the way a bare "store" endpoint's is.
+inline std::vector<MockNetwork::SentRequest*> pushes(MockNetwork& net) {
+    std::vector<MockNetwork::SentRequest*> found;
+    for (auto& r : net.sent_requests)
+        if (r.request.endpoint == "sequence")
+            found.push_back(&r);
+    return found;
+}
+
+/// The subrequests a push carries, in the order they will be applied.
+inline nlohmann::json push_requests(const MockNetwork::SentRequest& r) {
+    if (!r.request.body)
+        throw std::logic_error{"push request has no body"};
+    return parse_json(*r.request.body)["requests"];
 }
 
 /// The JSON a store request carries, which is where the namespace and the payload are.
@@ -256,7 +343,7 @@ inline std::string store_hash_for(std::string_view pubkey_hex) {
     return "hash-for-{}"_format(pubkey_hex);
 }
 
-/// Hands the first `max` captured requests for `endpoint` to `respond`, leaving everything else
+/// Hands the first `max` captured requests that `which` picks to `respond`, leaving everything else
 /// pending, and returns how many were answered.
 ///
 /// The pending list is taken away before any of it runs, and must be: a response can prompt Core to
@@ -264,7 +351,7 @@ inline std::string store_hash_for(std::string_view pubkey_hex) {
 /// the very callback being invoked.
 inline size_t answer_requests(
         MockNetwork& net,
-        std::string_view endpoint,
+        const std::function<bool(const MockNetwork::SentRequest&)>& which,
         const std::function<void(MockNetwork::SentRequest&)>& respond,
         size_t max = std::numeric_limits<size_t>::max()) {
     auto pending = std::exchange(net.sent_requests, {});
@@ -272,18 +359,94 @@ inline size_t answer_requests(
     std::vector<MockNetwork::SentRequest> others;
 
     for (auto& r : pending) {
-        if (r.request.endpoint == endpoint && answered < max) {
+        if (answered < max && which(r)) {
             respond(r);
             answered++;
         } else
             others.push_back(std::move(r));
     }
 
-    // Appended rather than assigned: whatever the responses prompted belongs in the list too.
-    for (auto& r : others)
+    // Whatever the responses prompted belongs in the list too, after what was already waiting: it
+    // was sent later, and "the oldest one not yet answered" has to keep meaning that.
+    auto prompted = std::exchange(net.sent_requests, std::move(others));
+    for (auto& r : prompted)
         net.sent_requests.push_back(std::move(r));
 
     return answered;
+}
+
+/// The same, for the requests to `endpoint`.
+inline size_t answer_requests(
+        MockNetwork& net,
+        std::string_view endpoint,
+        const std::function<void(MockNetwork::SentRequest&)>& respond,
+        size_t max = std::numeric_limits<size_t>::max()) {
+    return answer_requests(
+            net,
+            [endpoint](const MockNetwork::SentRequest& r) {
+                return r.request.endpoint == endpoint;
+            },
+            respond,
+            max);
+}
+
+/// A MockNetwork whose routing can carry the storage servers' pushes, so that a drained poll goes
+/// on to subscribe -- as the default, onion requests, never does.
+inline MockNetwork* attach_push_network(core::Core& core) {
+    network::config::Config config;
+    config.router = network::opt::router::Type::direct;
+    return attach_mock_network(core, std::move(config));
+}
+
+/// Answers the oldest captured poll batch: each namespace with what `held` has for it (message and
+/// hash), the rest with nothing.  Or fails it, as an unreachable member would.  Returns whether
+/// there was one.
+inline bool answer_batch(
+        MockNetwork& net,
+        const std::map<int, std::vector<std::pair<std::vector<std::byte>, std::string>>>& held = {},
+        bool reached = true) {
+    return answer_requests(
+                   net,
+                   "batch",
+                   [&](MockNetwork::SentRequest& r) {
+                       if (!reached)
+                           return r.callback(false, true, 0, {}, std::nullopt);
+                       auto results = nlohmann::json::array();
+                       // Bound first: ranging over a temporary's element would read it after it
+                       // has gone.
+                       auto batch = parse_json(*r.request.body);
+                       for (const auto& req : batch["requests"]) {
+                           auto body = retrieved_body();
+                           if (auto it = held.find(req["params"]["namespace"].get<int>());
+                               it != held.end())
+                               for (const auto& [data, hash] : it->second)
+                                   body["messages"].push_back(retrieved_message(data, hash));
+                           results.push_back({{"code", 200}, {"body", std::move(body)}});
+                       }
+                       r.callback(
+                               true,
+                               false,
+                               200,
+                               {},
+                               nlohmann::json{{"results", std::move(results)}}.dump());
+                   },
+                   1) == 1;
+}
+
+/// Answers the polls pending (a caller polls first) until drained, and accepts the subscription
+/// that follows, as a storage server does: from here nothing polls.  Leaves the poll Core sends on
+/// subscribing -- the one that closes the gap between draining and the subscription taking effect
+/// -- unanswered, for the caller.  Returns whether there was a subscription to accept.
+inline bool subscribe(MockNetwork& net) {
+    while (answer_batch(net)) {
+    }
+    return answer_requests(
+                   net,
+                   "monitor",
+                   [](MockNetwork::SentRequest& r) {
+                       r.callback(true, false, 200, {}, "d7:successi1ee");
+                   },
+                   1) == 1;
 }
 
 /// Answers every captured store, and returns how many there were -- which is itself worth asserting
@@ -303,7 +466,26 @@ inline size_t accept_stores(MockNetwork& net) {
     return answer_stores(net, true);
 }
 
-/// Times out captured key fetches, which is what releases a send queued behind one.
+/// Answers captured key fetches with these AccountPubkeys messages, or with none: the lookup that
+/// found nothing, which releases a send queued behind it with the non-PFS encryption when no key is
+/// held.
+inline size_t answer_retrieves(
+        MockNetwork& net,
+        const std::vector<std::vector<std::byte>>& messages = {},
+        size_t max = std::numeric_limits<size_t>::max()) {
+    return answer_requests(
+            net,
+            "retrieve",
+            [&](MockNetwork::SentRequest& r) {
+                auto body = retrieved_body();
+                for (const auto& m : messages)
+                    body["messages"].push_back(retrieved_message(m, "pubkeys"));
+                r.callback(true, false, 200, {}, body.dump());
+            },
+            max);
+}
+
+/// Times out captured key fetches: a failed lookup.
 inline size_t fail_retrieves(MockNetwork& net, size_t max = std::numeric_limits<size_t>::max()) {
     return answer_requests(
             net,
@@ -403,6 +585,23 @@ class TestHelper {
     /// test's own thread would answer its first member and leave the rest of the walk queued.
     static void poll(core::Core& core) {
         core.call_get([&core] { core._poll(); });
+    }
+
+    // When Core's own retry of a failed poll fires (unset with none scheduled), firing it now, and
+    // whether the poll timer is running -- which it is not while subscribed.
+    static std::optional<sys_ms> poll_retry_due(core::Core& core) {
+        return core.call_get([&core] { return core._poll_retry_due; });
+    }
+    static void fire_poll_retry(core::Core& core) {
+        core.call_get([&core] {
+            if (core._poll_retry_timer)
+                core._jq.wake(core._poll_retry_timer);
+        });
+        // A wake runs the timer on a later turn of the loop; wait for it.
+        drain(core);
+    }
+    static bool polling(core::Core& core) {
+        return core.call_get([&core] { return static_cast<bool>(core._poll_timer); });
     }
 
     /// Runs `f` on Core's loop and hands back what it returned.
@@ -524,21 +723,238 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
                 epoch_ms(clock_now_ms()));
     }
 
-    // Device group payload encryption/decryption.  These are private to Devices and currently have
-    // no production caller (nothing yet builds or pushes a device group message), so tests are the
-    // only thing exercising them.
+    // When the cursor entry for `hash` from this namespace+node lapses, in epoch ms; nullopt where
+    // the node never said.  Throws if there is no such entry.
+    static std::optional<int64_t> swarm_hash_expiry(
+            core::Core& core,
+            int16_t ns,
+            const network::ed25519_pubkey& sn_pubkey,
+            std::string_view hash) {
+        return core.db.conn().prepared_get<std::optional<int64_t>>(
+                R"(
+SELECT h.expiry FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
+ WHERE h.namespace = ? AND n.pubkey = ? AND h.hash = ?
+)",
+                ns,
+                sn_pubkey,
+                hash);
+    }
+
+    // Device group payload encryption/decryption, which are private to Devices, for tests that need
+    // to build a group message with contents of their choosing.
     static std::vector<std::byte> encrypt_device_data(
             core::Devices& d, const core::device::map& devices) {
         return d.encrypt_device_data(devices);
+    }
+    // The same with a payload of the caller's making, encrypted to the devices `devices` lists as
+    // live, under the current account key as the link key.
+    static std::vector<std::byte> encrypt_device_payload(
+            core::Devices& d, const core::device::map& devices, std::string payload) {
+        std::vector<const core::device::Info*> records;
+        for (const auto& [id, info] : devices)
+            records.push_back(&info);
+        return d._encrypt_group_payload(
+                records, d.active_account_keys().front().x25519_pub, std::move(payload));
     }
     static std::vector<std::byte> decrypt_device_data(
             core::Devices& d, std::span<const std::byte> data) {
         return d.decrypt_device_data(data);
     }
 
-    // Feeds an encrypted device group message through the receive path, as a poll would.
-    static void receive_device_group_message(core::Devices& d, std::span<const std::byte> data) {
-        d.receive_device_group_message(data);
+    // Feeds an encrypted device group message through the receive path, as a poll would.  The hash
+    // defaults to empty, which is a message with no swarm identity: merged, but never recorded as
+    // something a push supersedes.
+    static void receive_device_group_message(
+            core::Devices& d, std::span<const std::byte> data, const std::string& hash = "") {
+        d.receive_device_group_message(data, hash);
+    }
+
+    // Gives `core` another device's id, as a copy of that device's data would have it -- though
+    // not its keys, which is what a copy that has since rotated them looks like.
+    static void set_device_id(
+            core::Core& core, std::span<const std::byte, core::device::ID_SIZE> id) {
+        on_loop(core, [&] {
+            std::ranges::copy(id, core.devices.self_id.begin());
+            return 0;
+        });
+    }
+
+    // The devices `core` holds its account key with X25519 pubkey `pub` as delivered to.
+    static std::vector<core::device::Id> key_recipients(
+            core::Core& core, std::span<const std::byte, 32> pub) {
+        return on_loop(core, [&] {
+            auto key = core.devices.conn().prepared_get<int64_t>(
+                    "SELECT id FROM device_account_keys WHERE pubkey_x25519 = ?", pub);
+            return core.devices._key_recipients(key);
+        });
+    }
+
+    // Whether a group message's `kicked` list names `core`'s device.
+    static bool names_us_kicked(core::Core& core, std::span<const std::byte> message) {
+        return on_loop(core, [&] {
+            return core.devices._unreadable_verdict(message) == core::device::Membership::Removed;
+        });
+    }
+
+    // A link request as `request_link` builds it, asking to join `member`'s group, without the
+    // upload, for a test that hands it to another device itself.  Leaves no deadline behind, so the
+    // request never lapses on its own.
+    static auto build_link_request(core::Core& core, core::Core& member) {
+        auto link_x25519 = member.devices.active_account_keys().front().x25519_pub;
+        auto group = *group_id(member);
+        return on_loop(core, [&] { return core.devices._build_link_request(group, link_x25519); });
+    }
+
+    // A link request from `core` to `member`'s group carrying arbitrary contents, signed or not.
+    static std::vector<std::byte> encrypt_link_request(
+            core::Core& core, core::Core& member, std::span<const std::byte> plaintext) {
+        auto link_x25519 = member.devices.active_account_keys().front().x25519_pub;
+        return on_loop(
+                core, [&] { return core.devices._encrypt_link_request(plaintext, link_x25519); });
+    }
+
+    // Gives `core` a group of its own, as a new account gets one -- a second group, on an account
+    // that already has a first.
+    static void start_device_group(core::Core& core) {
+        on_loop(core, [&] {
+            core.devices._mark_group_owed();
+            core.devices.establish_group();
+        });
+    }
+
+    // A tombstone dissolving `groups`, as `core` would publish it, without publishing it.
+    static std::vector<std::byte> build_dissolution(
+            core::Core& core, std::vector<core::device::GroupId> groups) {
+        return on_loop(
+                core, [&] { return core.devices._build_dissolution(groups, clock_now_ms()); });
+    }
+
+    static std::optional<core::device::GroupId> group_id(core::Core& core) {
+        return on_loop(core, [&] { return core.devices._group_id(); });
+    }
+    static void set_group_id(core::Core& core, const core::device::GroupId& id) {
+        on_loop(core, [&] { core.devices._set_group_id(id); });
+    }
+    // What `device_groups` holds for a group: its link key and when it expires.
+    static std::optional<std::pair<std::array<std::byte, 32>, int64_t>> seen_group(
+            core::Core& core, const core::device::GroupId& group) {
+        return on_loop(core, [&]() -> std::optional<std::pair<std::array<std::byte, 32>, int64_t>> {
+            auto row = core.devices.conn()
+                               .prepared_maybe_get<
+                                       sqlite::blob_guts<std::array<std::byte, 32>>,
+                                       int64_t>(
+                                       "SELECT link_x25519, expires_at FROM device_groups"
+                                       " WHERE group_id = ?",
+                                       std::span<const std::byte>{group.value});
+            if (!row)
+                return std::nullopt;
+            auto& [key, expires] = *row;
+            return std::pair{std::array<std::byte, 32>{key}, expires};
+        });
+    }
+
+    static core::device::GroupId group_of(core::Core& core, std::span<const std::byte> message) {
+        return on_loop(core, [&] { return core.devices._group_of(message); });
+    }
+
+    // Delivers one namespace-21 message as a completed fetch would: through the same dispatch, with
+    // `is_final` set so the deferred work -- the prompts, and the ids they carry -- happens too,
+    // and with the expiry the swarm assigned it, which a link request takes as its deadline.
+    static void deliver_device_message(
+            core::Core& core,
+            std::span<const std::byte> data,
+            sys_ms expiry,
+            std::string hash = "hash",
+            bool is_final = true) {
+        on_loop(core, [&] {
+            core::SwarmMessage m{
+                    .data = data,
+                    .hash = std::move(hash),
+                    .timestamp = clock_now_ms(),
+                    .expiry = expiry};
+            core.devices.parse_device_messages(std::span{&m, 1}, is_final);
+        });
+    }
+
+    // Leaves `hash` as where the next retrieve of `ns` from `node` resumes, as a poll that returned
+    // it would.
+    static void record_swarm_cursor(
+            core::Core& core,
+            const network::service_node& node,
+            config::Namespace ns,
+            std::string hash) {
+        on_loop(core, [&] {
+            core::SwarmMessage m{
+                    .hash = std::move(hash),
+                    .timestamp = clock_now_ms(),
+                    .expiry = clock_now_ms() + std::chrono::hours{24}};
+            core._record_swarm_cursor(node.remote_pubkey, ns, std::span{&m, 1});
+        });
+    }
+
+    // Sets `core`'s rogue_account_key callback after the fact, for a Core built with other
+    // callbacks of its own.
+    static void set_message_send_status(
+            core::Core& core,
+            std::function<
+                    void(int64_t,
+                         core::MessageSendStatus,
+                         std::optional<std::string_view>,
+                         std::optional<core::MessageEncryption>)> f) {
+        on_loop(core, [&] { core.callbacks.message_send_status = std::move(f); });
+    }
+    static void set_rogue_account_key(core::Core& core, std::function<void()> f) {
+        on_loop(core, [&] { core.callbacks.rogue_account_key = std::move(f); });
+    }
+    // Fires it, as a rogue key judged would: for what a layer above Core does with it.
+    static void fire_rogue_account_key(core::Core& core) {
+        on_loop(core, [&] { core.callbacks.rogue_account_key(); });
+    }
+
+    // Ends a PFS key fetch for `session_id` as its answer would, firing pfs_keys_fetched.
+    static void finish_pfs_fetch(
+            core::Core& core, std::span<const std::byte, 33> session_id, core::PfsKeyFetch r) {
+        on_loop(core, [&] { core._pfs_fetch_done(session_id, r); });
+    }
+
+    // The same for namespace -21: what the account's key outbox holds, as a fetch of it finds it.
+    static void deliver_pubkey_message(
+            core::Core& core, std::span<const std::byte> data, std::string hash = "pubkey") {
+        on_loop(core, [&] {
+            core::SwarmMessage m{
+                    .data = data,
+                    .hash = std::move(hash),
+                    .timestamp = clock_now_ms(),
+                    .expiry = clock_now_ms() + core::Devices::ACCOUNT_PUBKEY_TTL};
+            core.devices.parse_account_pubkeys(std::span{&m, 1}, true);
+        });
+    }
+
+    // A namespace-21 fetch completing with nothing new, which is still a completed fetch.
+    static void finish_fetch(core::Core& core) {
+        on_loop(core, [&] { core.devices.parse_device_messages({}, true); });
+    }
+
+    // Whether the fetch timer will fire by itself, and firing it now: what it does once its
+    // interval is up, without waiting that out in real time.
+    static bool fetch_timer_armed(core::Core& core) {
+        return on_loop(core, [&] { return core.devices.jq().armed(core.devices._fetch_timer); });
+    }
+    static void fire_fetch_timer(core::Core& core) {
+        on_loop(core, [&] { core.devices.jq().wake(core.devices._fetch_timer); });
+    }
+
+    // When a push that was not stored is next to be tried; unset with none pending a retry.
+    static std::optional<sys_ms> push_retry_due(core::Core& core) {
+        return on_loop(core, [&] { return core.devices._push_retry_at; });
+    }
+
+    // Core's one-off fetch of `namespaces`, as Devices asks for one.
+    static void fetch(
+            core::Core& core,
+            std::vector<config::Namespace> namespaces,
+            std::function<void(bool)> done) {
+        on_loop(core, [&] { core._fetch(std::move(namespaces), std::move(done)); });
     }
 
     // Returns the raw 32-byte seed for the account key identified by the given x25519 public key.
@@ -566,15 +982,6 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         return {x25519, mlkem768};
     }
 
-    // Cached PFS key entry as stored in the pfs_key_cache table.
-    // fetched_at and pubkeys are nullopt when the entry is a NAK (no valid keys).
-    struct PfsCacheEntry {
-        std::optional<int64_t> fetched_at;
-        std::optional<int64_t> nak_at;
-        std::optional<std::array<std::byte, 32>> pubkey_x25519;
-        std::optional<std::array<std::byte, 1184>> pubkey_mlkem768;
-    };
-
     // Returns true if any swarm node has handed us a hash in the given namespace.  Used by live
     // tests to detect that a poll completed and delivered at least one message.
     static bool has_any_namespace_sync(core::Core& core, config::Namespace ns) {
@@ -583,7 +990,8 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         return count > 0;
     }
 
-    // Seeds the pfs_key_cache with PFS keys for a remote session_id.
+    // Records a lookup of `remote_session_id` that found these keys: `usable` for
+    // PFS_KEY_REFRESH.
     static void seed_pfs_cache(
             core::Core& core,
             std::span<const std::byte, 33> remote_session_id,
@@ -592,34 +1000,28 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         core._store_pfs_keys(remote_session_id, x25519_pub, mlkem768_pub);
     }
 
-    // Seeds a NAK entry in the pfs_key_cache (remote has no published PFS keys).
+    // Records a lookup of `remote_session_id` that found nothing: `nak` for PFS_KEY_EMPTY_HOLD,
+    // so that sends to them go out at once with the non-PFS encryption.  With a key already held
+    // it re-confirms that instead, as the real outcome does.
     static void seed_pfs_nak(core::Core& core, std::span<const std::byte, 33> remote_session_id) {
-        core._store_pfs_nak(remote_session_id);
+        core._store_pfs_empty(remote_session_id);
     }
 
-    // Returns the pfs_key_cache entry for the given session_id, or nullopt if absent.
-    static std::optional<PfsCacheEntry> pfs_cache_entry(
+    // The scheduled retry of a failed lookup of `session_id` that sends wait on, if any.
+    static std::optional<sys_ms> pfs_retry_due(
             core::Core& core, std::span<const std::byte, 33> session_id) {
-        using X = sqlite::blob_guts<std::array<std::byte, 32>>;
-        using M = sqlite::blob_guts<std::array<std::byte, 1184>>;
-        auto row = core.db.conn()
-                           .prepared_maybe_get<
-                                   std::optional<int64_t>,
-                                   std::optional<int64_t>,
-                                   std::optional<X>,
-                                   std::optional<M>>(
-                                   "SELECT fetched_at, nak_at, pubkey_x25519, pubkey_mlkem768"
-                                   " FROM pfs_key_cache WHERE session_id = ?",
-                                   session_id);
-        if (!row)
-            return std::nullopt;
-        auto [fetched_at, nak_at, pk_x25519, pk_mlkem768] = *row;
-        return PfsCacheEntry{
-                fetched_at,
-                nak_at,
-                pk_x25519 ? std::optional{(std::array<std::byte, 32>)*pk_x25519} : std::nullopt,
-                pk_mlkem768 ? std::optional{(std::array<std::byte, 1184>)*pk_mlkem768}
-                            : std::nullopt};
+        b33 sid;
+        std::ranges::copy(session_id, sid.begin());
+        return core.call_get([&]() -> std::optional<sys_ms> {
+            auto it = core._pfs_retries.find(sid);
+            return it == core._pfs_retries.end() ? std::nullopt : it->second.due;
+        });
+    }
+    // Runs the scheduled retry now rather than after its backoff.
+    static void fire_pfs_retry(core::Core& core, std::span<const std::byte, 33> session_id) {
+        b33 sid;
+        std::ranges::copy(session_id, sid.begin());
+        core.call_get([&] { core._retry_pfs_fetch(sid); });
     }
 };
 
