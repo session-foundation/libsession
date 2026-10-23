@@ -1497,8 +1497,10 @@ A key that is none of the member's:
   21 retrieve reports more and finishes in a later round, one message at a time through a
   subscription, or with a poll landing between the two stores.  So the device records the key as
   suspect and fetches namespace 21, and only once a fetch sent after the key was seen has drained
-  does it decide.  A key that has become known by then was a rotation, and is nothing.  One still
-  unknown is rogue.  A suspect is kept across a restart, since -21 is not handed out twice: a
+  does it decide.  A key that has become known by then was a rotation, and is nothing.  So is the
+  current key of another group in view -- the link key its group message carries -- which is the
+  account's own, forked, and is never treated as a suspect at all once that group is in view.  One
+  still unknown is rogue.  A suspect is kept across a restart, since -21 is not handed out twice: a
   retrieve resumes after the last message it returned.
 - **If rogue, is reported to the user**, who is told that the recovery phrase is in someone else's
   hands.  If `v` is 2 or more, the device also takes its own current key as unpublished, so that its
@@ -1510,9 +1512,15 @@ A key that is none of the member's:
 What this leaves open is a swarm member that lags on 21 as well as on -21: the window of the race
 itself, accepted rather than closed with a timer.
 
-An account that has forked (see "One group per account") has two groups each publishing its own key,
-and each sees the other's as rogue.  That is what it is -- a holder of the seed outside this
-group -- and it is settled as any fork is, by the user keeping one group.
+An account that has forked (see "One group per account") has two groups each publishing its own key.
+Neither takes the other's for rogue: the fork is what the user is told of, and it is settled as any
+fork is, by the user choosing one group.  Only the X25519 half can be matched, since that is all a
+group message carries; a seed holder pairing a known X25519 key with an ML-KEM key of its own makes
+a key no one can decrypt from, which denies service and no more, and a seed holder can do that
+anyway.  Neither group publishes over the other's key in the meantime: two groups each republishing
+over the other on every push would be worse than the last to publish holding -21 until the fork is
+settled.  Dissolving a group takes the dissolving device's own key as unpublished, so that its next
+push -- after the fetch it asks for at once -- puts the account's key back over whatever -21 holds.
 
 
 # Push notifications

@@ -1027,6 +1027,13 @@ class Devices final : detail::CoreComponent {
     // over.
     void _judge_suspects();
 
+    // Whether a key seen on -21 is the current account key of a group in view other than ours (by
+    // its X25519 half; see the definition): the account's own, forked, and so never rogue.  The
+    // fork is what the user is told of, and the key is not published over either: two groups each
+    // republishing over the other on every push is worse than the last to publish holding -21
+    // until the fork is settled, and settling it republishes ours (see `_queue_dissolution`).
+    bool _other_groups_key(std::span<const std::byte, 32> x25519_pub);
+
     // Fetches the group now if anything is owed a push -- a change of ours, or the account's key
     // once PFS/PQ is enabled -- so that the push following the fetch carries it: a device
     // subscribed for pushes does not poll, and could otherwise hold it until the swarm next had

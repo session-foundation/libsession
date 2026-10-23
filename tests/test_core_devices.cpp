@@ -3282,10 +3282,11 @@ TEST_CASE(
 
     auto* net = attach_mock_network(*l.core);
     TestHelper::finish_fetch(*l.core);
-    REQUIRE(pushes(*net).size() == 1);
-    auto [tombstone, deleted] = pushed(*pushes(*net)[0]);
+    REQUIRE(dissolutions(*net).size() == 1);
+    auto [tombstone, deleted] = pushed(*dissolutions(*net)[0]);
     CHECK(deleted == nlohmann::json::array({"B1"}));
-    answer_upload(l.core, *net, true);
+    while (!pushes(*net).empty())
+        answer_upload(l.core, *net, true);
     CHECK(pending_pushes(l.core) == 0);
 
     TestHelper::deliver_device_message(*other, tombstone, in(10min), "T1");
@@ -6079,6 +6080,90 @@ TEST_CASE(
     CHECK(alerts == 1);
     CHECK_FALSE(l.applicant->devices.needs_push().account_pubkey);
     CHECK(pushes(*net).empty());
+}
+
+TEST_CASE(
+        "Devices - while forked, the other group's key on -21 is the fork's, not rogue",
+        "[core][devices][pfs][rogue]") {
+    Linking l;
+    int alerts = 0;
+    auto* net = watching(l.core, alerts);
+    REQUIRE(l.core->pfs_enabled());
+    REQUIRE_FALSE(l.core->devices.needs_push().account_pubkey);
+
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_device_group(*other);
+    auto show_other = [&] {
+        TestHelper::deliver_device_message(
+                *l.core, other->devices.build_device_group_message().message, in(10min), "B1");
+        REQUIRE(l.core->devices.membership(await).membership == device::Membership::Forked);
+    };
+
+    SECTION("seen after its group: no alert, nothing published over it, nothing to check") {
+        show_other();
+        TestHelper::deliver_pubkey_message(
+                *l.core, other->devices.build_account_pubkey_message(), "P2");
+        TestHelper::drain(*l.core);
+        CHECK(alerts == 0);
+        CHECK_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
+        CHECK_FALSE(l.core->devices.needs_push().account_pubkey);
+        CHECK(pushes(*net).empty());
+    }
+
+    SECTION("seen before its group: judged its once the fetch shows the group") {
+        TestHelper::deliver_pubkey_message(
+                *l.core, other->devices.build_account_pubkey_message(), "P2");
+        REQUIRE(device_fetch_asked(l.core, *net));
+        show_other();
+        REQUIRE(answer_fetch(l.core, *net) == 1);
+        CHECK(alerts == 0);
+        CHECK_FALSE(l.core->devices.needs_push().account_pubkey);
+        CHECK(pushes(*net).empty());
+
+        // Settled: nothing left waiting to be judged again.
+        TestHelper::finish_fetch(*l.core);
+        CHECK(alerts == 0);
+    }
+
+    SECTION("a key of no group in view: rogue, as ever") {
+        show_other();
+        TestHelper::deliver_pubkey_message(*l.core, foreign_pubkey_message(l.core), "P2");
+        REQUIRE(device_fetch_asked(l.core, *net));
+        REQUIRE(answer_fetch(l.core, *net) == 1);
+        CHECK(alerts == 1);
+        CHECK(l.core->devices.needs_push().account_pubkey);
+    }
+}
+
+TEST_CASE(
+        "Devices - settling a fork puts our key back over whatever -21 holds",
+        "[core][devices][pfs][dissolve]") {
+    Linking l;
+    int alerts = 0;
+    auto* net = watching(l.core, alerts);
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_device_group(*other);
+    auto theirs = *TestHelper::group_id(*other);
+    TestHelper::deliver_device_message(
+            *l.core, other->devices.build_device_group_message().message, in(10min), "B1");
+    TestHelper::deliver_pubkey_message(
+            *l.core, other->devices.build_account_pubkey_message(), "P2");
+    REQUIRE_FALSE(l.core->devices.needs_push().account_pubkey);
+
+    // The other group's key is no group's once it is dissolved, and ours goes over it after the
+    // fetch a push follows.
+    REQUIRE(l.core->devices.dissolve_group(theirs, await));
+    CHECK(l.core->devices.needs_push().account_pubkey);
+    REQUIRE(device_fetch_asked(l.core, *net));
+    REQUIRE(answer_fetch(l.core, *net) == 1);
+    CHECK(std::ranges::any_of(pushes(*net), [](const auto* p) {
+        auto namespaces = stored_namespaces(*p);
+        return std::ranges::find(namespaces, -21) != namespaces.end();
+    }));
+    while (!pushes(*net).empty())
+        answer_upload(l.core, *net, true);
+    CHECK_FALSE(l.core->devices.needs_push().account_pubkey);
+    CHECK(alerts == 0);
 }
 
 TEST_CASE(

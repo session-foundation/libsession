@@ -1976,6 +1976,7 @@ void Devices::_dissolve(
     }
     log::info(cat, "Dissolved {} other device group(s)", groups.size());
     _send_pending_pushes();
+    _push_soon();
 }
 
 void Devices::_queue_dissolution(
@@ -1997,6 +1998,11 @@ void Devices::_queue_dissolution(
     // Never renewed, and never among what a group push deletes: it is there to tell the dissolved
     // group's devices that are online now, and lapses with the messages it replaced.
     _queue_push(_build_dissolution(groups, t), std::move(obsolete));
+
+    // -21 may hold a dissolved group's key, each group publishing its own, and with ours marked
+    // published nothing would replace it before our next rotation.  So ours is owed again, whether
+    // or not it is theirs there: -21 holds one message, and a push after a fetch is cheap.
+    c.prepared_exec("UPDATE device_account_keys SET published = 0 WHERE rotated IS NULL");
 }
 
 void Devices::_dissolve_all_but(const device::GroupId& kept) {
@@ -3688,7 +3694,7 @@ void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool
                                     "failed"};
                     });
 
-            if (_mark_published(M, X) || !member)
+            if (_mark_published(M, X) || !member || _other_groups_key(X))
                 continue;
 
             // Not ours, as far as we know yet.  Whatever PFS/PQ says: a seed holder publishing a
@@ -3756,8 +3762,9 @@ void Devices::_judge_suspects() {
     for (size_t i = 0; i + X_SIZE + M_SIZE <= held->size(); i += X_SIZE + M_SIZE) {
         auto X = std::span<const std::byte, X_SIZE>{held->data() + i, X_SIZE};
         auto M = std::span<const std::byte, M_SIZE>{held->data() + i + X_SIZE, M_SIZE};
-        // Known now: another device's rotation, whose group message has since arrived.
-        if (!_mark_published(M, X))
+        // Known now: another device's rotation, whose group message has since arrived -- or the
+        // key of another group in view, whose message has.
+        if (!_mark_published(M, X) && !_other_groups_key(X))
             rogue = true;
     }
     if (!rogue)
@@ -3783,6 +3790,23 @@ void Devices::_judge_suspects() {
 
     // A fetch has just completed, which is all a push waits on.
     push_owed();
+}
+
+bool Devices::_other_groups_key(std::span<const std::byte, 32> x25519_pub) {
+    // A group message carries its group's current account key as its link key, but only the
+    // X25519 half, so that is all there is to match.  A seed holder pairing a known X25519 key with
+    // an ML-KEM key of its own makes one nobody can decrypt from, which denies service and no more,
+    // and a seed holder can do that anyway.
+    auto ours = _group_id();
+    return conn()
+            .prepared_maybe_get<int>(
+                    "SELECT 1 FROM device_groups"
+                    " WHERE link_x25519 = ?1 AND expires_at > ?2 AND (?3 IS NULL OR group_id != "
+                    "?3)",
+                    x25519_pub,
+                    epoch_seconds(clock_now_s()),
+                    ours ? std::optional{std::span<const std::byte>{ours->value}} : std::nullopt)
+            .has_value();
 }
 
 bool Devices::_mark_published(
