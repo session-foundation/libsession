@@ -190,7 +190,7 @@ void Globals::create_account(result_function<> cb) {
 }
 
 void Globals::create_account(await_t) {
-    jq().call_get([this] { _create_account(); });
+    core.call_get([this] { _create_account(); });
 }
 
 void Globals::_create_account() {
@@ -223,7 +223,7 @@ void Globals::restore_account(predefined_seed seed, result_function<> cb) {
 }
 
 void Globals::restore_account(const predefined_seed& seed, await_t) {
-    jq().call_get([this, &seed] { _restore_account(seed); });
+    core.call_get([this, &seed] { _restore_account(seed); });
 }
 
 void Globals::_restore_account(const predefined_seed& seed) {

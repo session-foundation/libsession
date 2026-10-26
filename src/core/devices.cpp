@@ -478,7 +478,7 @@ void Devices::device_info(result_function<std::pair<device::Info, bool>> cb) {
 }
 
 std::pair<device::Info, bool> Devices::device_info(await_t) {
-    return jq().call_get([this] { return _device_info(); });
+    return core.call_get([this] { return _device_info(); });
 }
 
 std::pair<device::Info, bool> Devices::_device_info() {
@@ -505,7 +505,7 @@ void Devices::update_info(device::Info info, result_function<> cb) {
 }
 
 void Devices::update_info(const device::Info& info, await_t) {
-    jq().call_get([this, &info] { _update_info(info); });
+    core.call_get([this, &info] { _update_info(info); });
 }
 
 void Devices::_update_info(const device::Info& info) {
@@ -1173,7 +1173,7 @@ void Devices::build_link_request(result_function<LinkRequestResult> cb) {
 }
 
 Devices::LinkRequestResult Devices::build_link_request(await_t) {
-    return jq().call_get([this] { return _build_link_request(); });
+    return core.call_get([this] { return _build_link_request(); });
 }
 
 Devices::LinkRequestResult Devices::_build_link_request() {
