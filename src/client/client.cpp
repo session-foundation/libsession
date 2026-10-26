@@ -407,7 +407,9 @@ void Client::_init() {
     _disk_jq.emplace(*_disk_loop);
 
     // Core's send queue is in-memory, so anything still mid-flight when the last run ended is not
-    // resumed and its outcome is unknowable.  Say so rather than guessing either way.
+    // resumed and its outcome is unknowable.  Say so rather than guessing either way.  That
+    // includes a send whose confirmation arrived while storage was suspended and was waiting for
+    // the resume when the process was killed: it did go out.
     auto c = core.database().conn();
     c.prepared_exec(
             R"(
@@ -734,9 +736,23 @@ void Client::set_cache_dir(std::filesystem::path dir) {
 }
 
 Client::~Client() {
+    // A disk job waiting for storage to resume would keep the call_get below waiting for ever.  It
+    // runs to its end instead, as it would have on resume.
+    core.database().resume();
+
     // First, while everything a disk job reaches is still here.  On the disk loop, so that a job
     // already running there finishes before the queue stops rather than alongside it.
     _disk_loop->call_get([this] { _disk_jq->stop(); });
+}
+
+sqlite::Database::suspend_result Client::suspend_storage(
+        std::chrono::milliseconds wait, bool interrupt, bool checkpoint) {
+    return core.suspend_storage(wait, interrupt, checkpoint);
+}
+
+void Client::resume_storage() {
+    core.resume_storage();
+    call([this] { _pump_auto_downloads(); });
 }
 
 void Client::_post_disk(std::function<void()> job) {
@@ -2775,7 +2791,8 @@ void Client::_auto_download(const ConversationId& convo_id, int64_t message_id) 
 }
 
 void Client::_pump_auto_downloads() {
-    if (_auto_pumping)
+    // Resuming storage pumps again.
+    if (_auto_pumping || core.storage_suspended())
         return;
     _auto_pumping = true;
 
