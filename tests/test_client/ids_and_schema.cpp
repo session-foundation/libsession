@@ -212,9 +212,12 @@ TEST_CASE(
 
     // Run again over the database it already ran on, which is the one starting point a test can
     // build without carrying the old schema around: the rebuild does not care what it rebuilds.
+    // With every migration after it: the rebuild makes the tables as they were when it was
+    // written, and those add to them.
     db([](sqlite::Connection& conn) {
         return conn.prepared_exec(
-                "DELETE FROM migrations_applied WHERE name = 'client:006_ids_never_reused'");
+                "DELETE FROM migrations_applied"
+                " WHERE name LIKE 'client:%' AND name >= 'client:006_ids_never_reused'");
     });
     c.reopen();
     REQUIRE(TestHelper::migration_applied(c->core, "client:006_ids_never_reused"));

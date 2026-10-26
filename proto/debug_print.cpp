@@ -322,6 +322,8 @@ namespace {
             print(m.groupupdatemessage(), out, depth + 1);
             close_msg(out, depth);
         }
+        if (m.has_syncencryption())
+            line(out, depth, "syncEncryption", 1000, fmt::format("{}", m.syncencryption()));
         unknown(out, depth, m.unknown_fields());
     }
 

@@ -114,9 +114,9 @@ class update_throttle {
 
 static SendState state_for(core::MessageSendStatus status) {
     switch (status) {
-        case core::MessageSendStatus::awaiting_keys: return SendState::pending;
-        case core::MessageSendStatus::sending:
-        case core::MessageSendStatus::retrying: return SendState::sending;
+        case core::MessageSendStatus::awaiting_keys:
+        case core::MessageSendStatus::retrying: return SendState::pending;
+        case core::MessageSendStatus::sending: return SendState::sending;
         case core::MessageSendStatus::success: return SendState::sent;
         case core::MessageSendStatus::network_error:
         case core::MessageSendStatus::no_network:
@@ -374,8 +374,8 @@ static std::optional<int64_t> find_conversation(sqlite::Connection& c, const Con
 
 core::callbacks Client::_core_callbacks() {
     // Capturing `this` here is safe despite running in Core's member-init list: every callback we
-    // install can only fire from receive_messages(), send_dm(), or a config merge, none of which
-    // Core calls during its own construction.
+    // install can only fire from receive_messages(), send_dm(), a config merge, or a change to the
+    // device group, none of which Core makes during its own construction.
     //
     // These are Client's own wiring, and an application cannot supply any of its own: what it is
     // promised is `client::callbacks`, which is reported through the dispatcher and carries whole
@@ -391,15 +391,61 @@ core::callbacks Client::_core_callbacks() {
 
     cb.message_send_status = [this](int64_t id,
                                     core::MessageSendStatus status,
-                                    std::optional<std::string_view> swarm_hash) {
-        _on_send_status(id, status, swarm_hash);
+                                    std::optional<std::string_view> swarm_hash,
+                                    std::optional<core::MessageEncryption> encryption) {
+        _on_send_status(id, status, swarm_hash, encryption);
     };
 
     cb.configs_changed = [this](std::span<const config::Namespace> changed) {
         _on_configs_changed(changed);
     };
 
+    // Only when there is somewhere to relay to, since Core skips working out what changed for an
+    // application that has not asked.
+    if (_cbs->devices)
+        cb.devices = this;
+
+    if (_cbs->rogue_account_key)
+        cb.rogue_account_key = [this] {
+            _emit([](const callbacks& cbs) { cbs.rogue_account_key(); });
+        };
+
+    // Copied: what Core lends is valid for its call only, and the delivery comes later.
+    if (_cbs->pfs_keys_fetched)
+        cb.pfs_keys_fetched = [this](std::span<const std::byte, 33> session_id,
+                                     core::PfsKeyFetch result) {
+            b33 sid;
+            std::ranges::copy(session_id, sid.begin());
+            _emit([sid, result](const callbacks& cbs) { cbs.pfs_keys_fetched(sid, result); });
+        };
+
     return cb;
+}
+
+void Client::link_request_added(core::device::LinkRequest request) {
+    _emit([request = std::move(request)](const callbacks& cbs) mutable {
+        cbs.devices->link_request_added(std::move(request));
+    });
+}
+
+void Client::link_request_ended(int reqid, core::device::LinkRequestEnd why) {
+    _emit([reqid, why](const callbacks& cbs) { cbs.devices->link_request_ended(reqid, why); });
+}
+
+void Client::devices_replaced(core::device::map devices) {
+    _emit([devices = std::move(devices)](const callbacks& cbs) mutable {
+        cbs.devices->devices_replaced(std::move(devices));
+    });
+}
+
+void Client::device_membership_changed(core::device::Info device) {
+    _emit([device = std::move(device)](const callbacks& cbs) mutable {
+        cbs.devices->device_membership_changed(std::move(device));
+    });
+}
+
+void Client::membership_changed(core::device::Membership membership) {
+    _emit([membership](const callbacks& cbs) { cbs.devices->membership_changed(membership); });
 }
 
 void Client::_init() {
@@ -3733,7 +3779,7 @@ static constexpr auto WIRE_REF_TARGET = R"(
 static const std::string MESSAGE_COLUMNS = R"(
     SELECT m.id, m.swarm_hash, a.session_id, m.outgoing, m.timestamp, m.body, m.send_state,
            m.sync_send_state, m.deleted, m.gallery,
-           ra.session_id, m.reply_timestamp, {}
+           ra.session_id, m.reply_timestamp, {}, m.encryption
     FROM messages m
     JOIN accounts a ON a.id = m.sender
     LEFT JOIN accounts ra ON ra.id = m.reply_author
@@ -3856,7 +3902,8 @@ std::vector<Message> Client::_build_messages(
               gallery,
               reply_author,
               reply_ts,
-              reply_id] =
+              reply_id,
+              encryption] =
                 sqlite::get<
                         int64_t,
                         std::optional<std::string>,
@@ -3870,7 +3917,8 @@ std::vector<Message> Client::_build_messages(
                         int,
                         std::optional<sqlite::blob_guts<b33>>,
                         std::optional<int64_t>,
-                        std::optional<int64_t>>(st);
+                        std::optional<int64_t>,
+                        std::optional<int>>(st);
         out.push_back(Message{
                 .id = id,
                 .conversation = convo,
@@ -3882,6 +3930,9 @@ std::vector<Message> Client::_build_messages(
                                          : std::nullopt,
                 .sync_send_state = sync_send_state
                                          ? std::optional{static_cast<SendState>(*sync_send_state)}
+                                         : std::nullopt,
+                .encryption = encryption ? std::optional{static_cast<core::MessageEncryption>(
+                                                   *encryption)}
                                          : std::nullopt,
                 .hash = std::move(swarm_hash),
                 .gallery = gallery != 0,
@@ -4367,19 +4418,43 @@ void Client::_dispatch_sends(
             to_self ? core.send_dm(self, synced, now) : core.send_dm(id.session_id(), content, now);
     _send_ids[core_id] = OutgoingSend{client_id, to_self};
 
+    // The sync copy waits to say how the recipient's was encrypted, which Core decides only once it
+    // has the recipient's keys.  Registered before the stash below is drained, since that may be
+    // what releases it.
+    if (!to_self)
+        _pending_syncs[core_id] = PendingSync{client_id, synced.SerializeAsString(), now};
+
     // send_dm() reports its first status synchronously, i.e. before we knew the id to map it to.
     if (auto stashed = _early_status.extract(core_id)) {
-        auto& [status, hash] = stashed.mapped();
-        _apply_send_status(client_id, status, false, to_self ? opt_view(hash) : std::nullopt);
+        auto& [status, hash, encryption] = stashed.mapped();
+        _apply_send_status(
+                client_id, status, false, to_self ? opt_view(hash) : std::nullopt, encryption);
+        _release_sync(core_id, status, encryption);
     }
+}
 
-    if (!to_self) {
-        auto sync_id = core.send_dm(self, synced, now);
-        _sync_sends[sync_id] = client_id;
-        if (auto stashed = _early_status.extract(sync_id)) {
-            auto& [status, hash] = stashed.mapped();
-            _apply_send_status(client_id, status, true, opt_view(hash));
-        }
+void Client::_release_sync(
+        int64_t core_id,
+        core::MessageSendStatus status,
+        std::optional<core::MessageEncryption> encryption) {
+    auto it = _pending_syncs.find(core_id);
+    if (it == _pending_syncs.end() || !(encryption || is_terminal(status)))
+        return;
+    auto pending = std::move(it->second);
+    _pending_syncs.erase(it);
+
+    // Without the field when the recipient's copy was never encrypted: our other devices still
+    // need the message, and only lack the detail.
+    SessionProtos::Content synced;
+    synced.ParseFromString(pending.synced);
+    if (encryption)
+        synced.mutable_datamessage()->set_syncencryption(static_cast<uint32_t>(*encryption));
+
+    auto sync_id = core.send_dm(core.globals.session_id(), synced, pending.timestamp);
+    _sync_sends[sync_id] = pending.client_id;
+    if (auto stashed = _early_status.extract(sync_id)) {
+        auto& [sync_status, hash, sync_encryption] = stashed.mapped();
+        _apply_send_status(pending.client_id, sync_status, true, opt_view(hash));
     }
 }
 
@@ -6209,7 +6284,7 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
     auto msgid = msgid_of(content);
 
     bool created = false, inserted = false, renamed = false, contact_changed = false,
-         approved_them = false;
+         approved_them = false, encryption_filled = false;
     int64_t client_id = 0;
     std::vector<std::string> arrived_urls;
     {
@@ -6286,12 +6361,25 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
                 log::warning(cat, "Ignoring a quote with an unparseable author");
         }
 
+        // What this envelope used is what the message was sent with only when it was sent to us:
+        // an incoming message, or a note to self.  Our own message to someone else comes back
+        // encrypted to us, which says nothing of what reached them; the device that sent it says
+        // that in the copy, if it knew.
+        std::optional<int> encryption;
+        if (!outgoing || is_me(convo_with))
+            encryption = static_cast<int>(msg.encryption);
+        else if (auto e = data.syncencryption();
+                 data.has_syncencryption() &&
+                 e >= static_cast<uint32_t>(core::MessageEncryption::v1) &&
+                 e <= static_cast<uint32_t>(core::MessageEncryption::v2_pfs))
+            encryption = static_cast<int>(e);
+
         inserted = c.prepared_exec(
                            R"(
             INSERT OR IGNORE INTO messages
                 (conversation, msgid, swarm_hash, sender, outgoing, timestamp, body,
-                 send_state, reply_author, reply_timestamp, reply_msgid)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 send_state, reply_author, reply_timestamp, reply_msgid, encryption)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         )",
                            convo.id,
                            msgid,
@@ -6306,7 +6394,8 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
                                     : std::optional<int>{},
                            reply_author,
                            reply_ts,
-                           reply_msgid) > 0;
+                           reply_msgid,
+                           encryption) > 0;
         if (inserted) {
             client_id = c.sql.getLastInsertRowid();
             c.prepared_exec(
@@ -6326,6 +6415,19 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
             )",
                         convo.id,
                         epoch_ms(ts));
+        } else if (outgoing && encryption && msgid) {
+            // Our own message already here, as on the device that sent it: what the copy says
+            // fills in only what was never recorded, and never replaces what was.
+            if (auto filled = c.prepared_maybe_get<int64_t>(
+                        "UPDATE messages SET encryption = ? WHERE conversation = ? AND timestamp "
+                        "= ? AND msgid = ? AND encryption IS NULL RETURNING id",
+                        *encryption,
+                        convo.id,
+                        epoch_ms(ts),
+                        *msgid)) {
+                client_id = *filled;
+                encryption_filled = true;
+            }
         }
 
         // Skipped for a self-send: the LokiProfile on one of those is our own, which belongs to the
@@ -6363,6 +6465,8 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
         _auto_download(convo_id, client_id);
         _emit_message(true, client_id);
     }
+    if (encryption_filled)
+        _emit_message(false, client_id);
     if (inserted || renamed)
         _touch(convo_id);
 
@@ -6375,7 +6479,8 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
 void Client::_on_send_status(
         int64_t core_id,
         core::MessageSendStatus status,
-        std::optional<std::string_view> swarm_hash) {
+        std::optional<std::string_view> swarm_hash,
+        std::optional<core::MessageEncryption> encryption) {
     if (auto quiet = _quiet_sends.find(core_id); quiet != _quiet_sends.end()) {
         if (is_terminal(status)) {
             _quiet_sends.erase(quiet);
@@ -6406,21 +6511,24 @@ void Client::_on_send_status(
                 core_id,
                 EarlyStatus{
                         status,
-                        swarm_hash ? std::optional{std::string{*swarm_hash}} : std::nullopt});
+                        swarm_hash ? std::optional{std::string{*swarm_hash}} : std::nullopt,
+                        encryption});
         return;
     }
 
     auto [client_id, own_swarm] = it->second;
     if (is_terminal(status))
         _send_ids.erase(it);
-    _apply_send_status(client_id, status, false, own_swarm ? swarm_hash : std::nullopt);
+    _apply_send_status(client_id, status, false, own_swarm ? swarm_hash : std::nullopt, encryption);
+    _release_sync(core_id, status, encryption);
 }
 
 void Client::_apply_send_status(
         int64_t client_id,
         core::MessageSendStatus status,
         bool sync,
-        std::optional<std::string_view> swarm_hash) {
+        std::optional<std::string_view> swarm_hash,
+        std::optional<core::MessageEncryption> encryption) {
     auto state = state_for(status);
     std::optional<ConversationId> convo;
     {
@@ -6442,6 +6550,13 @@ void Client::_apply_send_status(
                                "UPDATE messages SET swarm_hash = ? WHERE id = ? AND swarm_hash IS "
                                "NULL",
                                *swarm_hash,
+                               client_id) > 0;
+
+        if (encryption && !sync)
+            changed |= c.prepared_exec(
+                               "UPDATE messages SET encryption = ?1 WHERE id = ?2 AND encryption "
+                               "IS NOT ?1",
+                               static_cast<int>(*encryption),
                                client_id) > 0;
 
         if (changed) {

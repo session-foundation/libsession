@@ -3537,6 +3537,7 @@ class DataMessage final :
     kTimestampFieldNumber = 7,
     kFlagsFieldNumber = 4,
     kBlocksCommunityMessageRequestsFieldNumber = 106,
+    kSyncEncryptionFieldNumber = 1000,
   };
   // repeated .SessionProtos.AttachmentPointer attachments = 2;
   int attachments_size() const;
@@ -3757,6 +3758,19 @@ class DataMessage final :
   void _internal_set_blockscommunitymessagerequests(bool value);
   public:
 
+  // optional uint32 syncEncryption = 1000;
+  bool has_syncencryption() const;
+  private:
+  bool _internal_has_syncencryption() const;
+  public:
+  void clear_syncencryption();
+  uint32_t syncencryption() const;
+  void set_syncencryption(uint32_t value);
+  private:
+  uint32_t _internal_syncencryption() const;
+  void _internal_set_syncencryption(uint32_t value);
+  public:
+
   // @@protoc_insertion_point(class_scope:SessionProtos.DataMessage)
  private:
   class _Internal;
@@ -3780,6 +3794,7 @@ class DataMessage final :
     uint64_t timestamp_;
     uint32_t flags_;
     bool blockscommunitymessagerequests_;
+    uint32_t syncencryption_;
   };
   union { Impl_ _impl_; };
   friend struct ::TableStruct_SessionProtos_2eproto;
@@ -10895,6 +10910,34 @@ inline void DataMessage::set_allocated_groupupdatemessage(::SessionProtos::Group
   }
   _impl_.groupupdatemessage_ = groupupdatemessage;
   // @@protoc_insertion_point(field_set_allocated:SessionProtos.DataMessage.groupUpdateMessage)
+}
+
+// optional uint32 syncEncryption = 1000;
+inline bool DataMessage::_internal_has_syncencryption() const {
+  bool value = (_impl_._has_bits_[0] & 0x00000800u) != 0;
+  return value;
+}
+inline bool DataMessage::has_syncencryption() const {
+  return _internal_has_syncencryption();
+}
+inline void DataMessage::clear_syncencryption() {
+  _impl_.syncencryption_ = 0u;
+  _impl_._has_bits_[0] &= ~0x00000800u;
+}
+inline uint32_t DataMessage::_internal_syncencryption() const {
+  return _impl_.syncencryption_;
+}
+inline uint32_t DataMessage::syncencryption() const {
+  // @@protoc_insertion_point(field_get:SessionProtos.DataMessage.syncEncryption)
+  return _internal_syncencryption();
+}
+inline void DataMessage::_internal_set_syncencryption(uint32_t value) {
+  _impl_._has_bits_[0] |= 0x00000800u;
+  _impl_.syncencryption_ = value;
+}
+inline void DataMessage::set_syncencryption(uint32_t value) {
+  _internal_set_syncencryption(value);
+  // @@protoc_insertion_point(field_set:SessionProtos.DataMessage.syncEncryption)
 }
 
 // -------------------------------------------------------------------

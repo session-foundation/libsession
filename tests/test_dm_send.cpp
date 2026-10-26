@@ -42,11 +42,14 @@ std::span<const std::byte> content_bytes() {
 TEST_CASE("send_dm: v2 PFS round-trip", "[core][send_dm]") {
     std::vector<ReceivedMessage> received;
     std::vector<MessageSendStatus> statuses;
+    std::vector<std::optional<MessageEncryption>> encryptions;
 
     callbacks sender_cbs;
-    sender_cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto) {
-        statuses.push_back(s);
-    };
+    sender_cbs.message_send_status =
+            [&](int64_t, MessageSendStatus s, auto, std::optional<MessageEncryption> e) {
+                statuses.push_back(s);
+                encryptions.push_back(e);
+            };
 
     callbacks recip_cbs;
     recip_cbs.message_received = [&](ReceivedMessage&& m) { received.push_back(std::move(m)); };
@@ -72,6 +75,9 @@ TEST_CASE("send_dm: v2 PFS round-trip", "[core][send_dm]") {
     REQUIRE(statuses.size() == 2);
     CHECK(statuses[0] == MessageSendStatus::sending);
     CHECK(statuses[1] == MessageSendStatus::success);
+    // What it was encrypted with, reported once decided and again on success.
+    CHECK(encryptions == std::vector<std::optional<MessageEncryption>>{
+                                 MessageEncryption::v2_pfs, MessageEncryption::v2_pfs});
 
     // What went onto the wire, fed back in as the recipient's swarm would deliver it.
     SwarmMessage sm;
@@ -83,8 +89,7 @@ TEST_CASE("send_dm: v2 PFS round-trip", "[core][send_dm]") {
     recipient->receive_messages({&sm, 1}, config::Namespace::Default, true);
 
     REQUIRE(received.size() == 1);
-    CHECK(received[0].version == 2);
-    CHECK(received[0].pfs_encrypted);
+    CHECK(received[0].encryption == MessageEncryption::v2_pfs);
     CHECK(std::ranges::equal(received[0].content, MINIMAL_CONTENT));
 }
 
@@ -95,7 +100,7 @@ TEST_CASE("send_dm: v1 fallback on NAK", "[core][send_dm]") {
     std::vector<MessageSendStatus> statuses;
 
     callbacks sender_cbs;
-    sender_cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto) {
+    sender_cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto, auto) {
         statuses.push_back(s);
     };
 
@@ -129,8 +134,7 @@ TEST_CASE("send_dm: v1 fallback on NAK", "[core][send_dm]") {
     recipient->receive_messages({&sm, 1}, config::Namespace::Default, true);
 
     REQUIRE(received.size() == 1);
-    CHECK(received[0].version == 1);
-    CHECK_FALSE(received[0].pfs_encrypted);
+    CHECK(received[0].encryption == MessageEncryption::v1);
 }
 
 // ── V2 non-PFS (force_v2=true, NAK) ────────────────────────────────────────────────────────────
@@ -140,7 +144,7 @@ TEST_CASE("send_dm: v2 non-PFS with force_v2", "[core][send_dm]") {
     std::vector<MessageSendStatus> statuses;
 
     callbacks sender_cbs;
-    sender_cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto) {
+    sender_cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto, auto) {
         statuses.push_back(s);
     };
 
@@ -175,8 +179,7 @@ TEST_CASE("send_dm: v2 non-PFS with force_v2", "[core][send_dm]") {
     recipient->receive_messages({&sm, 1}, config::Namespace::Default, true);
 
     REQUIRE(received.size() == 1);
-    CHECK(received[0].version == 2);
-    CHECK_FALSE(received[0].pfs_encrypted);
+    CHECK(received[0].encryption == MessageEncryption::v2_basic);
 }
 
 // ── No network error ────────────────────────────────────────────────────────────────────────────
@@ -185,7 +188,9 @@ TEST_CASE("send_dm: no_network once the keys are known but nothing can send", "[
     std::vector<MessageSendStatus> statuses;
 
     callbacks cbs;
-    cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto) { statuses.push_back(s); };
+    cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto, auto) {
+        statuses.push_back(s);
+    };
 
     TempCore sender{cbs};
     TestHelper::seed_pfs_nak(*sender, DUMMY_SID);
@@ -203,7 +208,9 @@ TEST_CASE("send_dm: no_network when no cache and no network", "[core][send_dm]")
     std::vector<MessageSendStatus> statuses;
 
     callbacks cbs;
-    cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto) { statuses.push_back(s); };
+    cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto, auto) {
+        statuses.push_back(s);
+    };
 
     TempCore sender{cbs};
 
@@ -239,7 +246,9 @@ TEST_CASE("send_dm: network_error when store fails", "[core][send_dm]") {
     std::vector<MessageSendStatus> statuses;
 
     callbacks cbs;
-    cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto) { statuses.push_back(s); };
+    cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto, auto) {
+        statuses.push_back(s);
+    };
 
     TempCore sender{cbs};
     auto* net = attach_mock_network(*sender);
@@ -277,7 +286,9 @@ TEST_CASE("send_dm: success waits for the store to be answered", "[core][send_dm
     std::vector<MessageSendStatus> statuses;
 
     callbacks cbs;
-    cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto) { statuses.push_back(s); };
+    cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto, auto) {
+        statuses.push_back(s);
+    };
 
     TempCore sender{cbs};
     auto* net = attach_mock_network(*sender);
@@ -377,7 +388,9 @@ TEST_CASE(
     std::vector<PfsKeyFetch> fetches;
 
     callbacks cbs;
-    cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto) { statuses.push_back(s); };
+    cbs.message_send_status = [&](int64_t, MessageSendStatus s, auto, auto) {
+        statuses.push_back(s);
+    };
     cbs.pfs_keys_fetched = [&](std::span<const std::byte, 33>, PfsKeyFetch r) {
         fetches.push_back(r);
     };
@@ -394,13 +407,16 @@ TEST_CASE(
     REQUIRE(net->sent_requests.size() == 1);
     CHECK(net->sent_requests[0].request.endpoint == "retrieve");
 
-    // A *failed* fetch must still release the send rather than stranding it forever.
+    // A failed fetch holds it, with no key to fall back on, until a retry settles it.
     REQUIRE(fail_retrieves(*net) == 1);
+    CHECK(stores(*net).empty());
+    CHECK(statuses.back() == MessageSendStatus::retrying);
 
-    REQUIRE(fetches.size() == 1);
-    CHECK(fetches[0] == PfsKeyFetch::failed);
+    TestHelper::fire_pfs_retry(*sender, DUMMY_SID);
+    REQUIRE(answer_retrieves(*net) == 1);
+
+    CHECK(fetches == std::vector{PfsKeyFetch::failed, PfsKeyFetch::not_found});
     REQUIRE(accept_stores(*net) == 1);
-    REQUIRE(statuses.size() >= 2);
     CHECK(statuses.back() == MessageSendStatus::success);
 }
 
@@ -425,7 +441,7 @@ TEST_CASE(
 
     // Settling one fetch drains the whole queue for that recipient, even though each send asked
     // for the keys in its own right.
-    REQUIRE(fail_retrieves(*net, 1) == 1);
+    REQUIRE(answer_retrieves(*net, {}, 1) == 1);
 
     CHECK(stores(*net).size() == 3);
     CHECK(fetches.size() == 1);
@@ -447,6 +463,6 @@ TEST_CASE(
     sender->send_dm(DUMMY_SID, content_bytes(), clock_now_ms());
     REQUIRE(!net->sent_requests.empty());
 
-    CHECK_NOTHROW(fail_retrieves(*net));
+    CHECK_NOTHROW(answer_retrieves(*net));
     CHECK(stores(*net).size() == 1);
 }

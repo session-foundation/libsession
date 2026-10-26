@@ -63,10 +63,9 @@ std::vector<std::vector<std::byte>> renamed(config::UserProfile& theirs, std::st
 
 /// A member's answer to the fetch's single retrieve, carrying `messages` under `hash`.
 std::string answer(const std::vector<std::vector<std::byte>>& messages, std::string_view hash) {
-    nlohmann::json body;
-    body["messages"] = nlohmann::json::array();
+    auto body = retrieved_body();
     for (const auto& m : messages)
-        body["messages"].push_back({{"data", oxenc::to_base64(m)}, {"hash", hash}});
+        body["messages"].push_back(retrieved_message(m, hash));
     return nlohmann::json{{"results", {{{"code", 200}, {"body", std::move(body)}}}}}.dump();
 }
 

@@ -264,7 +264,8 @@ PROTOBUF_CONSTEXPR DataMessage::DataMessage(
   , /*decltype(_impl_.groupupdatemessage_)*/nullptr
   , /*decltype(_impl_.timestamp_)*/uint64_t{0u}
   , /*decltype(_impl_.flags_)*/0u
-  , /*decltype(_impl_.blockscommunitymessagerequests_)*/false} {}
+  , /*decltype(_impl_.blockscommunitymessagerequests_)*/false
+  , /*decltype(_impl_.syncencryption_)*/0u} {}
 struct DataMessageDefaultTypeInternal {
   PROTOBUF_CONSTEXPR DataMessageDefaultTypeInternal()
       : _instance(::_pbi::ConstantInitialized{}) {}
@@ -6271,6 +6272,9 @@ class DataMessage::_Internal {
   static void set_has_groupupdatemessage(HasBits* has_bits) {
     (*has_bits)[0] |= 128u;
   }
+  static void set_has_syncencryption(HasBits* has_bits) {
+    (*has_bits)[0] |= 2048u;
+  }
 };
 
 const ::SessionProtos::DataMessage_Quote&
@@ -6317,7 +6321,8 @@ DataMessage::DataMessage(const DataMessage& from)
     , decltype(_impl_.groupupdatemessage_){nullptr}
     , decltype(_impl_.timestamp_){}
     , decltype(_impl_.flags_){}
-    , decltype(_impl_.blockscommunitymessagerequests_){}};
+    , decltype(_impl_.blockscommunitymessagerequests_){}
+    , decltype(_impl_.syncencryption_){}};
 
   _internal_metadata_.MergeFrom<std::string>(from._internal_metadata_);
   _impl_.body_.InitDefault();
@@ -6360,8 +6365,8 @@ DataMessage::DataMessage(const DataMessage& from)
     _this->_impl_.groupupdatemessage_ = new ::SessionProtos::GroupUpdateMessage(*from._impl_.groupupdatemessage_);
   }
   ::memcpy(&_impl_.timestamp_, &from._impl_.timestamp_,
-    static_cast<size_t>(reinterpret_cast<char*>(&_impl_.blockscommunitymessagerequests_) -
-    reinterpret_cast<char*>(&_impl_.timestamp_)) + sizeof(_impl_.blockscommunitymessagerequests_));
+    static_cast<size_t>(reinterpret_cast<char*>(&_impl_.syncencryption_) -
+    reinterpret_cast<char*>(&_impl_.timestamp_)) + sizeof(_impl_.syncencryption_));
   // @@protoc_insertion_point(copy_constructor:SessionProtos.DataMessage)
 }
 
@@ -6385,6 +6390,7 @@ inline void DataMessage::SharedCtor(
     , decltype(_impl_.timestamp_){uint64_t{0u}}
     , decltype(_impl_.flags_){0u}
     , decltype(_impl_.blockscommunitymessagerequests_){false}
+    , decltype(_impl_.syncencryption_){0u}
   };
   _impl_.body_.InitDefault();
   #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
@@ -6467,10 +6473,10 @@ void DataMessage::Clear() {
       _impl_.groupupdatemessage_->Clear();
     }
   }
-  if (cached_has_bits & 0x00000700u) {
+  if (cached_has_bits & 0x00000f00u) {
     ::memset(&_impl_.timestamp_, 0, static_cast<size_t>(
-        reinterpret_cast<char*>(&_impl_.blockscommunitymessagerequests_) -
-        reinterpret_cast<char*>(&_impl_.timestamp_)) + sizeof(_impl_.blockscommunitymessagerequests_));
+        reinterpret_cast<char*>(&_impl_.syncencryption_) -
+        reinterpret_cast<char*>(&_impl_.timestamp_)) + sizeof(_impl_.syncencryption_));
   }
   _impl_._has_bits_.Clear();
   _internal_metadata_.Clear<std::string>();
@@ -6603,6 +6609,15 @@ const char* DataMessage::_InternalParse(const char* ptr, ::_pbi::ParseContext* c
         } else
           goto handle_unusual;
         continue;
+      // optional uint32 syncEncryption = 1000;
+      case 1000:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 64)) {
+          _Internal::set_has_syncencryption(&has_bits);
+          _impl_.syncencryption_ = ::PROTOBUF_NAMESPACE_ID::internal::ReadVarint32(&ptr);
+          CHK_(ptr);
+        } else
+          goto handle_unusual;
+        continue;
       default:
         goto handle_unusual;
     }  // switch
@@ -6721,6 +6736,12 @@ uint8_t* DataMessage::_InternalSerialize(
         _Internal::groupupdatemessage(this).GetCachedSize(), target, stream);
   }
 
+  // optional uint32 syncEncryption = 1000;
+  if (cached_has_bits & 0x00000800u) {
+    target = stream->EnsureSpace(target);
+    target = ::_pbi::WireFormatLite::WriteUInt32ToArray(1000, this->_internal_syncencryption(), target);
+  }
+
   if (PROTOBUF_PREDICT_FALSE(_internal_metadata_.have_unknown_fields())) {
     target = stream->WriteRaw(_internal_metadata_.unknown_fields<std::string>(::PROTOBUF_NAMESPACE_ID::internal::GetEmptyString).data(),
         static_cast<int>(_internal_metadata_.unknown_fields<std::string>(::PROTOBUF_NAMESPACE_ID::internal::GetEmptyString).size()), target);
@@ -6810,7 +6831,7 @@ size_t DataMessage::ByteSizeLong() const {
     }
 
   }
-  if (cached_has_bits & 0x00000700u) {
+  if (cached_has_bits & 0x00000f00u) {
     // optional uint64 timestamp = 7;
     if (cached_has_bits & 0x00000100u) {
       total_size += ::_pbi::WireFormatLite::UInt64SizePlusOne(this->_internal_timestamp());
@@ -6824,6 +6845,13 @@ size_t DataMessage::ByteSizeLong() const {
     // optional bool blocksCommunityMessageRequests = 106;
     if (cached_has_bits & 0x00000400u) {
       total_size += 2 + 1;
+    }
+
+    // optional uint32 syncEncryption = 1000;
+    if (cached_has_bits & 0x00000800u) {
+      total_size += 2 +
+        ::_pbi::WireFormatLite::UInt32Size(
+          this->_internal_syncencryption());
     }
 
   }
@@ -6882,7 +6910,7 @@ void DataMessage::MergeFrom(const DataMessage& from) {
           from._internal_groupupdatemessage());
     }
   }
-  if (cached_has_bits & 0x00000700u) {
+  if (cached_has_bits & 0x00000f00u) {
     if (cached_has_bits & 0x00000100u) {
       _this->_impl_.timestamp_ = from._impl_.timestamp_;
     }
@@ -6891,6 +6919,9 @@ void DataMessage::MergeFrom(const DataMessage& from) {
     }
     if (cached_has_bits & 0x00000400u) {
       _this->_impl_.blockscommunitymessagerequests_ = from._impl_.blockscommunitymessagerequests_;
+    }
+    if (cached_has_bits & 0x00000800u) {
+      _this->_impl_.syncencryption_ = from._impl_.syncencryption_;
     }
     _this->_impl_._has_bits_[0] |= cached_has_bits;
   }
@@ -6945,8 +6976,8 @@ void DataMessage::InternalSwap(DataMessage* other) {
       &other->_impl_.synctarget_, rhs_arena
   );
   ::PROTOBUF_NAMESPACE_ID::internal::memswap<
-      PROTOBUF_FIELD_OFFSET(DataMessage, _impl_.blockscommunitymessagerequests_)
-      + sizeof(DataMessage::_impl_.blockscommunitymessagerequests_)
+      PROTOBUF_FIELD_OFFSET(DataMessage, _impl_.syncencryption_)
+      + sizeof(DataMessage::_impl_.syncencryption_)
       - PROTOBUF_FIELD_OFFSET(DataMessage, _impl_.quote_)>(
           reinterpret_cast<char*>(&_impl_.quote_),
           reinterpret_cast<char*>(&other->_impl_.quote_));

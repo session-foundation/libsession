@@ -596,6 +596,30 @@ TEST_CASE("UserProfile media-saved notifications", "[config][user_profile]") {
     CHECK_FALSE(reloaded.needs_push());
 }
 
+TEST_CASE("UserProfile lowest message version is only ever raised", "[config][user_profile]") {
+    const auto seed = "0123456789abcdef0123456789abcdef00000000000000000000000000000000"_hex_b;
+    session::config::UserProfile profile{seed, std::nullopt};
+
+    // Unset is 1, and costs nothing to carry.
+    CHECK(profile.get_min_message_version() == 1);
+    profile.set_min_message_version(1);
+    CHECK_FALSE(profile.needs_push());
+
+    profile.set_min_message_version(2);
+    CHECK(profile.get_min_message_version() == 2);
+    CHECK(profile.needs_push());
+
+    CHECK_THROWS_AS(profile.set_min_message_version(1), std::invalid_argument);
+    CHECK(profile.get_min_message_version() == 2);
+
+    auto [seqno, push, obs] = profile.push();
+    profile.confirm_pushed(seqno, {"fakehash"});
+    session::config::UserProfile reloaded{seed, profile.make_dump()};
+    CHECK(reloaded.get_min_message_version() == 2);
+    reloaded.set_min_message_version(2);
+    CHECK_FALSE(reloaded.needs_push());
+}
+
 TEST_CASE("UserProfile media-saved does not age the profile", "[config][user_profile]") {
     const auto seed = "0123456789abcdef0123456789abcdef00000000000000000000000000000000"_hex_b;
     session::config::UserProfile profile{seed, std::nullopt};

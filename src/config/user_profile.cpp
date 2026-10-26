@@ -178,6 +178,19 @@ void UserProfile::set_notify_media_saved(bool notify) {
     set_flag(data["x"], !notify);
 }
 
+int UserProfile::get_min_message_version() const {
+    return std::max<int64_t>(data["v"].integer_or(1), 1);
+}
+
+void UserProfile::set_min_message_version(int version) {
+    auto current = get_min_message_version();
+    if (version < current)
+        throw std::invalid_argument{
+                "set_min_message_version: the lowest message version can only be raised"};
+    if (version > current)
+        data["v"] = version;
+}
+
 std::chrono::sys_seconds UserProfile::get_profile_updated() const {
     if (auto t = data["t"].sys_seconds()) {
         if (auto T = data["T"].sys_seconds(); T && *T > *t)

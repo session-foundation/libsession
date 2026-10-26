@@ -361,6 +361,124 @@ TEST_CASE("Client: the two copies of a send report separately", "[client][send]"
     CHECK(c->message(id, await)->sync_send_state == SendState::failed);
 }
 
+namespace {
+// A second Client on `c`'s account: another device of ours.
+std::unique_ptr<TempClient> another_device(TempClient& c) {
+    std::array<std::byte, 32> seed;
+    {
+        auto s = c->core.globals.account_seed();
+        std::ranges::copy(std::as_bytes(s.seed()), seed.begin());
+    }
+    return std::make_unique<TempClient>(
+            core::predefined_seed{std::span<const std::byte, 32>{seed}});
+}
+
+// Delivers `payload` into `c` as its swarm would.
+void receive(Client& c, std::span<const std::byte> payload, std::string hash) {
+    core::SwarmMessage sm{payload, std::move(hash), clock_now_ms(), clock_now_ms() + 24h};
+    c.core.loop().call_get([&] {
+        c.core.receive_messages({&sm, 1}, config::Namespace::Default, true);
+        return 0;
+    });
+}
+}  // namespace
+
+TEST_CASE(
+        "Client: the sync copy says how the recipient's was encrypted, and only it does",
+        "[client][send]") {
+    TempClient c;
+    auto* net = attach_mock_network(c->core);
+    TestHelper::seed_pfs_nak(c->core, own_sid(*c));
+
+    std::vector<core::ReceivedMessage> got;
+    core::callbacks peer_cbs;
+    peer_cbs.message_received = [&](core::ReceivedMessage&& m) { got.push_back(std::move(m)); };
+    TempCore peer{peer_cbs};
+    b33 peer_sid;
+    std::ranges::copy(peer->globals.session_id(), peer_sid.begin());
+    peer->devices.active_account_keys();
+    auto [x25519, mlkem768] = TestHelper::active_account_pubkeys(*peer);
+    TestHelper::seed_pfs_cache(c->core, peer_sid, x25519, mlkem768);
+
+    c->send_message(ConversationId::dm(peer_sid), {.body = "with pfs"}, await);
+    auto sent = stores(*net);
+    REQUIRE(sent.size() == 2);
+    auto bound_for = [&](const b33& sid) {
+        auto it = std::ranges::find_if(sent, [&](const MockNetwork::SentRequest* r) {
+            return store_body(*r)["pubkey"].get<std::string>() == oxenc::to_hex(sid);
+        });
+        REQUIRE(it != sent.end());
+        return store_payload(**it);
+    };
+    auto recipient_copy = bound_for(peer_sid);
+    auto sync_copy = bound_for(own_sid(*c));
+
+    // The recipient is told nothing of it.
+    {
+        core::SwarmMessage sm{recipient_copy, "r1", clock_now_ms(), clock_now_ms() + 24h};
+        peer->receive_messages({&sm, 1}, config::Namespace::Default, true);
+    }
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].encryption == core::MessageEncryption::v2_pfs);
+    SessionProtos::Content content;
+    REQUIRE(content.ParseFromArray(got[0].content.data(), static_cast<int>(got[0].content.size())));
+    CHECK_FALSE(content.datamessage().has_syncencryption());
+
+    // Another device of ours shows what reached them, though its own copy came to it as v1.
+    auto other = another_device(c);
+    receive(**other, sync_copy, "s1");
+    auto msgs = (*other)->conversation(ConversationId::dm(peer_sid), await)->messages(await);
+    REQUIRE(msgs.size() == 1);
+    CHECK(msgs[0].outgoing);
+    CHECK(msgs[0].encryption == core::MessageEncryption::v2_pfs);
+}
+
+TEST_CASE("Client: the sync copy waits until the recipient's copy is encrypted", "[client][send]") {
+    TempClient c;
+    auto* net = attach_mock_network(c->core);
+    TestHelper::seed_pfs_nak(c->core, own_sid(*c));
+    TempCore peer;
+    b33 peer_sid;
+    std::ranges::copy(peer->globals.session_id(), peer_sid.begin());
+    auto published = peer->devices.build_account_pubkey_message();
+
+    // The recipient's keys are being fetched, so neither copy has gone anywhere yet.
+    auto id = c->send_message(ConversationId::dm(peer_sid), {.body = "waiting"}, await);
+    CHECK(stores(*net).empty());
+    CHECK_FALSE(c->message(id, await)->encryption);
+
+    // They arrive: both go, and both say PFS+PQ.
+    REQUIRE(answer_requests(
+                    *net,
+                    "retrieve",
+                    [&](MockNetwork::SentRequest& r) {
+                        auto body = retrieved_body(
+                                nlohmann::json::array({retrieved_message(published, "pk")}));
+                        r.callback(true, false, 200, {}, body.dump());
+                    },
+                    1) == 1);
+    CHECK(stores(*net).size() == 2);
+    CHECK(c->message(id, await)->encryption == core::MessageEncryption::v2_pfs);
+}
+
+TEST_CASE(
+        "Client: a sync copy that does not say how it was encrypted leaves it unset",
+        "[client][send]") {
+    TempClient c;
+    SenderKeys peer;
+    deliver(*c,
+            self_keys(*c),
+            "from another device",
+            from_epoch_ms(5000),
+            "s1",
+            "",
+            peer.session_id);
+    auto msgs = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await);
+    REQUIRE(msgs.size() == 1);
+    CHECK(msgs[0].outgoing);
+    CHECK_FALSE(msgs[0].encryption);
+}
+
 TEST_CASE("Client: sending to ourselves stores once", "[client][send]") {
     TempClient c;
     auto* net = attach_mock_network(c->core);

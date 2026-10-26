@@ -1,4 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <session/config/user_profile.hpp>
 #include <session/core.hpp>
 
 #include "test_helper.hpp"
@@ -90,17 +92,35 @@ TEST_CASE("Globals: defer_account leaves the account unresolved", "[core][global
         {
             Core core{path, defer_account{}};
             REQUIRE_FALSE(core.globals.have_account());
-            core.globals.create_account(await);
+            core.globals.create_account(SeedSize::Bits128, await);
             CHECK(core.globals.have_account());
             id = core.globals.session_id_hex();
             CHECK(id.starts_with("05"));
             // Adopting a second identity would orphan everything stored against the first.
-            CHECK_THROWS_AS(core.globals.create_account(await), std::logic_error);
+            CHECK_THROWS_AS(
+                    core.globals.create_account(SeedSize::Bits128, await), std::logic_error);
         }
         // Reopening finds the stored seed, so defer_account is a no-op on an existing account.
         Core core{path, defer_account{}};
         CHECK(core.globals.have_account());
         CHECK(core.globals.session_id_hex() == id);
+    }
+
+    SECTION("create_account makes a new account at either seed size") {
+        auto [size, words] = GENERATE(
+                std::pair{SeedSize::Bits128, size_t{13}}, std::pair{SeedSize::Bits256, size_t{25}});
+        Core core{path, defer_account{}};
+        core.globals.create_account(size, await);
+
+        CHECK(core.globals.seed_mnemonic().size() == words);
+
+        // New rather than restored, whatever its size: a restored account is never given a group,
+        // so a new one treated as restored would have no device that could ever admit it to one.
+        CHECK(core.devices.device_info(await).second);
+
+        // And its only device is a current one, so it reads PFS/PQ messages from the start.
+        CHECK(core.call_get(
+                      [&] { return core.configs.user_profile().get_min_message_version(); }) == 2);
     }
 
     SECTION("restore_account adopts a given seed") {
@@ -110,6 +130,12 @@ TEST_CASE("Globals: defer_account leaves the account unresolved", "[core][global
             core.globals.restore_account(predefined_seed{seed}, await);
             CHECK(core.globals.have_account());
             restored = core.globals.session_id_hex();
+
+            // Nothing written: what the account says is about to arrive from the swarm, and older
+            // devices of it may not read PFS/PQ messages.
+            CHECK(core.call_get([&] {
+                return core.configs.user_profile().get_min_message_version();
+            }) == 1);
         }
 
         // The same seed via the constructor must reach the same identity.
