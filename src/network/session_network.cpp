@@ -241,15 +241,11 @@ Network::Network(config::Config _conf) :
             break;
 
         case opt::router::Type::session_router:
-#ifdef ENABLE_NETWORKING_SROUTER
             _router = SessionRouter::make(
                     std::move(build_session_router_config(config, file_server_config)),
                     _loop,
                     _snode_pool,
                     _transport);
-#else
-            throw std::runtime_error{"Session Router support is not enabled in this build!"};
-#endif
             break;
 
         case opt::router::Type::direct:

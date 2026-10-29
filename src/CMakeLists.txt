@@ -204,14 +204,14 @@ add_libsession_util_library(network
     network/transport/quic_transport.cpp
     network/routing/direct_router.cpp
     network/routing/onion_request_router.cpp
+    network/routing/session_router_router.cpp
 )
 
 target_link_libraries(network
     PUBLIC
     crypto
     oxen::quic
-    # service_node.hpp declares `service_node::from_json(nlohmann::json)`, so anything including it
-    # -- which core.hpp does, and so anything using core -- needs the json headers.
+    session-router::core
     nlohmann_json::nlohmann_json
     PRIVATE
     sessiondep::libsodium
@@ -234,14 +234,6 @@ if(WITH_IP_GEOLOCATION)
     target_sources(network PRIVATE network/ip_country/data.cpp)
 else()
     target_sources(network PRIVATE network/ip_country/no_data.cpp)
-endif()
-
-if(ENABLE_NETWORKING_SROUTER)
-    target_sources(network
-        PRIVATE
-        network/routing/session_router_router.cpp)
-    target_link_libraries(network PUBLIC session-router::core)
-    target_compile_definitions(network PUBLIC ENABLE_NETWORKING_SROUTER)
 endif()
 
 if (BUILD_STATIC_DEPS)
