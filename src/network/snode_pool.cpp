@@ -367,19 +367,30 @@ void SnodePool::_refresh_snode_cache(std::optional<std::string> request_id_opt) 
         _snode_refresh_results.clear();
         _refresh_candidate_nodes.clear();
 
+        // A refresh for subnets picks its step here, and may finish without fetching anything: by
+        // adopting the prepackaged pool, or by relaxing diversity.  Its step is kept until the
+        // refresh completes or gives up, so that a retry of this same refresh asks the same way.
+        if (std::exchange(_subnet_shortfall, false) && _subnet_refresh == SubnetRefresh::none &&
+            !_choose_subnet_refresh(request_id))
+            return;
+        const bool for_subnets = _subnet_refresh != SubnetRefresh::none;
+
         // We should only use the routed_fetcher if it exists, passes a connectivity check, and
         // there are enough cached nodes
         const auto cache_insufficient =
                 (_config.cache_num_nodes_to_use_for_refresh > 0 &&
                  _snode_cache.size() < _config.cache_num_nodes_to_use_for_refresh);
-        use_routed_fetcher =
-                (cache_insufficient && _routed_fetcher && _routed_fetcher_connectivity_check &&
-                 (*_routed_fetcher_connectivity_check)());
+        use_routed_fetcher = for_subnets ? _subnet_refresh == SubnetRefresh::routed
+                                         : (cache_insufficient && _routed_fetcher &&
+                                            _routed_fetcher_connectivity_check &&
+                                            (*_routed_fetcher_connectivity_check)());
 
-        // We should only refresh using seed nodes if using cached nodes is disabled, or there
-        // aren't enough cached nodes to refresh from
+        // We should only refresh using seed nodes if using cached nodes is disabled, there aren't
+        // enough cached nodes to refresh from, or the cache spans too few subnets: refreshing that
+        // from its own nodes would hand back the same network
         const auto use_seed_nodes =
-                (_config.cache_num_nodes_to_use_for_refresh == 0 || cache_insufficient);
+                (_config.cache_num_nodes_to_use_for_refresh == 0 || cache_insufficient ||
+                 for_subnets);
 
         // Seed nodes are trusted so we only need to use a single node when refreshing from them
         num_nodes_for_refresh = (use_seed_nodes ? 1 : _config.cache_num_nodes_to_use_for_refresh);
@@ -431,6 +442,193 @@ void SnodePool::_refresh_snode_cache(std::optional<std::string> request_id_opt) 
     });
 }
 
+std::optional<std::vector<service_node>> SnodePool::_load_fallback_pool(
+        const std::string& request_id) {
+    if (!_config.fallback_snode_pool_path || _config.fallback_snode_pool_path->empty() ||
+        !fs::exists(*_config.fallback_snode_pool_path))
+        return std::nullopt;
+
+    try {
+        std::vector<std::byte> loaded_fallback_data =
+                read_whole_file(*_config.fallback_snode_pool_path);
+        auto json = nlohmann::json::parse(
+                reinterpret_cast<const char*>(loaded_fallback_data.data()),
+                reinterpret_cast<const char*>(
+                        loaded_fallback_data.data() + loaded_fallback_data.size()));
+        auto nodes = json.at("service_node_states").get<nlohmann::json::array_t>();
+        auto height = json.at("height").get<int>();
+        auto file_time = fs::last_write_time(*_config.fallback_snode_pool_path);
+        auto file_time_sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                file_time - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+        auto file_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    file_time_sys.time_since_epoch())
+                                    .count();
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now().time_since_epoch())
+                              .count();
+        auto seconds_since_build = (now_ms - file_time_ms) / 1000;
+        auto expected_height_diff = seconds_since_build / 120;
+        auto expected_current_height = height + expected_height_diff;
+
+        std::vector<service_node> parsed_nodes;
+        parsed_nodes.reserve(nodes.size());
+        auto invalid_count = 0;
+        auto unlocked_count = 0;
+
+        for (auto& json_node : nodes)
+            try {
+                auto snode = service_node::from_json(json_node);
+
+                // If a node has an unlock height and it is in the past then it's possible that the
+                // node is offline so don't both including it in the initial cache (if we get a
+                // successful connection and refresh the cache then it would be added back at that
+                // point)
+                if (snode.requested_unlock_height &&
+                    snode.requested_unlock_height <= expected_current_height) {
+                    unlocked_count++;
+                    continue;
+                }
+
+                parsed_nodes.emplace_back(std::move(snode));
+            } catch (...) {
+                invalid_count++;
+            }
+
+        if (parsed_nodes.size() < _config.cache_min_size)
+            throw std::runtime_error{
+                    "Failed to parse enough fallback nodes to meet the min cache size"};
+
+        if (invalid_count > 0)
+            log::warning(
+                    cat,
+                    "[Request {}] Failed to parse {} fallback nodes.",
+                    request_id,
+                    invalid_count);
+
+        if (unlocked_count > 0)
+            log::warning(
+                    cat,
+                    "[Request {}] {} fallback nodes might be unlocked.",
+                    request_id,
+                    unlocked_count);
+
+        return parsed_nodes;
+    } catch (const std::exception& e) {
+        log::error(cat, "[Request {}] Failed to process fallback cache: {}", request_id, e.what());
+        return std::nullopt;
+    }
+}
+
+size_t SnodePool::_usable_subnet_count(const std::vector<service_node>& nodes) const {
+    std::unordered_set<oxen::quic::ipv4> subnets;
+    for (const auto& node : nodes) {
+        auto it = _snode_strikes.find(node.remote_pubkey);
+        if (it == _snode_strikes.end() || it->second.size() < _config.cache_node_strike_threshold)
+            subnets.insert(node.ip.to_base(24));
+    }
+    return subnets.size();
+}
+
+bool SnodePool::_choose_subnet_refresh(const std::string& request_id) {
+    const bool can_route = !_config.seed_nodes.empty() && _routed_fetcher &&
+                           _routed_fetcher_connectivity_check &&
+                           (*_routed_fetcher_connectivity_check)();
+
+    // 1. The seed nodes, routed
+    if (!_routed_subnet_refresh_failed && can_route) {
+        log::info(
+                cat,
+                "[Request {}] Refreshing for subnets from the seed nodes, routed.",
+                request_id);
+        _subnet_refresh = SubnetRefresh::routed;
+        return true;
+    }
+
+    // 2. The prepackaged pool, when routing was not even possible: the same as it having failed
+    if (!_routed_subnet_refresh_failed) {
+        _routed_subnet_refresh_failed = true;
+        if (_adopt_prepackaged_for_subnets(request_id))
+            return false;
+    }
+
+    // 3. The seed nodes, directly
+    if (!_direct_subnet_refresh_failed && !_config.seed_nodes.empty()) {
+        log::info(
+                cat,
+                "[Request {}] Refreshing for subnets from the seed nodes, directly.",
+                request_id);
+        _subnet_refresh = SubnetRefresh::direct;
+        return true;
+    }
+
+    _direct_subnet_refresh_failed = true;
+    _relax_for_subnets(request_id, "there are no seed nodes to ask");
+    return false;
+}
+
+void SnodePool::_subnet_refresh_failed(const std::string& request_id) {
+    const auto failed = std::exchange(_subnet_refresh, SubnetRefresh::none);
+    _current_snode_cache_refresh_id.reset();
+    _snode_refresh_results.clear();
+    _refresh_candidate_nodes.clear();
+
+    if (failed == SubnetRefresh::routed) {
+        log::warning(
+                cat,
+                "[Request {}] No seed node answered over the routed fetcher with a usable pool.",
+                request_id);
+        _routed_subnet_refresh_failed = true;
+        if (_adopt_prepackaged_for_subnets(request_id))
+            return;
+
+        // On to the seed nodes directly, as a fresh refresh: the callbacks waiting on this one are
+        // still queued for it
+        _subnet_shortfall = true;
+        _refresh_snode_cache();
+        return;
+    }
+
+    _direct_subnet_refresh_failed = true;
+    _relax_for_subnets(request_id, "no seed node answered directly with a usable pool");
+}
+
+bool SnodePool::_adopt_prepackaged_for_subnets(const std::string& request_id) {
+    // Nobody on the network can alter the prepackaged pool, and the connection to each node still
+    // checks its key, so it being stale only means some of its nodes are gone.  Worth it only if it
+    // spans more subnets than what we have - which it may not, if it is what the cache was built
+    // from.  It is trusted to be a pool of this network, as at bootstrap: nothing in the file says
+    // which (see `opt::fallback_snode_pool_path`).
+    auto fallback = _load_fallback_pool(request_id);
+    if (!fallback || _usable_subnet_count(*fallback) <= _usable_subnet_count(_snode_cache))
+        return false;
+
+    log::warning(
+            cat,
+            "[Request {}] Using the prepackaged snode pool, which spans more /24 subnets than the "
+            "cache.",
+            request_id);
+    _update_cache(request_id, std::move(*fallback), CacheSource::prepackaged);
+    return true;
+}
+
+void SnodePool::_relax_for_subnets(const std::string& request_id, std::string_view why) {
+    // The cache we have is still usable, only not diverse enough, so rather than wait indefinitely,
+    // use it with as little subnet sharing as it allows
+    log::warning(
+            cat,
+            "[Request {}] The snode cache spans too few /24 subnets and {}; allowing nodes to "
+            "share "
+            "subnets, as few as possible, until the next refresh.",
+            request_id,
+            why);
+    _subnet_refresh = SubnetRefresh::none;
+    _subnet_diversity_relaxed = true;
+    _current_snode_cache_refresh_id.reset();
+    _snode_refresh_results.clear();
+    _refresh_candidate_nodes.clear();
+    _run_after_refresh_callbacks();
+}
+
 void SnodePool::_launch_next_refresh_request(
         const std::string& request_id,
         const uint8_t index,
@@ -448,6 +646,11 @@ void SnodePool::_launch_next_refresh_request(
 
         const auto target_request_id = "{}-{}"_format(request_id, index);
 
+        if (_refresh_candidate_nodes.empty() && _subnet_refresh != SubnetRefresh::none) {
+            _subnet_refresh_failed(request_id);
+            return;
+        }
+
         if (_refresh_candidate_nodes.empty()) {
             // If we run out of candidate nodes then we should fail this refresh request and kick
             // off a new one with a new id (the `_refresh_snode_cache` will decide which nodes and
@@ -456,90 +659,15 @@ void SnodePool::_launch_next_refresh_request(
             // If this was a bootstrap request then we've failed to refresh from all seed nodes so
             // we should try to use the `fallback_snode_pool_path` if it exists, otherwise just
             // retry indefinitely (not much else we can do)
-            if (refreshing_from_seed_nodes && _config.fallback_snode_pool_path &&
-                !_config.fallback_snode_pool_path->empty() &&
-                fs::exists(*_config.fallback_snode_pool_path)) {
-                log::warning(
-                        cat,
-                        "[Request {}] Ran out of seed nodes for refresh, using fallback cache.",
-                        request_id);
-
-                try {
-                    std::vector<std::byte> loaded_fallback_data =
-                            read_whole_file(*_config.fallback_snode_pool_path);
-                    auto json = nlohmann::json::parse(
-                            reinterpret_cast<const char*>(loaded_fallback_data.data()),
-                            reinterpret_cast<const char*>(
-                                    loaded_fallback_data.data() + loaded_fallback_data.size()));
-                    auto nodes = json.at("service_node_states").get<nlohmann::json::array_t>();
-                    auto height = json.at("height").get<int>();
-                    auto file_time = fs::last_write_time(*_config.fallback_snode_pool_path);
-                    auto file_time_sys =
-                            std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                                    file_time - fs::file_time_type::clock::now() +
-                                    std::chrono::system_clock::now());
-                    auto file_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                file_time_sys.time_since_epoch())
-                                                .count();
-                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                          std::chrono::system_clock::now().time_since_epoch())
-                                          .count();
-                    auto seconds_since_build = (now_ms - file_time_ms) / 1000;
-                    auto expected_height_diff = seconds_since_build / 120;
-                    auto expected_current_height = height + expected_height_diff;
-
-                    std::vector<service_node> parsed_nodes;
-                    parsed_nodes.reserve(nodes.size());
-                    auto invalid_count = 0;
-                    auto unlocked_count = 0;
-
-                    for (auto& json_node : nodes)
-                        try {
-                            auto snode = service_node::from_json(json_node);
-
-                            // If a node has an unlock height and it is in the past then it's
-                            // possible that the node is offline so don't both including it in the
-                            // initial cache (if we get a successful connection and refresh the
-                            // cache then it would be added back at that point)
-                            if (snode.requested_unlock_height &&
-                                snode.requested_unlock_height <= expected_current_height) {
-                                unlocked_count++;
-                                continue;
-                            }
-
-                            parsed_nodes.emplace_back(std::move(snode));
-                        } catch (...) {
-                            invalid_count++;
-                        }
-
-                    if (parsed_nodes.size() < _config.cache_min_size)
-                        throw std::runtime_error{
-                                "Failed to parse enough fallback nodes to meet the min cache size"};
-
-                    if (invalid_count > 0)
-                        log::warning(
-                                cat,
-                                "[Request {}] Failed to parse {} fallback nodes.",
-                                request_id,
-                                invalid_count);
-
-                    if (unlocked_count > 0)
-                        log::warning(
-                                cat,
-                                "[Request {}] {} fallback nodes might be unlocked.",
-                                request_id,
-                                unlocked_count);
-
-                    _update_cache(request_id, std::move(parsed_nodes));
-                    return;
-                } catch (const std::exception& e) {
-                    log::error(
+            if (refreshing_from_seed_nodes)
+                if (auto fallback = _load_fallback_pool(request_id)) {
+                    log::warning(
                             cat,
-                            "[Request {}] Failed to process fallback cache, will just retry seed "
-                            "nodes.",
-                            target_request_id);
+                            "[Request {}] Ran out of seed nodes for refresh, using fallback cache.",
+                            request_id);
+                    _update_cache(request_id, std::move(*fallback), CacheSource::prepackaged);
+                    return;
                 }
-            }
 
             _snode_cache_refresh_failure_count++;
             auto delay = _config.retry_delay.exponential(_snode_cache_refresh_failure_count);
@@ -571,6 +699,7 @@ void SnodePool::_launch_next_refresh_request(
                     cat, "[Request {}] No fetcher available, aborting refresh.", target_request_id);
             _current_snode_cache_refresh_id.reset();
             _refresh_candidate_nodes.clear();
+            _subnet_refresh = SubnetRefresh::none;
             return;
         }
 
@@ -856,14 +985,20 @@ void SnodePool::_on_refresh_complete(
         }
 
         // Update the cache with the combined nodes
-        _update_cache(refresh_id, std::move(nodes));
+        // From the seed nodes, routed or not, it is the network as they see it: routing can only
+        // drop or delay a reply encrypted for the seed node, not change it
+        _update_cache(
+                refresh_id,
+                std::move(nodes),
+                refreshing_from_seed_nodes ? CacheSource::seed_nodes : CacheSource::other);
     });
 }
 
-void SnodePool::_update_cache(std::string refresh_id, std::vector<service_node> nodes) {
+void SnodePool::_update_cache(
+        std::string refresh_id, std::vector<service_node> nodes, CacheSource source) {
     // Use 'call_get' to force this to be synchronous; a plain 'call' would queue when we aren't
     // already on the loop thread, and the captured `nodes` reference would dangle
-    _jq.call_get([this, refresh_id, &nodes] {
+    _jq.call_get([this, refresh_id, &nodes, source] {
         // Shuffle the nodes so we don't have a specific order
         std::ranges::shuffle(nodes, csrng);
         log::info(
@@ -885,32 +1020,47 @@ void SnodePool::_update_cache(std::string refresh_id, std::vector<service_node> 
         _refresh_candidate_nodes.clear();
         _snode_cache_refresh_failure_count = 0;
 
+        // A new cache is judged afresh: diversity is enforced again.  Only adopting the prepackaged
+        // pool is itself a step of a refresh for subnets, after which the seed nodes directly are
+        // still to try; any other cache starts the steps over.
+        _cache_source = source;
+        _subnet_refresh = SubnetRefresh::none;
+        _subnet_diversity_relaxed = false;
+        _subnet_shortfall = false;
+        if (source != CacheSource::prepackaged) {
+            _routed_subnet_refresh_failed = false;
+            _direct_subnet_refresh_failed = false;
+        }
+
         _disk_loop.call([path = _snode_cache_file_path, cache = _snode_cache] {
             SnodePool::_perform_cache_write(path, cache);
         });
 
-        // Trigger any callbacks
-        //
-        // These must be moved out of the member before being run: a callback can re-enter the pool
-        // and register another post-refresh callback (`get_swarm` does exactly that if the cache is
-        // still empty), which would reallocate the vector we're iterating and leave us calling
-        // through a freed `std::function`. Anything registered while we're here accumulates in the
-        // now-empty member and runs after the next refresh instead of being silently discarded.
-        if (!_after_snode_cache_refresh.empty()) {
-            auto callbacks = std::move(_after_snode_cache_refresh);
-            _after_snode_cache_refresh.clear();  // A moved-from vector is valid but unspecified
-
-            log::debug(cat, "Executing {} post-refresh callbacks.", callbacks.size());
-
-            for (const auto& cb : callbacks) {
-                try {
-                    cb();
-                } catch (const std::exception& e) {
-                    log::error(cat, "Exception thrown in a post-refresh callback: {}", e.what());
-                }
-            }
-        }
+        _run_after_refresh_callbacks();
     });
+}
+
+void SnodePool::_run_after_refresh_callbacks() {
+    // These must be moved out of the member before being run: a callback can re-enter the pool and
+    // register another post-refresh callback (`get_swarm` does exactly that if the cache is still
+    // empty), which would reallocate the vector we're iterating and leave us calling through a
+    // freed `std::function`. Anything registered while we're here accumulates in the now-empty
+    // member and runs after the next refresh instead of being silently discarded.
+    if (_after_snode_cache_refresh.empty())
+        return;
+
+    auto callbacks = std::move(_after_snode_cache_refresh);
+    _after_snode_cache_refresh.clear();  // A moved-from vector is valid but unspecified
+
+    log::debug(cat, "Executing {} post-refresh callbacks.", callbacks.size());
+
+    for (const auto& cb : callbacks) {
+        try {
+            cb();
+        } catch (const std::exception& e) {
+            log::error(cat, "Exception thrown in a post-refresh callback: {}", e.what());
+        }
+    }
 }
 
 // MARK: Public Functions
@@ -958,6 +1108,11 @@ void SnodePool::clear_cache() {
         _snode_cache = {};
         _all_swarms = {};
         _swarm_cache = {};
+        _subnet_shortfall = false;
+        _cache_source = CacheSource::other;
+        _routed_subnet_refresh_failed = false;
+        _direct_subnet_refresh_failed = false;
+        _subnet_diversity_relaxed = false;
 
         _disk_loop.call([path = _snode_cache_file_path] { SnodePool::_clear_disk_cache(path); });
     });
@@ -1086,6 +1241,12 @@ void SnodePool::refresh_if_needed(
                     needs_to_start_refresh = true;
             }
 
+            // Enough nodes by count, but `get_unused_nodes` could not draw them from distinct
+            // subnets: without a refresh, a caller retrying on our callback is answered at once and
+            // fails the same way, for ever
+            if (_subnet_shortfall)
+                needs_to_start_refresh = true;
+
             if (needs_to_start_refresh && cache_lifetime < _config.cache_min_lifetime)
                 delay.emplace(std::chrono::duration_cast<std::chrono::milliseconds>(
                         _config.cache_min_lifetime - cache_lifetime));
@@ -1120,56 +1281,110 @@ std::vector<service_node> SnodePool::get_unused_nodes(
             return std::vector<service_node>{};
         }
 
-        // Then try to get the desired number of nodes from the current cache
-        std::vector<service_node> result;
-        result.reserve(count);
-
         std::unordered_set<ed25519_pubkey> exclusion_keys;
         exclusion_keys.reserve(exclude_nodes.size());
         for (const auto& node : exclude_nodes)
             exclusion_keys.insert(node.remote_pubkey);
 
-        std::unordered_set<oxen::quic::ipv4> used_subnets;
-        if (_config.enforce_subnet_diversity)
-            for (const auto& node : exclude_nodes)
-                used_subnets.insert(node.ip.to_base(24));
-
         // Pick a random starting index to start checking for unused nodes
-        size_t start_index = random::get_uniform_distribution<size_t>(0, _snode_cache.size() - 1);
+        const size_t start_index =
+                random::get_uniform_distribution<size_t>(0, _snode_cache.size() - 1);
 
-        for (size_t i = 0; i < _snode_cache.size(); ++i) {
-            if (result.size() >= count)
-                break;
+        // At most `max_share` nodes from any one /24 subnet, counting those in `exclude_nodes`, or
+        // no limit at all for 0.  Each pass allows one more per subnet, so a subnet is shared only
+        // once every subnet with fewer nodes in use has nothing left to give.
+        auto pick = [&](size_t max_share) {
+            std::vector<service_node> result;
+            result.reserve(count);
+            std::vector<bool> taken(_snode_cache.size(), false);
 
-            const size_t current_index = (start_index + i) % _snode_cache.size();
-            const auto& node = _snode_cache[current_index];
+            std::unordered_map<oxen::quic::ipv4, size_t> subnet_uses;
+            if (max_share > 0)
+                for (const auto& node : exclude_nodes)
+                    subnet_uses[node.ip.to_base(24)]++;
 
-            // Skip nodes explicitly excluded (needed in case subnet diversity is disabled)
-            if (exclusion_keys.count(node.remote_pubkey))
-                continue;
+            for (size_t share = 1; result.size() < count && (max_share == 0 || share <= max_share);
+                 ++share) {
+                for (size_t i = 0; i < _snode_cache.size() && result.size() < count; ++i) {
+                    const size_t current_index = (start_index + i) % _snode_cache.size();
+                    if (taken[current_index])
+                        continue;
+                    const auto& node = _snode_cache[current_index];
 
-            // Skip nodes with too many failures
-            auto it = _snode_strikes.find(node.remote_pubkey);
-            if (it != _snode_strikes.end() &&
-                it->second.size() >= _config.cache_node_strike_threshold)
-                continue;
+                    // Skip nodes explicitly excluded (needed in case subnet diversity is disabled)
+                    if (exclusion_keys.count(node.remote_pubkey))
+                        continue;
 
-            // Skip nodes whos IP addresses are in the exclusion list
-            if (_config.enforce_subnet_diversity) {
-                auto subnet = node.ip.to_base(24);
-                if (used_subnets.count(subnet))
-                    continue;
+                    // Skip nodes with too many failures
+                    auto it = _snode_strikes.find(node.remote_pubkey);
+                    if (it != _snode_strikes.end() &&
+                        it->second.size() >= _config.cache_node_strike_threshold)
+                        continue;
+
+                    if (max_share > 0) {
+                        auto& uses = subnet_uses[node.ip.to_base(24)];
+                        if (uses >= share)
+                            continue;
+                        uses++;
+                    }
+
+                    taken[current_index] = true;
+                    result.push_back(node);
+                }
+
+                if (max_share == 0)
+                    break;
             }
+            return result;
+        };
 
-            result.push_back(node);
-
-            if (_config.enforce_subnet_diversity)
-                used_subnets.insert(node.ip.to_base(24));
+        if (!_config.enforce_subnet_diversity) {
+            auto result = pick(0);
+            if (result.size() < count)
+                log::warning(
+                        cat, "Could only find {}/{} suitable unused nodes.", result.size(), count);
+            return result;
         }
 
-        if (result.size() < count)
-            log::warning(cat, "Could only find {}/{} suitable unused nodes.", result.size(), count);
+        // Enough to never be the limit: every node picked, and every excluded one, in one subnet
+        const size_t any_share = count + exclude_nodes.size();
 
+        auto result = pick(_subnet_diversity_relaxed ? any_share : 1);
+        if (result.size() >= count)
+            return result;
+
+        // Short only because of subnet diversity: refresh for it (see `_choose_subnet_refresh`),
+        // and give way only for a cache that is the seed nodes' own list, or once every way of
+        // reaching them has failed
+        if (!_subnet_diversity_relaxed) {
+            if (auto shared = pick(any_share); shared.size() >= count) {
+                if (_cache_source == CacheSource::seed_nodes || _direct_subnet_refresh_failed) {
+                    log::warning(
+                            cat,
+                            "The snode cache spans too few /24 subnets for {} nodes from distinct "
+                            "subnets, {}; allowing nodes to share subnets, as few as possible, "
+                            "until the next refresh.",
+                            count,
+                            (_cache_source == CacheSource::seed_nodes
+                                     ? "as the seed nodes list the network"
+                                     : "and the seed nodes cannot be reached"));
+                    _subnet_diversity_relaxed = true;
+                    return shared;
+                }
+
+                if (!_subnet_shortfall)
+                    log::warning(
+                            cat,
+                            "Could only find {}/{} unused nodes in distinct /24 subnets; "
+                            "refreshing for more.",
+                            result.size(),
+                            count);
+                _subnet_shortfall = true;
+                return result;
+            }
+        }
+
+        log::warning(cat, "Could only find {}/{} suitable unused nodes.", result.size(), count);
         return result;
     });
 }
