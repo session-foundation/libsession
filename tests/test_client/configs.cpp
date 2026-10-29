@@ -73,7 +73,9 @@ TEST_CASE("Client: re-deriving a contact changes nothing", "[client][configs]") 
 TEST_CASE("Client: a contact removed elsewhere takes its history", "[client][configs]") {
     std::vector<ConversationId> gone;
     callbacks cbs;
-    cbs.conversation_removed = [&](const ConversationId& id) { gone.push_back(id); };
+    cbs.conversation_removed = [&](ConversationId&& id, ConversationList) {
+        gone.push_back(std::move(id));
+    };
     TempClient c{cbs};
 
     auto them = "05" + std::string(64, 'c');
@@ -399,7 +401,9 @@ TEST_CASE("Client: hiding note to self keeps what is in it", "[client][configs]"
 TEST_CASE("Client: deleting a contact takes the entry that held the block", "[client][configs]") {
     std::vector<ConversationId> gone;
     callbacks cbs;
-    cbs.conversation_removed = [&](const ConversationId& id) { gone.push_back(id); };
+    cbs.conversation_removed = [&](ConversationId&& id, ConversationList) {
+        gone.push_back(std::move(id));
+    };
     TempClient c{cbs};
 
     auto them = "05" + std::string(64, '4');
