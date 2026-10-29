@@ -101,13 +101,14 @@ quic::Loop& Core::loop() {
     return _loop;
 }
 
-Core::~Core() {
+void Core::close_network() {
     // Tearing a Network down fails every request its transport is still holding, and failing them
     // fires the hooks installed in set_network -- which marshal onto our loop and reach members
-    // that are already gone.  Members are destroyed in reverse declaration order and `_jq` is
-    // declared after `_network`, so by the time ~Network runs it has been destroyed while `_loop`,
-    // declared first, is still alive to run the job: a dropped subscription removing its timers
-    // from a queue that no longer exists, at every exit that had a subscription.
+    // that may already be gone.  Members are destroyed in reverse declaration order and `_jq` is
+    // declared after `_network`, so left to member destruction ~Network would run after `_jq` had
+    // been destroyed while `_loop`, declared first, is still alive to run the job: a dropped
+    // subscription removing its timers from a queue that no longer exists, at every exit that had a
+    // subscription.
     //
     // So detach before anything is torn down.  ~Network pays its own router and transport the
     // same courtesy for the same reason, and doing it here rather than by shuffling the member
@@ -119,18 +120,23 @@ Core::~Core() {
     }
 
     // Before the Network goes, because a poll or a renew that fires while it is being torn down
-    // would reach it; stopping `_jq` below cancels them too, but only once the Network is already
-    // gone.  On the loop because the ids are only ever touched there.
+    // would reach it; stopping `_jq` cancels them too, but only once the Network is already gone.
+    // On the loop because the ids are only ever touched there.  Always, not only with a Network:
+    // `~Core` relies on it.
     call_get([this] {
         for (auto* timer : {&_poll_timer, &_sub_timer, &_probe_timer})
             _remove_timer(*timer);
     });
 
-    // Blocking, and it must not run on the Network's own loop -- it does not, because a Core is
-    // destroyed by whoever owns it.  Before the queue is stopped rather than after: tearing the
-    // Network down fails whatever it still holds, and those completions marshal onto our queue,
-    // which throws if it has already been stopped.  Queued here they are simply cancelled below.
+    // Blocking, and it must not run on the Network's own loop -- it does not, because its callers
+    // are whoever owns this Core.  Before `_jq` stops rather than after: tearing the Network down
+    // fails whatever it still holds, and those completions marshal onto our queue, which throws if
+    // it has already been stopped.  Queued now, they are simply cancelled when it stops.
     _network.reset();
+}
+
+Core::~Core() {
+    close_network();
 
     // One job that settles and then shuts the queue down from inside itself, which is what
     // `process_job_queue` is written for -- it re-checks the running flag between jobs, so nothing

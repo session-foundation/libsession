@@ -641,6 +641,17 @@ class Core {
     /// swarm work quiesced before the old Network is dropped.
     void set_network(std::unique_ptr<network::Network> network);
 
+    /// Detaches the Network and destroys it: its hooks are cleared, polling's timers removed, and
+    /// every request it still holds completed, those completions marshalling onto whatever queue
+    /// their callers gave them.  Safe to call again.  The timers are removed every time, Network or
+    /// not: a reply already queued can re-arm one after an earlier call, and `~Core` relies on its
+    /// own call catching that.  Blocking, and never to be called on the Network's own loop.
+    ///
+    /// `~Core` does this first.  Anything owning a Core whose own queues receive network callbacks
+    /// does it sooner, while those queues still exist -- a Client's uploads complete onto the
+    /// Client's queue, which is destroyed before its Core.
+    void close_network();
+
     /// Constructs a Network from `args` and attaches it, returning a reference to it that is valid
     /// for as long as this Core is.  The usual way to attach one:
     ///
