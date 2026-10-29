@@ -1,10 +1,13 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "session/attachments.hpp"
@@ -68,6 +71,43 @@ enum class ConnectionStatus {
     connecting = CONNECTION_STATUS_CONNECTING,
     connected = CONNECTION_STATUS_CONNECTED,
     disconnected = CONNECTION_STATUS_DISCONNECTED,
+};
+
+/// What a Network tells its owner, fixed when the Network is built: it starts connecting in its
+/// constructor and reads these on its loop from then on, so there is no later moment at which one
+/// could be changed without racing that read.  Any of them may be left empty.  Each is called on
+/// the Network's loop, so a hook that blocks holds up the whole network.
+struct NetworkHooks {
+    /// Notified whenever the network connection status changes, including a final `disconnected`
+    /// as the Network is destroyed, which is the last call any of these hooks receives.
+    std::function<void(ConnectionStatus status)> status_changed;
+
+    /// Notified when the network's clock offset or fork versions change.
+    std::function<void(std::chrono::milliseconds network_time_offset, int hardfork, int softfork)>
+            network_info_changed;
+
+    /// Notified when a storage server sends us something we did not ask for, on a connection we
+    /// already hold -- which is how a swarm subscription delivers messages.  `node` names the
+    /// swarm member; `endpoint` and `body` are the pushed request's, unparsed.
+    ///
+    /// Only reachable with a routing mode that gives the storage server a connection to us, which
+    /// means `session_router` or `direct`.  Under `onion_requests` the server has nothing to push
+    /// down: the connection it can see belongs to the last relay rather than to us, so it would
+    /// key the subscription to that relay.  This is not a property of onion routing in general --
+    /// `session_router` is onion-routed too, and is the mode this exists for.
+    std::function<void(
+            const ed25519_pubkey& node, std::string_view endpoint, std::span<const std::byte> body)>
+            server_push;
+
+    /// Notified once a connection to `node` is usable, including when it comes back after having
+    /// been lost.  Per-connection state the far end holds for us -- a subscription -- does not
+    /// survive that, so this is where it has to be established again.
+    std::function<void(const ed25519_pubkey& node)> connection_established;
+
+    /// Notified when a connection to `node` is gone, for any reason.  A subscription held on it is
+    /// gone too, and the far end will not say so: it simply stops pushing.  Not called for the
+    /// connections a Network closes as it is destroyed.
+    std::function<void(const ed25519_pubkey& node)> connection_lost;
 };
 
 /// What a request is for, which decides how it is carried.

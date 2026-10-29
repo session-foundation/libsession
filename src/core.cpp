@@ -102,26 +102,13 @@ quic::Loop& Core::loop() {
 }
 
 Core::~Core() {
-    // Tearing a Network down fails every request its transport is still holding, and failing them
-    // fires the hooks installed in set_network -- which marshal onto our loop and reach members
-    // that are already gone.  Members are destroyed in reverse declaration order and `_jq` is
-    // declared after `_network`, so by the time ~Network runs it has been destroyed while `_loop`,
-    // declared first, is still alive to run the job: a dropped subscription removing its timers
-    // from a queue that no longer exists, at every exit that had a subscription.
-    //
-    // So detach before anything is torn down.  ~Network pays its own router and transport the
-    // same courtesy for the same reason, and doing it here rather than by shuffling the member
-    // declarations leaves the requirement stated instead of resting on where a field sits.
-    if (_network) {
-        _network->on_server_push = nullptr;
-        _network->on_connection_established = nullptr;
-        _network->on_connection_lost = nullptr;
-    }
-
     // Before the Network goes, because a poll or a renew that fires while it is being torn down
     // would reach it; stopping `_jq` below cancels them too, but only once the Network is already
-    // gone.  On the loop because the ids are only ever touched there.
+    // gone.  On the loop because the ids are only ever touched there.  `_closing` is set in the
+    // same job: a job a Network hook queued before this one runs first, and whatever it armed is
+    // removed here; one queued after finds `_closing` set and does nothing.
     call_get([this] {
+        _closing = true;
         for (auto* timer : {&_poll_timer, &_sub_timer, &_probe_timer})
             _remove_timer(*timer);
     });
@@ -156,20 +143,27 @@ Core::~Core() {
     }
 }
 
-network::Network& Core::make_network(network::config::Config config) {
+network::Network& Core::make_network(network::config::Config config, network::NetworkHooks hooks) {
+    if (hooks.server_push || hooks.connection_established || hooks.connection_lost)
+        throw std::invalid_argument{
+                "make_network: server_push, connection_established and connection_lost are "
+                "Core's own hooks"};
     if (!config.disk_loop)
         config.disk_loop = _disk_loop;
-    auto net = std::make_unique<network::Network>(std::move(config));
-    auto& ref = *net;
-    set_network(std::move(net));
-    return ref;
+    set_network([&](network::NetworkHooks core_hooks) {
+        core_hooks.status_changed = std::move(hooks.status_changed);
+        core_hooks.network_info_changed = std::move(hooks.network_info_changed);
+        return std::make_unique<network::Network>(std::move(config), std::move(core_hooks));
+    });
+    return *_network;
 }
 
-void Core::set_network(std::unique_ptr<network::Network> network) {
+void Core::set_network(
+        const std::function<std::unique_ptr<network::Network>(network::NetworkHooks)>& make) {
     // Polling signs its retrieve requests with the account key, so attaching a network before the
     // account has an identity would fail inside a background poll rather than here.  Refuse at the
     // call site, where the ordering mistake actually is.
-    if (network && !globals.have_account())
+    if (!globals.have_account())
         throw no_account{};
 
     // Replacing an attached Network is unsupported, and unsupported here means unsafe rather than
@@ -177,51 +171,54 @@ void Core::set_network(std::unique_ptr<network::Network> network) {
     if (_network)
         throw network_already_attached{};
 
-    // Ownership moves in via release() because the two pointer types differ deliberately: the
-    // parameter is a plain unique_ptr so callers can hand over a std::make_unique, while the
-    // member's deleter (which is just `delete`) is what keeps Network an incomplete type in
-    // core.hpp -- including session_network.hpp there costs ~6x the compile time per file.
-    _network.reset(network.release());
+    // These fire on the network's loop, from the moment it is built; each hops onto ours before
+    // touching subscription state.  Safe to capture `this` bare: the Network is declared after
+    // `_loop` so it is destroyed first, ~Network does not return until no callback of its is still
+    // in flight, and it drops these three before closing its connections, so its teardown sends
+    // nothing here.  Until it does, `_closing` keeps what they queue from acting once ~Core has
+    // begun.
+    network::NetworkHooks hooks;
 
-    if (_network) {
-        // These fire on the network's loop; each hops onto ours before touching subscription
-        // state.  Safe to capture `this` bare: the Network is declared after `_loop` so it is
-        // destroyed first, and ~Network does not return until no callback of its is still in
-        // flight.
-        // The body is copied because it has to be: the span is the transport's buffer and is only
-        // valid for the duration of this call, so anything deferred must own its bytes.  That cost
-        // is what a push is worth -- a poll response arrives the same way and is copied too.
-        //
-        // Which node sent it is deliberately not checked: `_sub_node` is our loop's, and by the
-        // time this runs the answer could have changed anyway.  It does not need to be, either --
-        // everything here is authenticated downstream, replays dedup on the swarm hash, and
-        // configs merge by seqno, so the worst a connected node achieves by pushing us something
-        // is making us do work we would have done anyway.
-        _network->on_server_push = [this](const network::ed25519_pubkey& /*node*/,
-                                          std::string_view endpoint,
-                                          std::span<const std::byte> body) {
-            call([this, endpoint = std::string{endpoint}, body = to_vector(body)] {
+    // The body is copied because it has to be: the span is the transport's buffer and is only
+    // valid for the duration of this call, so anything deferred must own its bytes.  That cost
+    // is what a push is worth -- a poll response arrives the same way and is copied too.
+    //
+    // Which node sent it is deliberately not checked: `_sub_node` is our loop's, and by the
+    // time this runs the answer could have changed anyway.  It does not need to be, either --
+    // everything here is authenticated downstream, replays dedup on the swarm hash, and
+    // configs merge by seqno, so the worst a connected node achieves by pushing us something
+    // is making us do work we would have done anyway.
+    hooks.server_push = [this](const network::ed25519_pubkey& /*node*/,
+                               std::string_view endpoint,
+                               std::span<const std::byte> body) {
+        call([this, endpoint = std::string{endpoint}, body = to_vector(body)] {
+            if (!_closing)
                 _handle_server_push(endpoint, body);
-            });
-        };
+        });
+    };
 
-        _network->on_connection_lost = [this](const network::ed25519_pubkey& node) {
-            call([this, node] {
-                if (_sub_node && _sub_node->remote_pubkey == node)
-                    _drop_subscription("connection lost");
-            });
-        };
+    hooks.connection_lost = [this](const network::ed25519_pubkey& node) {
+        call([this, node] {
+            if (!_closing && _sub_node && _sub_node->remote_pubkey == node)
+                _drop_subscription("connection lost");
+        });
+    };
 
-        _network->on_connection_established = [this](const network::ed25519_pubkey& node) {
-            call([this, node] {
-                // A rebuilt connection carries no subscription: the far end keyed the old one to
-                // the connection that just went away.  Losing it should already have dropped us,
-                // so this is the case where it somehow did not.
-                if (_subscribed && _sub_node && _sub_node->remote_pubkey == node)
-                    _drop_subscription("connection was re-established");
-            });
-        };
-    }
+    hooks.connection_established = [this](const network::ed25519_pubkey& node) {
+        call([this, node] {
+            // A rebuilt connection carries no subscription: the far end keyed the old one to
+            // the connection that just went away.  Losing it should already have dropped us,
+            // so this is the case where it somehow did not.
+            if (!_closing && _subscribed && _sub_node && _sub_node->remote_pubkey == node)
+                _drop_subscription("connection was re-established");
+        });
+    };
+
+    // Ownership moves in via release() because the two pointer types differ deliberately: `make`
+    // returns a plain unique_ptr so callers can hand over a std::make_unique, while the member's
+    // deleter (which is just `delete`) is what keeps Network an incomplete type in core.hpp --
+    // including session_network.hpp there costs ~6x the compile time per file.
+    _network.reset(make(std::move(hooks)).release());
 
     _update_polling();
 }

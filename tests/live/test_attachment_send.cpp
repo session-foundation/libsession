@@ -26,7 +26,9 @@ struct LiveClient {
                 fmt::format("{}", random::unique_id("live_client", 7))} {
         std::filesystem::create_directories(dir);
         client = std::make_unique<Client>(dir / "client.db");
-        client->core.set_network(make_testnet_network(dir / "netcache"));
+        client->core.set_network([this](session::network::NetworkHooks hooks) {
+            return make_testnet_network(dir / "netcache", std::move(hooks));
+        });
     }
 
     ~LiveClient() {

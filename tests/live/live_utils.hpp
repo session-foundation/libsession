@@ -35,7 +35,7 @@ inline constexpr auto TESTNET_QUIC_FS_ED_PUBKEY =
 
 // Creates a Network instance pointed at testnet using the current live_router_mode.
 inline std::unique_ptr<session::network::Network> make_testnet_network(
-        std::filesystem::path cache_dir) {
+        std::filesystem::path cache_dir, session::network::NetworkHooks hooks = {}) {
     namespace opt = session::network::opt;
 
     std::vector<opt::any> net_opts;
@@ -52,7 +52,8 @@ inline std::unique_ptr<session::network::Network> make_testnet_network(
                 opt::quic_file_server_address{session::test::resolve_host(TESTNET_QUIC_FS_HOST)});
     }
 
-    return std::make_unique<session::network::Network>(net_opts);
+    return std::make_unique<session::network::Network>(
+            session::network::config::Config{net_opts}, std::move(hooks));
 }
 
 // Creates a session::TempCore connected to a fresh testnet Network.  A unique temporary directory
@@ -67,7 +68,9 @@ inline session::TempCore make_live_core(Opts&&... opts) {
 
     session::TempCore tc{std::forward<Opts>(opts)...};
     tc.extra_dir = cache_dir;
-    tc->set_network(make_testnet_network(std::move(cache_dir)));
+    tc->set_network([&](session::network::NetworkHooks hooks) {
+        return make_testnet_network(std::move(cache_dir), std::move(hooks));
+    });
     return tc;
 }
 
