@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <span>
 #include <vector>
@@ -445,6 +446,73 @@ class PushEncryptor {
 
     /// Encrypts what is held back as the final chunk.  Throws std::logic_error if called twice.
     void finalize();
+};
+
+/// API: crypto/attachment::SeekableDecryptor
+///
+/// Random-access reader over an encrypted attachment file on disk: provides `read()`, `seek()`, and
+/// `tell()` in plaintext offsets, decrypting only the 32kiB chunks that are actually needed rather
+/// than the whole file.  This is intended for consumers that want a file-like source, such as an
+/// image decoder that needs only part of the file, or reads it incrementally.
+///
+/// The stream cipher cannot start at an arbitrary chunk: each chunk's decryption state depends on
+/// every chunk before it.  The reader therefore keeps a copy of the (52-byte) state at each chunk
+/// boundary that it has reached so far: sequential reads and seeks backwards cost at most one chunk
+/// decryption, while a seek forward past anything read so far decrypts every chunk in between.
+///
+/// Construction decrypts the leading padding chunk(s) (typically just one) to find where the data
+/// begins and so determine the exact plaintext size.
+///
+/// Truncation is detected only upon reaching the end: data read before that is authenticated, but a
+/// file cut off at a chunk boundary is not known to be cut off until a read reaches the last
+/// available chunk and finds that it is not marked as the final one, at which point that `read()`
+/// throws.  A caller who needs to know that it had the complete file must read through to the end.
+///
+/// Reads and seeks throw std::runtime_error if decryption fails; the object is left in a consistent
+/// state (retrying the same read will simply fail again).
+class SeekableDecryptor {
+    std::ifstream in;
+    uint64_t enc_size;
+    uint64_t chunks;
+    // Checkpoint `i` is the secretstream state (crypto_secretstream_xchacha20poly1305_state) before
+    // decrypting chunk `i`; it is filled in as far as we have decrypted so far.
+    cleared_vector<std::array<std::byte, 52>> checkpoints;
+    std::vector<std::byte> buf;
+    uint64_t buf_chunk;
+    // Offset of plaintext position 0 within the decrypted stream (i.e. the padding length):
+    uint64_t data_start;
+    uint64_t size_;
+    uint64_t pos = 0;
+
+    // Decrypts stream chunk `i` into `buf`, advancing through (and checkpointing) any chunks in
+    // between if `i` is beyond what we have decrypted so far.
+    void load_chunk(uint64_t i);
+
+    // Decrypts chunk `i` (which must already have a checkpoint) into `buf`.
+    void decrypt_chunk(uint64_t i);
+
+  public:
+    /// Opens the encrypted file at `file` for decryption with the given key.
+    ///
+    /// Throws std::runtime_error if the file is not a validly sized encrypted attachment, if the
+    /// key is wrong (or the initial data is corrupted), or if the file cannot be opened or read.
+    SeekableDecryptor(
+            const std::filesystem::path& file, std::span<const std::byte, ENCRYPT_KEY_SIZE> key);
+
+    /// The exact size of the decrypted data.
+    uint64_t size() const { return size_; }
+
+    /// The current plaintext read position.
+    uint64_t tell() const { return pos; }
+
+    /// Sets the plaintext read position.  Seeking to or beyond `size()` is permitted, and results
+    /// in subsequent reads returning 0 bytes.  No decryption happens until the next `read()`.
+    void seek(uint64_t position) { pos = position; }
+
+    /// Reads decrypted data from the current position into `out` and advances the position.
+    /// Returns the number of bytes read, which is less than `out.size()` only when the end of the
+    /// data is reached.
+    size_t read(std::span<std::byte> out);
 };
 
 /// API: crypto/attachment::Encryptor

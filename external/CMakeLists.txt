@@ -138,6 +138,24 @@ endif()
 session_dep(simdutf 7)
 libsession_static_bundle(sessiondep::simdutf)
 
+# 8.13 added vips_operation_block_set(), which the loader whitelist in src/image/vips.cpp needs: a
+# system libvips may carry loaders (svg, pdf, tiff, ...) that our static build leaves out.
+session_dep(vips 8.13)
+libsession_static_bundle(sessiondep::vips)
+
+# libvips' own HEIF support cannot say which codec a HEIF file uses (it guesses from the brand),
+# so libsession::image asks libheif directly; 1.19 is the first with the grid tile API it needs.
+session_dep(libheif 1.19)
+libsession_static_bundle(sessiondep::libheif)
+
+if(SESSION_ENABLE_JPEGLI)
+    # Always our own build, even when everything else comes from the system: distributions do not
+    # package jpegli, and we want every client encoding JPEGs the same way whatever libvips it has.
+    set(BUILD_STATIC_jpegli ON CACHE BOOL "" FORCE)
+    session_dep(jpegli 0)
+    libsession_static_bundle(sessiondep::jpegli)
+endif()
+
 
 add_subdirectory(session-sqlite)
 

@@ -67,6 +67,9 @@ struct MessagePreview {
 
     /// True if there is at least one attachment and every one of them is an image, so a row can say
     /// "3 images" where it would otherwise say "3 files".  False when there are none at all.
+    ///
+    /// "Image" means a content type Session displays as one (image::displayable_image_types), the
+    /// same rule as Message::gallery_viewable: an SVG or TIFF counts as a file.
     bool all_images = false;
 };
 

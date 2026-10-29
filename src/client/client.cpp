@@ -19,6 +19,7 @@
 #include <session/config/user_profile.hpp>
 #include <session/format.hpp>
 #include <session/hash.hpp>
+#include <session/image/content_types.hpp>
 #include <session/network/backends/session_file_server.hpp>
 #include <session/network/session_network.hpp>
 #include <session/placeholders.hpp>
@@ -1927,6 +1928,16 @@ static constexpr auto IS_REQUEST =
 //
 // Messages with no attachments simply do not come back, and need not: a default-constructed
 // preview already says a message has none.
+// The SQL counterpart of image::is_displayable_image(), built from the same list so the two cannot
+// drift apart.  SQLite's lower() folds only ASCII, which is also all the C++ side folds.
+static const std::string DISPLAYABLE_IMAGE_SQL = [] {
+    std::string sql = "lower(content_type) IN (";
+    for (auto type : image::displayable_image_types)
+        sql += "'{}',"_format(type);
+    sql.back() = ')';
+    return sql;
+}();
+
 static void load_preview_attachments(
         sqlite::Connection& c,
         std::vector<AnyConversation>& convos,
@@ -1947,19 +1958,19 @@ static void load_preview_attachments(
     // Only the three columns a preview uses, so a list does not carry the sizes and urls that a
     // message view reads.
     //
-    // `substr(...) = 'image/'` rather than `LIKE 'image/%'` because LIKE is ASCII-case-insensitive
-    // in SQLite while `gallery_viewable`'s `starts_with` is not, and the two deciding differently
-    // about `image/PNG` is exactly the sort of disagreement nobody would think to look for.
-    // Every attachment starts an all-images run that its own answer then confirms or ends, so the
-    // flag means "at least one, and all of them" without a separate count to compare against.
+    // "Image" is decided by DISPLAYABLE_IMAGE_SQL, which answers exactly as `gallery_viewable`'s
+    // is_displayable_image() does: the two deciding differently about some content type is exactly
+    // the sort of disagreement nobody would think to look for.  Every attachment starts an
+    // all-images run that its own answer then confirms or ends, so the flag means "at least one,
+    // and all of them" without a separate count to compare against.
     for (auto&& [msg, filename, is_image, flags] :
          c.prepared_results<int64_t, std::optional<std::string>, int, int>(
                  R"(
         SELECT message, filename,
-               content_type IS NOT NULL AND substr(content_type, 1, 6) = 'image/',
+               content_type IS NOT NULL AND {},
                flags
         FROM message_attachments WHERE message IN ({}) ORDER BY message, idx
-    )"_format(sqlite::placeholders(ids.size())),
+    )"_format(DISPLAYABLE_IMAGE_SQL, sqlite::placeholders(ids.size())),
                  sqlite::bind_each{ids})) {
         auto found = at.find(msg);
         if (found == at.end())
@@ -2718,7 +2729,7 @@ static bool auto_download_wants(AutoDownload mode, const std::optional<std::stri
     switch (mode) {
         case AutoDownload::all: return true;
         case AutoDownload::image_attachments:
-            return content_type && content_type->starts_with("image/");
+            return content_type && image::is_displayable_image(*content_type);
         case AutoDownload::none: return false;
     }
     return false;
@@ -3745,7 +3756,7 @@ static const std::string MESSAGE_COLUMNS = R"(
 // behind to be honoured forever.
 static bool gallery_viewable(const std::vector<Attachment>& attachments) {
     return !attachments.empty() && std::ranges::all_of(attachments, [](const Attachment& a) {
-        return a.content_type && a.content_type->starts_with("image/");
+        return a.content_type && image::is_displayable_image(*a.content_type);
     });
 }
 

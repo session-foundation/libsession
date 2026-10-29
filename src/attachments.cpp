@@ -105,6 +105,67 @@ class decryption_failure : public std::runtime_error {
             std::runtime_error{"Attachment decryption failed: invalid key or corrupted data"} {}
 };
 
+static void check_encryption_type(std::byte prefix) {
+    if (prefix != std::byte{'S'})
+        throw std::runtime_error{
+                "Attachment decryption failed: unknown encryption type 0x{:02x}; expected 0x53 (S)"_format(
+                        +static_cast<unsigned char>(prefix))};
+}
+
+// Decrypts one encrypted chunk (mac+tag included) into `out`, which must have room for
+// `chunk.size() - ENCRYPT_CHUNK_OVERHEAD` bytes.  Returns the chunk's stream tag, or nullopt if the
+// chunk is too short to hold a mac+tag or does not authenticate.
+static std::optional<unsigned char> pull_chunk(
+        crypto_secretstream_xchacha20poly1305_state& st,
+        std::span<const std::byte> chunk,
+        std::byte* out) {
+    assert(chunk.size() <= ENCRYPTED_CHUNK_TOTAL);
+    if (chunk.size() < ENCRYPT_CHUNK_OVERHEAD)
+        return std::nullopt;
+
+    unsigned char tag;
+    if (crypto_secretstream_xchacha20poly1305_pull(
+                &st,
+                to_unsigned(out),
+                nullptr,
+                &tag,
+                to_unsigned(chunk.data()),
+                chunk.size(),
+                nullptr,
+                0) != 0)
+        return std::nullopt;
+    return tag;
+}
+
+// Sentinel returns of padding_end():
+constexpr size_t PADDING_CONTINUES = std::numeric_limits<size_t>::max();
+constexpr size_t PADDING_INVALID = PADDING_CONTINUES - 1;
+
+// Given a decrypted chunk that is still inside the leading padding (0x00s terminated by a single
+// 0x01), returns the offset just past the 0x01, i.e. where the real data begins in this chunk.
+// Returns PADDING_CONTINUES if the chunk is zeros throughout, and PADDING_INVALID if the first
+// non-zero byte is not 0x01.
+static size_t padding_end(std::span<const std::byte> chunk) {
+    auto it = std::find_if_not(
+            chunk.begin(), chunk.end(), [](const std::byte c) { return c == std::byte{0x00}; });
+    if (it == chunk.end())
+        return PADDING_CONTINUES;
+    if (*it != std::byte{0x01})
+        return PADDING_INVALID;
+    return it - chunk.begin() + 1;
+}
+
+// The FINAL tag must be on the last chunk and nowhere else: earlier means data was appended after
+// the real end, and missing from the end means the data was truncated at a chunk boundary.
+static void check_final_tag(unsigned char tag, bool last_chunk) {
+    bool final = tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL;
+    if (final && !last_chunk)
+        throw std::runtime_error{
+                "Attachment decryption failed: FINAL tag before end of the encrypted data"};
+    if (!final && last_chunk)
+        throw std::runtime_error{"Attachment decryption failed: end of data without FINAL tag"};
+}
+
 // We have to roll our own custom version of crypto_secretstream_xchacha20poly1305_init_push here
 // because libsodium offers no way to provide the randomness it uses (it hard codes a call to
 // randombytes_buf), and so this repeats its internal implementation but using our hashed data for
@@ -265,10 +326,7 @@ size_t decrypt(
     if (!max_size)
         throw std::runtime_error{"Attachment decryption failed: encrypted data too short"};
 
-    if (encrypted.front() != std::byte{'S'})
-        throw std::runtime_error{
-                "Attachment decryption failed: unknown encryption type 0x{:02x}; expected 0x53 (S)"_format(
-                        +static_cast<unsigned char>(encrypted.front()))};
+    check_encryption_type(encrypted.front());
 
     if (out.size() < *max_size)
         throw std::logic_error{
@@ -302,52 +360,29 @@ size_t decrypt(
                     std::min(inend - inpos - ENCRYPT_CHUNK_OVERHEAD, ENCRYPT_CHUNK_SIZE);
             padbuf.resize(chunk_size);
 
-            unsigned char tag;
-            if (crypto_secretstream_xchacha20poly1305_pull(
-                        &st,
-                        reinterpret_cast<unsigned char*>(padbuf.data()),
-                        nullptr,
-                        &tag,
-                        to_unsigned(inpos),
-                        chunk_size + ENCRYPT_CHUNK_OVERHEAD,
-                        nullptr,
-                        0) != 0)
-                throw std::runtime_error{
-                        "Attachment decryption failed: invalid key or corrupted data"};
+            auto tag = pull_chunk(st, {inpos, chunk_size + ENCRYPT_CHUNK_OVERHEAD}, padbuf.data());
+            if (!tag)
+                throw decryption_failure{};
 
             inpos += chunk_size + ENCRYPT_CHUNK_OVERHEAD;
+            check_final_tag(*tag, inpos == inend);
 
-            auto padend = std::find_if_not(padbuf.begin(), padbuf.end(), [](const std::byte c) {
-                return c == std::byte{0x00};
-            });
-            if (padend != padbuf.end()) {
-                if (*padend != std::byte{0x01})
-                    throw std::runtime_error{"Attachment decryption failed: invalid padding"};
-                ++padend;
-
-                std::span<const std::byte> init_data{padend, padbuf.end()};
+            auto data_start = padding_end(padbuf);
+            if (data_start == PADDING_INVALID)
+                throw std::runtime_error{"Attachment decryption failed: invalid padding"};
+            if (data_start != PADDING_CONTINUES) {
+                auto init_data = std::span{padbuf}.subspan(data_start);
                 // We've identified the start of the data: assuming it is valid, the remaining of
                 // the encrypted data consists of N chunks of
                 // (ENCRYPT_CHUNK_SIZE+ENCRYPT_CHUNK_OVERHEAD) full data chunks plus one final
                 // (chunk+ENCRYPT_CHUNK_OVERHEAD).
-                size_t final_size = init_data.size() + (inend - inpos) -
-                                    (inend - inpos + ENCRYPTED_CHUNK_TOTAL - 1) /
-                                            ENCRYPTED_CHUNK_TOTAL * ENCRYPT_CHUNK_OVERHEAD;
+                [[maybe_unused]] size_t final_size = init_data.size() + (inend - inpos) -
+                                                     (inend - inpos + ENCRYPTED_CHUNK_TOTAL - 1) /
+                                                             ENCRYPTED_CHUNK_TOTAL *
+                                                             ENCRYPT_CHUNK_OVERHEAD;
                 assert(out.size() >= final_size);
-                decrypted = std::copy(padend, padbuf.end(), decrypted);
-
-                if (tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL) {
-                    if (inpos != inend)
-                        throw std::runtime_error{
-                                "Attachment decryption failed: FINAL tag before end of the "
-                                "encrypted data"};
-                    done = true;
-                } else if (
-                        inpos == inend && tag != crypto_secretstream_xchacha20poly1305_TAG_FINAL) {
-                    throw std::runtime_error{
-                            "Attachment decryption failed: end of data without FINAL tag"};
-                }
-
+                decrypted = std::copy(init_data.begin(), init_data.end(), decrypted);
+                done = inpos == inend;
                 break;
             }
         } while (true);
@@ -361,30 +396,15 @@ size_t decrypt(
         size_t chunk_size = std::min(inend - inpos - ENCRYPT_CHUNK_OVERHEAD, ENCRYPT_CHUNK_SIZE);
         assert(decrypted + chunk_size <= out.data() + out.size());
 
-        unsigned char tag;
-        if (crypto_secretstream_xchacha20poly1305_pull(
-                    &st,
-                    reinterpret_cast<unsigned char*>(decrypted),
-                    nullptr,
-                    &tag,
-                    to_unsigned(inpos),
-                    chunk_size + ENCRYPT_CHUNK_OVERHEAD,
-                    nullptr,
-                    0) != 0)
-            throw std::runtime_error{"Attachment decryption failed: invalid key or corrupted data"};
+        auto tag = pull_chunk(st, {inpos, chunk_size + ENCRYPT_CHUNK_OVERHEAD}, decrypted);
+        if (!tag)
+            throw decryption_failure{};
 
         decrypted += chunk_size;
         inpos += chunk_size + ENCRYPT_CHUNK_OVERHEAD;
 
-        if (tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL) {
-            if (inpos != inend)
-                throw std::runtime_error{
-                        "Attachment decryption failed: FINAL tag before end of the "
-                        "encrypted data"};
-            done = true;
-        } else if (inpos == inend && tag != crypto_secretstream_xchacha20poly1305_TAG_FINAL) {
-            throw std::runtime_error{"Attachment decryption failed: end of data without FINAL tag"};
-        }
+        check_final_tag(*tag, inpos == inend);
+        done = inpos == inend;
     }
 
     return decrypted - out.data();
@@ -397,10 +417,7 @@ std::vector<std::byte> decrypt(
     if (!max_size)
         throw std::runtime_error{"Attachment decryption failed: encrypted data too short"};
 
-    if (encrypted.front() != std::byte{'S'})
-        throw std::runtime_error{
-                "Attachment decryption failed: unknown encryption type 0x{:02x}; expected 0x53 (S)"_format(
-                        +static_cast<unsigned char>(encrypted.front()))};
+    check_encryption_type(encrypted.front());
 
     std::vector<std::byte> result;
     result.resize(*max_size);
@@ -604,48 +621,33 @@ void Decryptor::process_chunk(std::span<const std::byte> chunk, [[maybe_unused]]
         return;
     }
     assert(is_final || chunk.size() == ENCRYPTED_CHUNK_TOTAL);
-    assert(chunk.size() <= ENCRYPTED_CHUNK_TOTAL);
-    if (chunk.size() < ENCRYPT_CHUNK_OVERHEAD) {
-        failed = true;
-        return;
-    }
 
-    unsigned char tag;
     std::array<std::byte, ENCRYPT_CHUNK_SIZE> outa;
-    std::span out{outa.data(), chunk.size() - ENCRYPT_CHUNK_OVERHEAD};
-    if (crypto_secretstream_xchacha20poly1305_pull(
-                st(st_data),
-                reinterpret_cast<unsigned char*>(out.data()),
-                nullptr,
-                &tag,
-                reinterpret_cast<const unsigned char*>(chunk.data()),
-                chunk.size(),
-                nullptr,
-                0) != 0) {
+    auto tag = pull_chunk(*st(st_data), chunk, outa.data());
+    if (!tag) {
         failed = true;
         return;
     }
+    std::span out{outa.data(), chunk.size() - ENCRYPT_CHUNK_OVERHEAD};
 
-    if (tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL)
+    if (*tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL)
         hit_final = true;
 
     if (!depadded) {
-        auto padend = std::find_if_not(
-                out.begin(), out.end(), [](const std::byte c) { return c == std::byte{0x00}; });
-        if (padend == out.end()) {
-            padding_seen += out.size();
-            return;
-        }
-        if (*padend != std::byte{0x01}) {
+        auto data_start = padding_end(out);
+        if (data_start == PADDING_INVALID) {
             failed = true;
             return;
         }
-        ++padend;
-        padding_seen += static_cast<size_t>(padend - out.begin());
+        if (data_start == PADDING_CONTINUES) {
+            padding_seen += out.size();
+            return;
+        }
+        padding_seen += data_start;
         depadded = true;
-        if (padend != out.end())
-            output(std::span<const std::byte>{padend, out.end()});
-        return;
+        out = out.subspan(data_start);
+        if (out.empty())
+            return;
     }
 
     output(out);
@@ -798,6 +800,117 @@ void PushEncryptor::push(size_t size, bool is_final) {
             is_final ? crypto_secretstream_xchacha20poly1305_TAG_FINAL : 0);
     buf.erase(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(size));
     output(std::span<const std::byte>{out.data(), static_cast<size_t>(len)});
+}
+
+static constexpr uint64_t NO_CHUNK = std::numeric_limits<uint64_t>::max();
+
+SeekableDecryptor::SeekableDecryptor(
+        const std::filesystem::path& file, std::span<const std::byte, ENCRYPT_KEY_SIZE> key) :
+        buf_chunk{NO_CHUNK} {
+    static_assert(
+            sizeof(crypto_secretstream_xchacha20poly1305_state) ==
+            sizeof(decltype(checkpoints)::value_type));
+
+    in.exceptions(std::ios::badbit);
+    in.open(file, std::ios::binary | std::ios::ate);
+    if (!in.is_open())
+        throw std::runtime_error{
+                "Attachment decryption failed: unable to open {}"_format(file.string())};
+    enc_size = in.tellg();
+
+    constexpr uint64_t prefix_size = 1 + ENCRYPT_HEADER;
+    // The smallest possible stream is a single chunk holding just the 0x01 padding byte:
+    if (enc_size < prefix_size + ENCRYPT_CHUNK_OVERHEAD + 1)
+        throw std::runtime_error{
+                "Attachment decryption failed: file is too small to contain an encrypted "
+                "attachment"};
+    const uint64_t body = enc_size - prefix_size;
+    chunks = (body + ENCRYPTED_CHUNK_TOTAL - 1) / ENCRYPTED_CHUNK_TOTAL;
+    if (body - (chunks - 1) * ENCRYPTED_CHUNK_TOTAL <= ENCRYPT_CHUNK_OVERHEAD)
+        throw std::runtime_error{"Attachment decryption failed: invalid encrypted file size"};
+
+    std::array<std::byte, prefix_size> hdr;
+    in.seekg(0);
+    in.read(reinterpret_cast<char*>(hdr.data()), hdr.size());
+    if (static_cast<size_t>(in.gcount()) != hdr.size())
+        throw std::runtime_error{"Attachment decryption failed: unable to read header"};
+    check_encryption_type(hdr[0]);
+
+    auto& st0 = checkpoints.emplace_back();
+    crypto_secretstream_xchacha20poly1305_init_pull(
+            reinterpret_cast<crypto_secretstream_xchacha20poly1305_state*>(st0.data()),
+            to_unsigned(hdr.data() + 1),
+            to_unsigned(key.data()));
+
+    for (uint64_t i = 0;; i++) {
+        if (i == chunks)
+            throw std::runtime_error{
+                    "Attachment decryption failed: data ended in the middle of padding"};
+        decrypt_chunk(i);
+        auto end = padding_end(buf);
+        if (end == PADDING_INVALID)
+            throw std::runtime_error{"Attachment decryption failed: invalid padding"};
+        if (end != PADDING_CONTINUES) {
+            data_start = i * ENCRYPT_CHUNK_SIZE + end;
+            break;
+        }
+    }
+
+    size_ = body - chunks * ENCRYPT_CHUNK_OVERHEAD - data_start;
+}
+
+void SeekableDecryptor::decrypt_chunk(uint64_t i) {
+    assert(i < checkpoints.size());
+    assert(i < chunks);
+
+    const bool last = i + 1 == chunks;
+    const uint64_t enc_offset = 1 + ENCRYPT_HEADER + i * ENCRYPTED_CHUNK_TOTAL;
+    const size_t enc_len =
+            last ? static_cast<size_t>(enc_size - enc_offset) : ENCRYPTED_CHUNK_TOTAL;
+
+    std::array<std::byte, ENCRYPTED_CHUNK_TOTAL> enc;
+    in.seekg(enc_offset);
+    in.read(reinterpret_cast<char*>(enc.data()), enc_len);
+    if (static_cast<size_t>(in.gcount()) != enc_len)
+        throw std::runtime_error{
+                "Attachment decryption failed: encrypted file changed size while reading"};
+
+    crypto_secretstream_xchacha20poly1305_state st;
+    std::memcpy(&st, checkpoints[i].data(), sizeof(st));
+
+    // buf is about to be overwritten, so must not claim to hold anything if we fail:
+    buf_chunk = NO_CHUNK;
+    buf.resize(enc_len - ENCRYPT_CHUNK_OVERHEAD);
+    auto tag = pull_chunk(st, std::span{enc}.first(enc_len), buf.data());
+    if (!tag)
+        throw decryption_failure{};
+    check_final_tag(*tag, last);
+    buf_chunk = i;
+
+    if (i + 1 == checkpoints.size() && !last)
+        std::memcpy(checkpoints.emplace_back().data(), &st, sizeof(st));
+}
+
+void SeekableDecryptor::load_chunk(uint64_t i) {
+    if (i == buf_chunk)
+        return;
+    for (auto j = std::min<uint64_t>(i, checkpoints.size() - 1); j <= i; j++)
+        decrypt_chunk(j);
+}
+
+size_t SeekableDecryptor::read(std::span<std::byte> out) {
+    size_t total = 0;
+    while (!out.empty() && pos < size_) {
+        const uint64_t stream_pos = data_start + pos;
+        load_chunk(stream_pos / ENCRYPT_CHUNK_SIZE);
+        const size_t offset = stream_pos % ENCRYPT_CHUNK_SIZE;
+        const size_t n = std::min(out.size(), buf.size() - offset);
+        std::memcpy(out.data(), buf.data() + offset, n);
+        out = out.subspan(n);
+        pos += n;
+        total += n;
+    }
+    return total;
 }
 
 void decrypt(

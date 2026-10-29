@@ -123,12 +123,31 @@ def workflow(name, platform, steps, when = None, clone = None):
         wf["clone"] = clone
     return wf
 
-# Installs `pkgs` in a fresh container of `image`, from deb.session.foundation as well if wanted.
-def apt_install(image, pkgs, session_repo = True, foreign_arch = None):
+build_tools = ["cmake", "make", "git", "ccache", "ca-certificates"]
+
+# Where a build gets meson, which the libvips stack (libvips, glib) builds with, at 1.4 or later:
+# from the image's own apt by default, from a Debian backports suite when that is the only place an
+# older release has a recent enough one (Debian 12), or from pip when no apt source does (Ubuntu
+# 22.04).
+def meson_tools(source = None):
+    if source == "pip":
+        return {"pkgs": ["python3-pip", "ninja-build"], "commands": ["pip3 install 'meson>=1.4'"]}
+    if source:
+        return {
+            "pkgs": ["meson/" + source, "ninja-build"],
+            "apt_source": "deb http://deb.debian.org/debian %s main" % source,
+        }
+    return {"pkgs": ["meson", "ninja-build"]}
+
+# Installs `pkgs` in a fresh container of `image`, from deb.session.foundation as well if wanted,
+# and from `apt_source` if given.
+def apt_install(image, pkgs, session_repo = True, foreign_arch = None, apt_source = None):
     cmds = ['echo "man-db man-db/auto-update boolean false" | debconf-set-selections']
     if foreign_arch:
         # Has to come before the `apt-get update`.
         cmds.append("dpkg --add-architecture " + foreign_arch)
+    if apt_source:
+        cmds.append("echo %s >/etc/apt/sources.list.d/extra.list" % apt_source)
     cmds += [apt_get + " update", apt_get + " install -y eatmydata"]
     if session_repo:
         codename = "sid" if image.startswith(registry + "debian-sid") else "$$(lsb_release -sc)"
@@ -177,15 +196,18 @@ def linux(
         jobs = 6,
         test_runner = "",
         checks = None,
-        clone = None):
+        clone = None,
+        meson = None):
     if cmake.get("BUILD_STATIC_DEPS"):
         system = []
     if checks == None:
         checks = [tests(test_runner)]
     image = registry + image
+    m = meson_tools(meson)
     steps = [build_step(
         image,
-        apt_install(image, ["cmake", "make", "git", "ccache", "ca-certificates"] + deps + system, session_repo, foreign_arch) +
+        apt_install(image, build_tools + m["pkgs"] + deps + system, session_repo, foreign_arch, m.get("apt_source")) +
+        m.get("commands", []) +
         build_commands(cmake, jobs),
     )]
     for check in checks:
@@ -233,12 +255,14 @@ def full_llvm(version, cxx = None):
     )
 
 # Release archives: built by `commands` and uploaded from `directory`, where they leave the archive.
-def package(name, image, commands, directory, arch = "amd64", deps = gcc_deps, session_repo = False):
+def package(name, image, commands, directory, arch = "amd64", deps = gcc_deps, session_repo = False, meson = None):
     image = registry + image
+    m = meson_tools(meson)
     return workflow(name, "linux/" + arch, [
         build_step(
             image,
-            apt_install(image, ["cmake", "make", "git", "ccache", "ca-certificates"] + deps, session_repo) +
+            apt_install(image, build_tools + m["pkgs"] + deps, session_repo, apt_source = m.get("apt_source")) +
+            m.get("commands", []) +
             ["export JOBS=6"] + commands,
         ),
         upload_step(image, "cd %s && ../utils/ci/static-upload.sh" % directory),
@@ -394,14 +418,14 @@ def main(ctx):
         full_llvm(19),
         linux("Debian stable (i386)", "debian-stable/i386"),
         linux("Debian 13", "debian-trixie", checks = [tests(), schema_history], clone = full_clone),
-        linux("Debian 12", "debian-bookworm"),
+        linux("Debian 12", "debian-bookworm", meson = "bookworm-backports"),
         linux("Ubuntu latest", "ubuntu-rolling"),
         linux("Ubuntu LTS", "ubuntu-lts"),
 
         # The one build that compiles every dependency itself rather than taking the distro's, on
         # the oldest distro we support: what the release artifacts do, and the only thing that
         # notices when a dependency we vendor stops building.
-        linux("Ubuntu 22.04 (static deps)", "ubuntu-jammy", cmake = {"BUILD_STATIC_DEPS": True}),
+        linux("Ubuntu 22.04 (static deps)", "ubuntu-jammy", cmake = {"BUILD_STATIC_DEPS": True}, meson = "pip"),
 
         # ARM builds; armhf builds in a 32-bit image on the arm64 agents.
         linux("Debian sid (ARM64)", "debian-sid", arch = "arm64", jobs = 4),

@@ -5,6 +5,7 @@
 #include <catch2/matchers/catch_matchers_exception.hpp>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <session/attachments.hpp>
 #include <session/random.hpp>
 
@@ -563,6 +564,159 @@ TEST_CASE(
                 std::runtime_error,
                 bad_data_message);
         CHECK_FALSE(std::filesystem::exists(out.path));
+    }
+}
+
+static std::vector<std::byte> read_at(attachment::SeekableDecryptor& d, uint64_t pos, size_t len) {
+    d.seek(pos);
+    std::vector<std::byte> out(len);
+    out.resize(d.read(out));
+    CHECK(d.tell() == pos + out.size());
+    return out;
+}
+
+static std::vector<std::byte> slice(std::span<const std::byte> data, uint64_t pos, size_t len) {
+    if (pos >= data.size())
+        return {};
+    auto s = data.subspan(pos, std::min<size_t>(len, data.size() - pos));
+    return {s.begin(), s.end()};
+}
+
+TEST_CASE("Seekable attachment decryption", "[attachments][files][seekable]") {
+
+    // 4200000 is large enough that its padding spans several chunks.
+    auto DATA_SIZE =
+            GENERATE(0, 1, 2, 4053, 4054, 32767, 32768, 32769, 33333, 261983, 4200000, 10218286);
+
+    auto seed = "c123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_hex_b;
+    const auto data = make_data(DATA_SIZE);
+    temp_data_file f;
+    auto key = attachment::encrypt(seed, data, attachment::Domain::ATTACHMENT, f.path);
+
+    attachment::SeekableDecryptor d{f.path, key};
+    REQUIRE(d.size() == data.size());
+    CHECK(d.tell() == 0);
+
+    SECTION("sequential reads") {
+        auto READ_SIZE = GENERATE(1000, 4096, 100000);
+        std::vector<std::byte> out;
+        std::vector<std::byte> buf(READ_SIZE);
+        while (auto n = d.read(buf))
+            out.insert(out.end(), buf.begin(), buf.begin() + n);
+        CHECK(d.tell() == data.size());
+        CHECK(!!(out == data));
+        CHECK(d.read(buf) == 0);
+    }
+
+    SECTION("reading the end first") {
+        auto tail = std::min<size_t>(DATA_SIZE, 50);
+        CHECK(!!(read_at(d, DATA_SIZE - tail, 100) == slice(data, DATA_SIZE - tail, 100)));
+        CHECK(!!(read_at(d, 0, 100) == slice(data, 0, 100)));
+    }
+
+    SECTION("random access") {
+        std::mt19937_64 rng{static_cast<uint64_t>(DATA_SIZE)};
+        for (int i = 0; i < 200; i++) {
+            uint64_t pos = std::uniform_int_distribution<uint64_t>{0, data.size() + 10}(rng);
+            size_t len = std::uniform_int_distribution<size_t>{0, 100'000}(rng);
+            INFO("read of " << len << " at " << pos);
+            CHECK(!!(read_at(d, pos, len) == slice(data, pos, len)));
+        }
+    }
+
+    SECTION("seeking past the end") {
+        CHECK(read_at(d, data.size(), 10).empty());
+        CHECK(read_at(d, data.size() + 12345, 10).empty());
+        CHECK(!!(read_at(d, 0, 10) == slice(data, 0, 10)));
+    }
+}
+
+TEST_CASE("Seekable attachment decryption rejects bad data", "[attachments][files][seekable]") {
+
+    auto seed = "d123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_hex_b;
+    auto data = make_data(261983);
+    auto [enc, key] = attachment::encrypt(seed, data, attachment::Domain::ATTACHMENT);
+    temp_data_file f;
+
+    constexpr size_t first_chunk = 1 + attachment::ENCRYPT_HEADER;
+    constexpr size_t chunk_total = attachment::ENCRYPTED_CHUNK_TOTAL;
+
+    SECTION("wrong key") {
+        write_file(f.path, enc);
+        key[0] ^= std::byte{0x01};
+        CHECK_THROWS_MATCHES(
+                (attachment::SeekableDecryptor{f.path, key}), std::runtime_error, bad_data_message);
+    }
+
+    SECTION("unknown encryption type") {
+        enc[0] = std::byte{'X'};
+        write_file(f.path, enc);
+        CHECK_THROWS_MATCHES(
+                (attachment::SeekableDecryptor{f.path, key}),
+                std::runtime_error,
+                Message("Attachment decryption failed: unknown encryption type 0x58; expected "
+                        "0x53 (S)"));
+    }
+
+    SECTION("too small") {
+        enc.resize(first_chunk + attachment::ENCRYPT_CHUNK_OVERHEAD);
+        write_file(f.path, enc);
+        CHECK_THROWS_MATCHES(
+                (attachment::SeekableDecryptor{f.path, key}),
+                std::runtime_error,
+                Message("Attachment decryption failed: file is too small to contain an encrypted "
+                        "attachment"));
+    }
+
+    SECTION("last chunk too short to hold a mac+tag") {
+        enc.resize(first_chunk + 3 * chunk_total + 5);
+        write_file(f.path, enc);
+        CHECK_THROWS_MATCHES(
+                (attachment::SeekableDecryptor{f.path, key}),
+                std::runtime_error,
+                Message("Attachment decryption failed: invalid encrypted file size"));
+    }
+
+    SECTION("missing file") {
+        CHECK_THROWS_AS((attachment::SeekableDecryptor{f.path, key}), std::runtime_error);
+    }
+
+    SECTION("corrupted middle chunk") {
+        enc[first_chunk + 3 * chunk_total + 100] ^= std::byte{0x01};
+        write_file(f.path, enc);
+        attachment::SeekableDecryptor d{f.path, key};
+        CHECK(d.size() == data.size());
+
+        // The padding is all within chunk 0, so this reads through chunk 2, and bad_pos is in the
+        // corrupted chunk 3:
+        const uint64_t good_len = 2 * attachment::ENCRYPT_CHUNK_SIZE;
+        const uint64_t bad_pos = 3 * attachment::ENCRYPT_CHUNK_SIZE;
+
+        CHECK(!!(read_at(d, 0, good_len) == slice(data, 0, good_len)));
+        std::vector<std::byte> buf(1);
+        d.seek(bad_pos);
+        CHECK_THROWS_MATCHES(d.read(buf), std::runtime_error, bad_data_message);
+        CHECK_THROWS_MATCHES(d.read(buf), std::runtime_error, bad_data_message);
+        // Anything later is unreachable, as getting there requires decrypting chunk 3:
+        d.seek(d.size() - 1);
+        CHECK_THROWS_MATCHES(d.read(buf), std::runtime_error, bad_data_message);
+        // ... but the earlier data is still readable:
+        CHECK(!!(read_at(d, 0, good_len) == slice(data, 0, good_len)));
+    }
+
+    SECTION("truncated at a chunk boundary") {
+        enc.resize(first_chunk + 5 * chunk_total);
+        write_file(f.path, enc);
+        attachment::SeekableDecryptor d{f.path, key};
+        CHECK(d.size() < data.size());
+
+        CHECK(!!(read_at(d, 0, 1000) == slice(data, 0, 1000)));
+        d.seek(d.size() - 1);
+        std::vector<std::byte> buf(1);
+        CHECK_THROWS_MATCHES(
+                d.read(buf),
+                std::runtime_error,
+                Message("Attachment decryption failed: end of data without FINAL tag"));
     }
 }
 
