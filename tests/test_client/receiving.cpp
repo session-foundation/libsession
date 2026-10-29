@@ -470,6 +470,101 @@ TEST_CASE("Client: message history pages backwards by cursor", "[client][message
     CHECK(c->conversation(convo, await)->messages(4, page3.back().cursor(), await).empty());
 }
 
+namespace {
+std::vector<std::string> bodies(const std::vector<Message>& page) {
+    std::vector<std::string> out;
+    for (auto& m : page)
+        out.push_back(m.body);
+    return out;
+}
+}  // namespace
+
+TEST_CASE("Client: message history pages forwards by cursor", "[client][messages]") {
+    TempClient c;
+    SenderKeys sender;
+    auto convo = ConversationId::dm(sender.session_id);
+    for (int i = 1; i <= 10; i++)
+        deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
+    auto conversation = c->conversation(convo, await);
+    auto all = conversation->messages(10, await);
+    auto third = all[7];
+    REQUIRE(third.body == "msg3");
+
+    // The four just newer than the cursor, newest first, the cursor's own message left out.
+    CHECK(bodies(conversation->messages_after(4, third.cursor(), await)) ==
+          std::vector<std::string>{"msg7", "msg6", "msg5", "msg4"});
+    // Short at the newest end, and empty past it.
+    CHECK(bodies(conversation->messages_after(4, all[1].cursor(), await)) ==
+          std::vector<std::string>{"msg10"});
+    CHECK(conversation->messages_after(4, all[0].cursor(), await).empty());
+}
+
+TEST_CASE("Client: a window around a message puts it in the middle", "[client][messages]") {
+    TempClient c;
+    SenderKeys sender;
+    auto convo = ConversationId::dm(sender.session_id);
+    for (int i = 1; i <= 10; i++)
+        deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
+    auto conversation = c->conversation(convo, await);
+    auto all = conversation->messages(10, await);
+    auto at = [&](int n) { return all[10 - n].cursor(); };
+
+    CHECK(bodies(conversation->messages_around(5, at(5), await)) ==
+          std::vector<std::string>{"msg7", "msg6", "msg5", "msg4", "msg3"});
+    // An even limit's spare row goes newer.
+    CHECK(bodies(conversation->messages_around(4, at(5), await)) ==
+          std::vector<std::string>{"msg7", "msg6", "msg5", "msg4"});
+
+    SECTION("a side that runs out gives its share to the other") {
+        CHECK(bodies(conversation->messages_around(5, at(9), await)) ==
+              std::vector<std::string>{"msg10", "msg9", "msg8", "msg7", "msg6"});
+        CHECK(bodies(conversation->messages_around(5, at(2), await)) ==
+              std::vector<std::string>{"msg5", "msg4", "msg3", "msg2", "msg1"});
+    }
+
+    SECTION("a limit past the history returns all of it") {
+        CHECK(conversation->messages_around(20, at(5), await).size() == 10);
+    }
+
+    SECTION("deleted messages are skipped, and the window is still full") {
+        REQUIRE(c->delete_message(all[10 - 4].id, await));
+        REQUIRE(c->delete_message(all[10 - 6].id, await));
+        CHECK(bodies(conversation->messages_around(5, at(5), await)) ==
+              std::vector<std::string>{"msg8", "msg7", "msg5", "msg3", "msg2"});
+        CHECK(conversation->messages_around(5, at(5), true, await).size() == 5);
+    }
+
+    SECTION("it carries on with before and messages_after") {
+        auto window = conversation->messages_around(3, at(5), await);
+        REQUIRE(bodies(window) == std::vector<std::string>{"msg6", "msg5", "msg4"});
+        CHECK(bodies(conversation->messages(2, window.back().cursor(), await)) ==
+              std::vector<std::string>{"msg3", "msg2"});
+        CHECK(bodies(conversation->messages_after(2, window.front().cursor(), await)) ==
+              std::vector<std::string>{"msg8", "msg7"});
+    }
+}
+
+TEST_CASE("Client: first_unread is the oldest of what unread counts", "[client][messages]") {
+    TempClient c;
+    SenderKeys sender;
+    auto convo = ConversationId::dm(sender.session_id);
+    for (int i = 1; i <= 10; i++)
+        deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
+    auto conversation = c->conversation(convo, await);
+    auto all = conversation->messages(10, await);
+
+    // Never read: every message is unread, so it starts at the first one.
+    CHECK(conversation->first_unread(await) == all.back().cursor());
+
+    conversation->mark_read(from_epoch_ms(6000), await);
+    REQUIRE(c->conversation(convo, await)->unread() == 4);
+    CHECK(conversation->first_unread(await) == all[3].cursor());
+    REQUIRE(all[3].body == "msg7");
+
+    conversation->mark_read(await);
+    CHECK_FALSE(conversation->first_unread(await).has_value());
+}
+
 TEST_CASE("Client: paging is stable across equal timestamps", "[client][messages]") {
     TempClient c;
     SenderKeys sender;

@@ -219,6 +219,51 @@ class Conversation {
     std::vector<Message> messages(
             int limit, std::optional<MessageCursor> before, bool include_deleted, await_t) const;
 
+    /// The next page *newer* than `after`, newest first: the counterpart of `before`, for paging
+    /// forwards from a window that did not start at the newest message -- one opened by
+    /// `messages_around`.  The message at the cursor is not repeated, and a short page means there
+    /// is nothing newer.  Deleted messages as for `messages`.
+    ///
+    /// @throws std::invalid_argument if `limit` is not positive.
+    void messages_after(
+            int limit, MessageCursor after, result_function<std::vector<Message>> cb) const;
+    void messages_after(
+            int limit,
+            MessageCursor after,
+            bool include_deleted,
+            result_function<std::vector<Message>> cb) const;
+    std::vector<Message> messages_after(int limit, MessageCursor after, await_t) const;
+    std::vector<Message> messages_after(
+            int limit, MessageCursor after, bool include_deleted, await_t) const;
+
+    /// A window of `limit` messages around `at`, newest first, with the message at `at` as near the
+    /// middle as the history allows: of the rest, half older and half newer, and a side that runs
+    /// out gives what it lacks to the other, so the page is full wherever there are enough messages
+    /// to fill it.  For opening a conversation somewhere other than its newest message -- at
+    /// `first_unread()`, say -- with room to scroll both ways before the next page is needed;
+    /// `before` the oldest and `messages_after` the newest of it carry on in each direction.
+    ///
+    /// The message at `at` is in the window unless it is deleted and `include_deleted` is not set;
+    /// either way the window is placed by it.
+    ///
+    /// @throws std::invalid_argument if `limit` is not positive.
+    void messages_around(
+            int limit, MessageCursor at, result_function<std::vector<Message>> cb) const;
+    void messages_around(
+            int limit,
+            MessageCursor at,
+            bool include_deleted,
+            result_function<std::vector<Message>> cb) const;
+    std::vector<Message> messages_around(int limit, MessageCursor at, await_t) const;
+    std::vector<Message> messages_around(
+            int limit, MessageCursor at, bool include_deleted, await_t) const;
+
+    /// Where the unread messages start: the cursor of the oldest message `unread` counts --
+    /// incoming, not deleted, and newer than the read watermark -- or nullopt with nothing unread.
+    /// Counted the same way as `unread`, so the two always agree on what is unread.
+    void first_unread(result_function<std::optional<MessageCursor>> cb) const;
+    std::optional<MessageCursor> first_unread(await_t) const;
+
     /// Removes every deleted message's leftover row from this conversation, and says how many went.
     ///
     /// A deletion leaves a row behind deliberately — see `Client::delete_message` — and this is
@@ -568,6 +613,9 @@ class AnyConversation {
     }
 
     SESSION_CONVO_FORWARD(messages)
+    SESSION_CONVO_FORWARD(messages_after)
+    SESSION_CONVO_FORWARD(messages_around)
+    SESSION_CONVO_FORWARD(first_unread)
     SESSION_CONVO_FORWARD(mark_read)
     SESSION_CONVO_FORWARD(set_marked_unread)
     SESSION_CONVO_FORWARD(set_priority)

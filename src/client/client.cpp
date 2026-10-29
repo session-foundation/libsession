@@ -4022,6 +4022,122 @@ std::vector<Message> Client::_messages(
             limit);
 }
 
+std::vector<Message> Client::_messages_after(
+        const ConversationId& id, int limit, MessageCursor after, bool include_deleted) {
+    auto c = core.database().conn();
+    auto convo = find_conversation(c, id);
+    if (!convo)
+        return {};
+    auto visible = include_deleted ? ""sv : "AND m.deleted IS NULL"sv;
+
+    // Ascending, so that `limit` takes the messages nearest the cursor rather than the newest in
+    // the conversation; turned round afterwards to the newest-first order every page comes in.
+    auto page = _query_messages(
+            c,
+            id,
+            ReplyDepth::with_target,
+            R"(
+        {} WHERE m.conversation = ?1 {}
+             AND (m.timestamp > ?2 OR (m.timestamp = ?2 AND m.id > ?3))
+           ORDER BY m.timestamp ASC, m.id ASC LIMIT ?4
+    )"_format(MESSAGE_COLUMNS, visible),
+            *convo,
+            epoch_ms(after.timestamp),
+            after.id,
+            limit);
+    std::ranges::reverse(page);
+    return page;
+}
+
+std::vector<Message> Client::_messages_around(
+        const ConversationId& id, int limit, MessageCursor at, bool include_deleted) {
+    auto c = core.database().conn();
+    auto convo = find_conversation(c, id);
+    if (!convo)
+        return {};
+    auto visible = include_deleted ? ""sv : "AND m.deleted IS NULL"sv;
+    auto ts = epoch_ms(at.timestamp);
+
+    // Keys first, up to `limit` each side, so that one which runs short can be made up from the
+    // other: the message at the cursor and newer, oldest first, and everything older, newest
+    // first.  These walk the history index in order and read two columns, which is what makes
+    // asking for a whole `limit` on each side cheap; building a message costs far more, and only
+    // the window is built.  The index has no `deleted`, so unless deleted messages are included
+    // each row is also looked up in the table to check it.
+    using Key = std::pair<int64_t, int64_t>;
+    auto keys = [&](std::string_view side, std::string_view order) {
+        std::vector<Key> out;
+        for (auto [t, i] : c.prepared_results<int64_t, int64_t>(
+                     R"(
+                SELECT m.timestamp, m.id FROM messages m
+                WHERE m.conversation = ?1 {} AND {}
+                ORDER BY m.timestamp {}, m.id {} LIMIT ?4
+            )"_format(visible, side, order, order),
+                     *convo,
+                     ts,
+                     at.id,
+                     limit))
+            out.emplace_back(t, i);
+        return out;
+    };
+    auto newer = keys("(m.timestamp > ?2 OR (m.timestamp = ?2 AND m.id >= ?3))", "ASC");
+    auto older = keys("(m.timestamp < ?2 OR (m.timestamp = ?2 AND m.id < ?3))", "DESC");
+
+    // Of the rest, half older and half newer; an even limit's spare row goes to the newer side,
+    // which is the one the cursor's own message is counted on.
+    size_t want_older = static_cast<size_t>(limit - 1) / 2;
+    size_t want_newer = static_cast<size_t>(limit) - want_older;
+    if (newer.size() < want_newer)
+        want_older = static_cast<size_t>(limit) - newer.size();
+    else if (older.size() < want_older)
+        want_newer = static_cast<size_t>(limit) - older.size();
+    want_older = std::min(want_older, older.size());
+    want_newer = std::min(want_newer, newer.size());
+    if (want_older + want_newer == 0)
+        return {};
+
+    // Then the window itself, in one range between its two ends, which also comes out newest
+    // first.  A range rather than a list of ids: an `IN` list is a different statement for every
+    // length, and each would be kept in the prepared-statement cache.
+    auto oldest = want_older > 0 ? older[want_older - 1] : newer.front();
+    auto newest = want_newer > 0 ? newer[want_newer - 1] : older.front();
+    return _query_messages(
+            c,
+            id,
+            ReplyDepth::with_target,
+            R"(
+        {} WHERE m.conversation = ?1 {}
+             AND (m.timestamp > ?2 OR (m.timestamp = ?2 AND m.id >= ?3))
+             AND (m.timestamp < ?4 OR (m.timestamp = ?4 AND m.id <= ?5))
+           ORDER BY m.timestamp DESC, m.id DESC
+    )"_format(MESSAGE_COLUMNS, visible),
+            *convo,
+            oldest.first,
+            oldest.second,
+            newest.first,
+            newest.second);
+}
+
+std::optional<MessageCursor> Client::_first_unread(const ConversationId& id) {
+    auto c = core.database().conn();
+    auto convo = find_conversation(c, id);
+    if (!convo)
+        return std::nullopt;
+    // The same predicate `unread_count` is kept by, so this is always the oldest of what it counts.
+    auto found = c.prepared_maybe_get<int64_t, int64_t>(
+            R"(
+        SELECT timestamp, id FROM messages
+        WHERE conversation = ?1 AND {}
+          AND timestamp > (SELECT last_read FROM conversations WHERE id = ?1)
+        ORDER BY timestamp ASC, id ASC LIMIT 1
+    )"_format(UNREAD),
+            *convo);
+    if (!found)
+        return std::nullopt;
+    auto [timestamp, message] = *found;
+    return MessageCursor{from_epoch_ms(timestamp), message};
+}
+
 void Client::_emit_attachment_availability(std::string_view url) {
     auto c = core.database().conn();
     _emit_messages_showing(c, _messages_showing(c, url));

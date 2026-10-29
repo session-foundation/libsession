@@ -1179,6 +1179,11 @@ class Client {
             int limit,
             std::optional<MessageCursor> before,
             bool include_deleted);
+    std::vector<Message> _messages_after(
+            const ConversationId& id, int limit, MessageCursor after, bool include_deleted);
+    std::vector<Message> _messages_around(
+            const ConversationId& id, int limit, MessageCursor at, bool include_deleted);
+    std::optional<MessageCursor> _first_unread(const ConversationId& id);
     std::optional<Message> _message(int64_t id);
     int64_t _send_message(const ConversationId& id, const OutgoingMessage& msg);
     int64_t _send_message(
