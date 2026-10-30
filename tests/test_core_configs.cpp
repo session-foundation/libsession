@@ -814,3 +814,66 @@ TEST_CASE("Configs: a push already in flight is not duplicated", "[core][configs
         CHECK(c.net->sent_requests.size() == 1);
     });
 }
+
+TEST_CASE("Configs: a pending push is reported as it starts and stops", "[core][configs][push]") {
+    // Written by handlers on the loop and read only from jobs on the loop, so it needs no lock.
+    std::vector<bool> reports;
+    TempCore c{core::callbacks{.config_push_changed = [&](bool p) { reports.push_back(p); }}};
+
+    // A new account owes its defaults from construction, and nothing is listening then: the state
+    // is there to read, and the reports that follow are changes from it.
+    TestHelper::on_loop(*c, [&] {
+        CHECK(c->configs.push_pending());
+        CHECK(reports.empty());
+    });
+
+    auto* net = attach_mock_network(*c);
+    net->current_node.remote_pubkey[0] = std::byte{0x01};
+    net->sent_requests.clear();
+
+    auto send_now = [&] {
+        TestHelper::backdate_push_state(c->configs, 1h, 1h);
+        TestHelper::push_if_due(c->configs);
+    };
+    auto answer = [&](bool ok) {
+        auto answered = answer_requests(*net, "sequence", [ok](MockNetwork::SentRequest& r) {
+            auto subs = parse_json(*r.request.body)["requests"];
+            auto results = nlohmann::json::array();
+            for (size_t i = 0; i < subs.size(); i++)
+                results.push_back({{"code", 200}, {"body", {{"hash", fmt::format("h{}", i)}}}});
+            r.callback(ok, false, ok ? 200 : 500, {}, nlohmann::json{{"results", results}}.dump());
+        });
+        REQUIRE(answered == 1);
+    };
+
+    TestHelper::on_loop(*c, [&] {
+        // Going from scheduled to sent is the same push, still pending.
+        send_now();
+        CHECK(c->configs.push_pending());
+        CHECK(reports.empty());
+    });
+    answer(true);
+    TestHelper::on_loop(*c, [&] {
+        CHECK_FALSE(c->configs.push_pending());
+        CHECK(reports == std::vector{false});
+    });
+
+    // A change schedules the next, which is a start.
+    TestHelper::on_loop(*c, [&] { c->configs.user_profile().set_name("Leia"); });
+    TestHelper::drain(*c);
+    TestHelper::on_loop(*c, [&] {
+        CHECK(c->configs.push_pending());
+        CHECK(reports == std::vector{false, true});
+        send_now();
+        CHECK(reports == std::vector{false, true});
+    });
+
+    // A failure stops it as surely as success: the change is still owed, but nothing will deliver
+    // it until something schedules another push.
+    answer(false);
+    TestHelper::on_loop(*c, [&] {
+        CHECK_FALSE(c->configs.push_pending());
+        CHECK(c->configs.needs_push());
+        CHECK(reports == std::vector{false, true, false});
+    });
+}

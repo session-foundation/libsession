@@ -81,6 +81,16 @@ class Configs : public detail::CoreComponent {
     bool _push_scheduled = false;
     bool _push_in_flight = false;
 
+    // What push_pending() was when last checked, so that `config_push_changed` fires on a change
+    // and only then.  Kept current during construction too, when nothing is fired, so that the
+    // first report after it is a change from what push_pending() said once construction was done.
+    bool _push_pending_reported = false;
+
+    // Fires `config_push_changed` if push_pending() no longer matches what it last said.  Called
+    // once an operation has finished moving the push state rather than at each assignment, so that
+    // a push going from scheduled to sent is not reported as stopping and starting again.
+    void _report_push_pending();
+
     // The network's callbacks outlive this component and are owned by the Network rather than by
     // Core's job queue, so cancelling the queue cannot reach them: they capture a weak reference
     // to this and do nothing if it has expired.  That is what stops a push completing into a
@@ -234,6 +244,22 @@ class Configs : public detail::CoreComponent {
     ///
     /// Does nothing if a push is already in flight; the one in flight re-checks when it completes.
     void push_now();
+
+    /// Whether a push is under way: one is scheduled to go out once the debounce allows, or its
+    /// request is on the wire and unanswered.  Changes are reported through
+    /// `callbacks::config_push_changed`.
+    ///
+    /// Narrower than needs_push(), on purpose.  That says something is owed and stays true for as
+    /// long as nothing can deliver it -- no network, pushing disabled, a push that failed --
+    /// whereas this says something is actually going to happen, which is what keeping a process
+    /// alive for it needs.  A failed push leaves this false until the next change schedules
+    /// another.
+    ///
+    /// A scheduled push with no network attached, or with pushing disabled, counts until its timer
+    /// fires and finds it cannot go, which is at most `push_max_delay`.
+    ///
+    /// Reads two flags and nothing else, so it is cheap and does not need an account.
+    bool push_pending() const { return _push_scheduled || _push_in_flight; }
 };
 
 }  // namespace session::core

@@ -477,6 +477,13 @@ class TestHelper {
         return c._cache_path(kind, url);
     }
 
+    /// The query Client answers "is anything being sent" with, so that a test can ask SQLite how
+    /// it would run it.
+    template <typename Client>
+    static std::string_view outbound_query() {
+        return Client::_OUTBOUND_QUERY;
+    }
+
     /// Drives the database-to-config direction directly, which is what makes the round-trip
     /// assertable: applying a config and then deriving one back has to be the identity, and only a
     /// test can ask for the second half in isolation.

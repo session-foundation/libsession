@@ -727,6 +727,23 @@ class Client {
     /// it takes effect.
     void set_high_freq_dispatch_interval(std::chrono::milliseconds interval);
 
+    /// API: client/Client::outbound_busy
+    ///
+    /// Whether this Client has outbound work in flight: a message still being sent, its copy for
+    /// our own swarm, its attachments still uploading, or a config push scheduled or unanswered.
+    /// See `callbacks::outbound_changed` for exactly what counts, which reports every change to
+    /// this.
+    ///
+    /// Callable from any thread at any moment, including a platform's main thread in the call that
+    /// tells it the app is going to the background: it reads one atomic, touches no database and
+    /// is not dispatched.  Kept up to date on Core's loop as the work starts and ends, so it is the
+    /// state as of the last change there -- which may be ahead of the last `outbound_changed` a
+    /// dispatcher has delivered, never behind it.
+    ///
+    /// False for a Client that has sent nothing, and false the moment construction returns unless
+    /// something is already under way by then.
+    bool outbound_busy() const;
+
     // -- Change notification ------------------------------------------------------------------
     //
     // Handlers are given at construction; there is no way to add or remove one afterwards.  See
@@ -752,6 +769,24 @@ class Client {
 
     // As above, and for the same reason.
     std::chrono::milliseconds _high_freq_dispatch_interval{100};
+
+    // What `outbound_busy()` returns and `outbound_changed` last reported.  Written only on the
+    // loop, by `_update_outbound`, which is also the only thing that compares against it; atomic
+    // so that any thread can read it.
+    std::atomic<bool> _outbound_busy{false};
+
+    // Recomputes whether there is outbound work in flight and reports it if that changed.  Called
+    // wherever a send state is written or a config push starts or stops; cheap enough for that,
+    // being two indexed lookups and two flags.  On the loop.
+    void _update_outbound();
+
+    // The send states that are still going somewhere, as `_update_outbound` asks the database for
+    // them: pending, sending, uploading.  Bound rather than inlined, and written so that both
+    // columns' partial indexes answer it -- `x IN (...)` implies the indexes' `x IS NOT NULL`.
+    static constexpr std::string_view _OUTBOUND_QUERY = R"(
+        SELECT EXISTS(SELECT 1 FROM messages WHERE send_state IN (?1, ?2, ?3))
+            OR EXISTS(SELECT 1 FROM messages WHERE sync_send_state IN (?1, ?2, ?3))
+    )";
 
     // Core's send ids are per-process (its counter restarts at 1 on every run), so this mapping
     // must not be persisted or a stale row would capture a later run's status updates.
@@ -1435,6 +1470,11 @@ class Client {
             std::span<const std::byte, 33> sender,
             const SessionProtos::DataExtractionNotification& note,
             sys_ms when);
+
+    // Reports a message send_message has just stored, and what storing it did to the
+    // conversation: whether that created it, and whether it approved the recipient.  Shared by the
+    // plain and attachment-carrying sends, which differ only in what follows.
+    void _announce_send(const ConversationId& id, int64_t client_id, bool created, bool approved);
 
     // Hands a stored message to Core: the recipient's copy and, unless it is a note to self, the
     // copy for our own swarm.  Shared by the plain and attachment-carrying sends.
