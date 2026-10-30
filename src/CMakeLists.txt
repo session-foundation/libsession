@@ -252,6 +252,24 @@ endif()
 # depends on the network target (defined after core above).
 target_link_libraries(core PUBLIC network)
 
+# Push notification handling, on top of client.  Optional because only mobile clients receive
+# pushes.
+if(ENABLE_PUSH)
+    add_libsession_util_library(push
+        push/notifications.cpp
+        push/decision.cpp
+        push/payload.cpp
+        push/subscription.cpp
+    )
+    target_link_libraries(
+        push
+        PUBLIC
+        client
+        PRIVATE
+        nlohmann_json::nlohmann_json
+    )
+endif()
+
 if(WARNINGS_AS_ERRORS AND NOT USE_LTO AND CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION MATCHES "^11\\.")
     # GCC 11 has an overzealous (and false) stringop-overread warning, but only when LTO is off.
     # Um, yeah.

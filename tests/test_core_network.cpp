@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <session/core.hpp>
+#include <session/network/network_config.hpp>
 #include <session/network/session_network.hpp>
 
 #include "utils.hpp"
@@ -27,4 +28,19 @@ TEST_CASE("Core can hold an optional Network interface", "[core][network]") {
 
     if (std::filesystem::exists(db_path))
         std::filesystem::remove(db_path);
+}
+
+TEST_CASE("Network: a one-shot config implies the onion one-shot settings", "[network]") {
+    // Whichever order the options come in: the onion router reads only its own two flags.
+    network::config::Config before{network::opt::one_shot{}, network::opt::path_length{2}};
+    network::config::Config after{network::opt::path_length{2}, network::opt::one_shot{}};
+    for (auto* cfg : {&before, &after}) {
+        CHECK(cfg->one_shot);
+        CHECK(cfg->onionreq_single_path_mode);
+        CHECK(cfg->onionreq_disable_pre_build_paths);
+    }
+
+    network::config::Config ordinary{network::opt::path_length{2}};
+    CHECK_FALSE(ordinary.one_shot);
+    CHECK_FALSE(ordinary.onionreq_single_path_mode);
 }

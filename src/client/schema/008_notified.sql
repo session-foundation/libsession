@@ -1,0 +1,5 @@
+CREATE TABLE notified (
+    message INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    at INTEGER NOT NULL,
+    removed INTEGER
+) STRICT;

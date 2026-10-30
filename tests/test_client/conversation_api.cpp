@@ -259,3 +259,44 @@ TEST_CASE("Client: auto-download is per conversation and stays here", "[client][
     c.reopen();
     CHECK(c->conversation(id, await)->auto_download() == AutoDownload::all);
 }
+
+TEST_CASE("Client: the badge counts what the user should be told about", "[client][badge]") {
+    TempClient c;
+    CHECK(c->badge_count(await) == 0);
+
+    SenderKeys friend_, stranger, muted, silenced, blocked;
+    for (auto* k : {&friend_, &muted, &silenced, &blocked})
+        approve(*c, k->session_id);
+
+    int64_t ts = 1'700'000'000'000;
+    auto send = [&](SenderKeys& from, int n, std::string_view tag) {
+        for (int i = 0; i < n; i++, ts++)
+            deliver(*c, from, "msg", from_epoch_ms(ts), "{}-{}"_format(tag, i));
+    };
+    send(friend_, 3, "friend");
+    send(stranger, 4, "stranger");
+    send(muted, 2, "muted");
+    send(silenced, 2, "silenced");
+    send(blocked, 2, "blocked");
+
+    c->conversation(ConversationId::dm(muted.session_id), await)
+            ->set_mute_until(std::chrono::floor<std::chrono::seconds>(clock_now() + 1h), await);
+    c->conversation(ConversationId::dm(silenced.session_id), await)
+            ->set_notifications(config::notify_mode::disabled, await);
+    c->set_blocked(ConversationId::dm(blocked.session_id), true, await);
+
+    // The friend's three, and the stranger's request once however many it holds.
+    CHECK(c->badge_count(await) == 3 + 1);
+
+    // Mentions-only is a group setting: on a one-to-one conversation it still counts everything.
+    c->conversation(ConversationId::dm(friend_.session_id), await)
+            ->set_notifications(config::notify_mode::mentions_only, await);
+    CHECK(c->badge_count(await) == 3 + 1);
+
+    // Reading empties it; a mute that has passed counts again.
+    c->conversation(ConversationId::dm(friend_.session_id), await)->mark_read(await);
+    CHECK(c->badge_count(await) == 1);
+    c->conversation(ConversationId::dm(muted.session_id), await)
+            ->set_mute_until(std::chrono::floor<std::chrono::seconds>(clock_now() - 1h), await);
+    CHECK(c->badge_count(await) == 1 + 2);
+}

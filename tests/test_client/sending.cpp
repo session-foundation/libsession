@@ -99,6 +99,32 @@ TEST_CASE("Client: an in-flight send becomes interrupted after a restart", "[cli
     CHECK(c->message(id, await)->body == "did this land?");
 }
 
+TEST_CASE(
+        "Client: a one-shot Client leaves the application's in-flight sends alone",
+        "[client][send]") {
+    // The application, with a send whose store has not been answered: mid-flight, as it is when
+    // the application is suspended and its notification extension starts up.
+    TempClient app;
+    auto* net = attach_mock_network(app->core);
+
+    constexpr auto peer =
+            "05fe94b7ad4b7f1cc1bb92671f1f0d243f226e115b33770465e82b503fc3e96e1f"_hex_b;
+    TestHelper::seed_pfs_nak(app->core, peer);
+    TestHelper::seed_pfs_nak(app->core, own_sid(*app));
+    auto id = app->send_message(ConversationId::dm(peer), {.body = "on its way"}, await);
+    REQUIRE(app->message(id, await)->send_state == SendState::sending);
+
+    // The extension opens the same database while the application is still alive.
+    {
+        Client extension{app.path, core::one_shot{}};
+    }
+    CHECK(app->message(id, await)->send_state == SendState::sending);
+
+    // The send then completes as normal.
+    CHECK(accept_stores(*net) == 2);
+    CHECK(app->message(id, await)->send_state == SendState::sent);
+}
+
 // ── Signals ─────────────────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("Client: the application is told what changed", "[client][signals]") {

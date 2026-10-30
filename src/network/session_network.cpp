@@ -127,7 +127,8 @@ namespace {
         return {file_server_config,
                 main_config.netid,
                 *main_config.cache_directory,
-                main_config.path_length};
+                main_config.path_length,
+                main_config.one_shot};
     }
 
     config::OnionRequestRouter build_onion_request_router_config(
@@ -303,8 +304,10 @@ Network::Network(config::Config _conf) :
             cb(node);
     };
 
-    // Perform a clock resync
-    _jq->call_soon([this] { _resync_clock(std::nullopt, nullptr); });
+    // A one-shot network skips this: a storage server that finds our clock out answers 425, which
+    // resyncs and retries, so resyncing up front only puts round trips ahead of its few requests.
+    if (!config.one_shot)
+        _jq->call_soon([this] { _resync_clock(std::nullopt, nullptr); });
 }
 
 Network::~Network() {

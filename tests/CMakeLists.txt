@@ -77,6 +77,10 @@ list(APPEND LIB_SESSION_UTESTS_SOURCES
     test_pfs_key_cache.cpp
     test_sqlite_bind.cpp)
 
+if(ENABLE_PUSH)
+    list(APPEND LIB_SESSION_UTESTS_SOURCES test_push.cpp)
+endif()
+
 add_library(test_libs INTERFACE)
 
 target_link_libraries(test_libs INTERFACE
@@ -92,6 +96,9 @@ target_link_libraries(test_libs INTERFACE
     oxen::logging)
 
 target_link_libraries(test_libs INTERFACE libsession::network)
+if(ENABLE_PUSH)
+    target_link_libraries(test_libs INTERFACE libsession::push)
+endif()
 
 add_executable(testAll main.cpp ${LIB_SESSION_UTESTS_SOURCES})
 target_include_directories(testAll PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -142,6 +149,9 @@ if(BUILD_LIVE_TESTS)
     target_link_libraries(testLive PRIVATE
         test_libs
         Catch2::Catch2)
+    if(ENABLE_PUSH)
+        target_sources(testLive PRIVATE live/test_push_fetch.cpp)
+    endif()
 endif()
 
 if(BUILD_LIVE_TESTS)

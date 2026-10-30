@@ -406,6 +406,12 @@ void Client::_init() {
     _disk_loop = core.disk_loop();
     _disk_jq.emplace(*_disk_loop);
 
+    // Both of what follows is recovery for an application starting up, and a one-shot Core is not
+    // that: it shares the database with an application that may only be suspended, whose sends are
+    // still its own and live.  Marking them interrupted here would overwrite them.
+    if (core.one_shot())
+        return;
+
     // Core's send queue is in-memory, so anything still mid-flight when the last run ended is not
     // resumed and its outcome is unknowable.  Say so rather than guessing either way.
     auto c = core.database().conn();
@@ -1777,6 +1783,14 @@ std::optional<Message> Client::message(int64_t id, await_t) {
     return call_get([this, id] { return _message(id); });
 }
 
+int64_t Client::badge_count(await_t) {
+    return call_get([this] { return _badge_count(); });
+}
+
+std::optional<Message> Client::message_by_hash(std::string hash, await_t) {
+    return call_get([this, hash = std::move(hash)] { return _message_by_hash(hash); });
+}
+
 int64_t Client::send_message(const ConversationId& id, OutgoingMessage msg, await_t) {
     return send_message(id, std::move(msg), nullptr, await);
 }
@@ -1830,6 +1844,14 @@ DM Client::open_dm(const ConversationId& id, await_t) {
 
 void Client::message(int64_t id, result_function<std::optional<Message>> cb) {
     _async([this, id] { return _message(id); }, std::move(cb));
+}
+
+void Client::badge_count(result_function<int64_t> cb) {
+    _async([this] { return _badge_count(); }, std::move(cb));
+}
+
+void Client::message_by_hash(std::string hash, result_function<std::optional<Message>> cb) {
+    _async([this, hash = std::move(hash)] { return _message_by_hash(hash); }, std::move(cb));
 }
 
 uint64_t Client::save_attachment(
@@ -4193,6 +4215,48 @@ std::optional<Message> Client::_message(int64_t id) {
     if (found.empty())
         return std::nullopt;
     return std::move(found.front());
+}
+
+int64_t Client::_badge_count() {
+    // A request is a one-to-one conversation with someone not approved, other than ourselves; it
+    // counts once however many messages it holds, so a stranger cannot inflate the badge.
+    // Mentions-only is a group setting and reads as "all" on a one-to-one conversation.
+    //
+    // TODO: once Client holds groups, a group invitation not yet accepted counts once, as a request
+    // does; and a mentions-only group counts its unread mentions, once Client records which
+    // messages mention us -- until then such a group counts nothing (the clause below).
+    std::vector<std::byte> me;
+    if (core.globals.have_account())
+        me = to_vector(core.globals.session_id());
+    auto now_s = std::chrono::duration_cast<std::chrono::seconds>(clock_now_ms().time_since_epoch())
+                         .count();
+    return core.database().conn().prepared_get<int64_t>(
+            R"(
+SELECT COALESCE(SUM(CASE WHEN request THEN 1 ELSE unread_count END), 0)
+  FROM (SELECT c.unread_count,
+               c.dm IS NOT NULL AND a.session_id IS NOT ?1 AND NOT COALESCE(ct.approved, 0)
+                   AS request
+          FROM conversations c
+          LEFT JOIN accounts a ON a.id = c.dm
+          LEFT JOIN contacts ct ON ct.account = c.dm
+         WHERE c.unread_count > 0
+           AND c.mute_until <= ?2
+           AND c.notifications != ?3
+           AND NOT (c.dm IS NULL AND c.notifications = ?4)
+           AND NOT COALESCE(ct.blocked, 0))
+)",
+            me,
+            now_s,
+            static_cast<int>(config::notify_mode::disabled),
+            static_cast<int>(config::notify_mode::mentions_only));
+}
+
+std::optional<Message> Client::_message_by_hash(std::string_view hash) {
+    auto id = core.database().conn().prepared_maybe_get<int64_t>(
+            "SELECT id FROM messages WHERE swarm_hash = ?", hash);
+    if (!id)
+        return std::nullopt;
+    return _message(*id);
 }
 
 std::optional<std::string> Client::_message_debug(int64_t message_id) {
