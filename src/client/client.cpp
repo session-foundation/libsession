@@ -661,10 +661,9 @@ void Client::_flush_pending() {
     // keeps its lists arranged without ever sorting -- which it could not do correctly anyway,
     // since the two lists are not sorted the same way.
     //
-    // Deliberately after that loop rather than before it, which is the guarantee
-    // `conversation_order_updated` documents: the ids reported here always name conversations the
-    // subscriber has already been told about, so an id it does not recognise means it missed a
-    // notification rather than that the two are racing.
+    // Deliberately after that loop rather than before it: a replaced list only ever carries
+    // conversations the subscriber has already been told about, so one it does not recognise means
+    // it missed a notification rather than that the two are racing.
     //
     // Once for the batch, not once per row: a poll delivering fifty messages to one conversation
     // reaches here a single time, which is the same reason `_dirty` exists.
