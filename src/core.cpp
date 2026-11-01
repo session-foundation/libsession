@@ -8,6 +8,7 @@
 #include <oxenc/bt_serialize.h>
 #include <oxenc/hex.h>
 #include <sodium/core.h>
+#include <sqlite3.h>
 
 #include <cassert>
 #include <nlohmann/json.hpp>
@@ -574,6 +575,9 @@ void Core::_swarm_attempt(std::shared_ptr<SwarmOp> op) {
     // storage is suspended that waits for the resume only on Core's own threads, and is refused
     // anywhere else.  So then it goes onto our queue instead, as it does when a suspend begins
     // between the check and the body: nothing has been sent or spent by then, so it starts again.
+    // A suspend with `interrupt` that begins while the body is being built stops it with
+    // SQLITE_INTERRUPT instead -- a statement it interrupted, or a begin_immediate() it stopped
+    // waiting for the write lock -- and that starts again in the same way.
     net->get_swarm(
             swarm_pubkey,
             false,
@@ -583,6 +587,9 @@ void Core::_swarm_attempt(std::shared_ptr<SwarmOp> op) {
                     try {
                         return _swarm_chosen(op, swarm);
                     } catch (const sqlite::database_suspended&) {
+                    } catch (const SQLite::Exception& e) {
+                        if (!_storage_suspended || (e.getErrorCode() & 0xff) != SQLITE_INTERRUPT)
+                            throw;
                     }
                 }
                 call([this, op = std::move(op), swarm = std::move(swarm)]() mutable {
