@@ -290,7 +290,8 @@ void Configs::store_dumps() {
 
     // One write transaction across every comparison and write in _store, which would be worth
     // nothing if another process could write in between.  A caller's open transaction is joined:
-    // begin_immediate() refuses to nest on one thread.
+    // begin_immediate() refuses to nest on one thread.  That caller's must be a begin_immediate()
+    // one too, since a deferred begin() would write here without queueing for the write lock.
     auto c = conn();
     auto store = [&] {
         for (auto* conf : confs)
