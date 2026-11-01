@@ -150,6 +150,22 @@ class OnionRequestRouter : public IRouter, public std::enable_shared_from_this<O
     oxen::quic::JobQueue _jq{_loop};
 
   public:
+    /// Builds a router and starts its setup.
+    ///
+    /// Setup cannot start in the constructor.  It hands the snode pool a callback guarded by
+    /// `weak_from_this()`, which is empty until a shared_ptr owns the router, and
+    /// `Loop::make_shared` wraps the router only after the constructor returns.  Setup started
+    /// there runs on the loop thread and can capture the guard first; the callback then has
+    /// nothing to lock, `_finish_setup` never runs, and every request waits until it times out.
+    static std::shared_ptr<OnionRequestRouter> make(
+            config::OnionRequestRouter config,
+            oxen::quic::Loop& loop,
+            oxen::quic::Loop& disk_loop,
+            std::weak_ptr<SnodePool> snode_pool,
+            std::weak_ptr<ITransport> transport);
+
+    /// Public only for `Loop::make_shared`: use `make()`.  A router constructed directly never sets
+    /// up, which the unit tests rely on when they hand it paths themselves.
     OnionRequestRouter(
             config::OnionRequestRouter config,
             oxen::quic::Loop& loop,
@@ -181,6 +197,8 @@ class OnionRequestRouter : public IRouter, public std::enable_shared_from_this<O
             const std::filesystem::path& file_path, std::span<const cached_edge_node> edge_nodes);
 
     // All of the below functions should only be called from within `_loop`
+    // Starts setup; `make()` calls it once a shared_ptr owns this.
+    void _start_setup();
     void _finish_setup();
     void _pre_build_paths_if_needed();
     void _close_connections();

@@ -28,6 +28,12 @@ struct ScopedClockOffset {
         session::AdjustedClock::set_offset(new_offset);
     }
     ~ScopedClockOffset() { session::AdjustedClock::set_offset(_saved); }
+
+    // Moves the clock a further `by` forward, as if that much time had passed.
+    void advance(session::AdjustedClock::duration by) {
+        session::AdjustedClock::set_offset(session::AdjustedClock::get_offset() + by);
+    }
+
     ScopedClockOffset(const ScopedClockOffset&) = delete;
     ScopedClockOffset& operator=(const ScopedClockOffset&) = delete;
 

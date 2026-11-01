@@ -50,15 +50,8 @@ if [ $SHOULD_ACHIVE = true ]; then
     UNIQUE_NAME="${1:-libsession-util-ios-TAG}"
 
     if [[ "$UNIQUE_NAME" =~ TAG ]]; then
-        if [ -n "$DRONE_TAG" ]; then
-            tag="$DRONE_TAG"
-        elif [ -n "$DRONE_COMMIT" ]; then
-            tag="$(date --date=@$DRONE_BUILD_CREATED +%Y%m%dT%H%M%SZ)-${DRONE_COMMIT:0:9}"
-        else
-            tag="$(date +%Y%m%dT%H%M%SZ)-$(git rev-parse --short=9 HEAD)"
-        fi
-
-        UNIQUE_NAME="${UNIQUE_NAME/TAG/$tag}"
+        . "$(dirname "$0")/archive-name.sh"
+        UNIQUE_NAME="$(archive_name "$UNIQUE_NAME")"
     fi
 
     OUTPUT_DIR="${OUTPUT_DIR}/${UNIQUE_NAME}"
@@ -147,7 +140,7 @@ if [ "${SHOULD_BUILD_STATIC_LIBS}" == "SHOULD_BUILD_STATIC_LIBS" ]; then
             -DSROUTER_DAEMON=OFF \
             -DSUBMODULE_CHECK=$submodule_check \
             -DCMAKE_BUILD_TYPE=$build_type \
-            -DLOCAL_MIRROR=https://oxen.rocks/deps
+            -DLOCAL_MIRROR=https://builds.session.codes/deps
     done
 fi
 

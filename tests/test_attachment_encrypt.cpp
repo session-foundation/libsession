@@ -185,9 +185,14 @@ TEST_CASE("Attachment Decryptor", "[attachments][decryptor]") {
     auto [enc, key] = attachment::encrypt(seed, data, attachment::Domain::ATTACHMENT);
 
     std::vector<std::byte> decrypted;
-    attachment::Decryptor d{key, [&decrypted](std::span<const std::byte> data) {
+    std::vector<std::optional<size_t>> padding_seen;
+    attachment::Decryptor* self = nullptr;
+    attachment::Decryptor d{key, [&](std::span<const std::byte> data) {
+                                padding_seen.push_back(self->padding());
                                 decrypted.insert(decrypted.end(), data.begin(), data.end());
                             }};
+    self = &d;
+    CHECK_FALSE(d.padding());
 
     std::span input{enc};
     while (!input.empty()) {
@@ -198,6 +203,84 @@ TEST_CASE("Attachment Decryptor", "[attachments][decryptor]") {
 
     REQUIRE(d.finalize());
     CHECK(!!(decrypted == data));
+
+    // The padding is known by the time the first byte of data comes out -- which is what lets a
+    // copy with the same padding be started before the data's length is known -- and it is the
+    // padding the encryption chose.
+    REQUIRE(d.padding());
+    for (const auto& p : padding_seen)
+        CHECK(p == d.padding());
+    CHECK(*d.padding() == attachment::encrypted_padding(DATA_SIZE));
+}
+
+TEST_CASE("Attachment PushEncryptor", "[attachments][encryptor]") {
+    auto DATA_SIZE = GENERATE(0, 1, 100, 32767, 32768, 32769, 65536, 200'000, 6543210);
+    auto FEED_SIZE = GENERATE(1, 41, 32768, 10000000);
+
+    const auto data = make_data(DATA_SIZE);
+    cleared_b32 key;
+    session::random::fill(key);
+
+    // Re-encrypting with the padding a download carried reproduces it exactly: the same layout as
+    // the Encryptor's, down to the byte count.  The padding is what an honest sender's Encryptor
+    // chose, since that is what a cached copy of their file starts from.
+    auto padding = attachment::encrypted_padding(DATA_SIZE);
+    std::vector<std::byte> enc;
+    attachment::PushEncryptor e{key, padding, [&](std::span<const std::byte> out) {
+                                    enc.insert(enc.end(), out.begin(), out.end());
+                                }};
+    for (std::span input{data}; !input.empty();) {
+        auto sz = std::min<size_t>(FEED_SIZE, input.size());
+        e.update(input.first(sz));
+        input = input.subspan(sz);
+    }
+    e.finalize();
+    CHECK(enc.size() == attachment::encrypted_size(DATA_SIZE));
+
+    // ...and reads back, through both the whole-buffer and the streaming decryption, with the
+    // padding it was given.
+    CHECK(!!(attachment::decrypt(enc, key) == data));
+
+    std::vector<std::byte> decrypted;
+    attachment::Decryptor d{key, [&](std::span<const std::byte> out) {
+                                decrypted.insert(decrypted.end(), out.begin(), out.end());
+                            }};
+    REQUIRE(d.update(enc));
+    REQUIRE(d.finalize());
+    CHECK(!!(decrypted == data));
+    CHECK(d.padding() == padding);
+
+    CHECK_THROWS_AS(e.update(data), std::logic_error);
+    CHECK_THROWS_AS(e.finalize(), std::logic_error);
+}
+
+TEST_CASE(
+        "Attachment PushEncryptor keeps whatever padding it is given", "[attachments][encryptor]") {
+    // Not only the padding the Encryptor would choose: a sender's file may carry any amount,
+    // including more than a chunk of it, or none but the marker.
+    auto PADDING = GENERATE(1, 2, 32768, 32769, 100'000);
+    const auto data = make_data(5000);
+    cleared_b32 key;
+    session::random::fill(key);
+
+    std::vector<std::byte> enc;
+    attachment::PushEncryptor e{key, static_cast<size_t>(PADDING), [&](auto out) {
+                                    enc.insert(enc.end(), out.begin(), out.end());
+                                }};
+    e.update(data);
+    e.finalize();
+
+    std::vector<std::byte> decrypted;
+    attachment::Decryptor d{key, [&](std::span<const std::byte> out) {
+                                decrypted.insert(decrypted.end(), out.begin(), out.end());
+                            }};
+    REQUIRE(d.update(enc));
+    REQUIRE(d.finalize());
+    CHECK(!!(decrypted == data));
+    CHECK(d.padding() == static_cast<size_t>(PADDING));
+
+    // The marker is part of the padding, so there is no such thing as none.
+    CHECK_THROWS_AS(attachment::PushEncryptor(key, 0, [](auto) {}), std::invalid_argument);
 }
 
 struct temp_data_file {

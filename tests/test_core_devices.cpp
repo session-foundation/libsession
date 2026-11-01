@@ -499,6 +499,53 @@ TEST_CASE("Devices - build_account_pubkey_message", "[core][devices]") {
     }
 }
 
+TEST_CASE("Devices - a link request id is never handed out twice", "[core][devices]") {
+    std::vector<int> reqids;
+    core::callbacks cbs;
+    cbs.device_link_request =
+            [&](int reqid, device::Info&&, std::span<const std::string_view, 21>) {
+                reqids.push_back(reqid);
+            };
+    TempCore c{cbs};
+
+    cleared_b32 seed;
+    {
+        auto access = c->globals.account_seed();
+        std::ranges::copy(std::as_bytes(access.seed()), seed.begin());
+    }
+
+    auto deliver = [&](std::span<const SwarmMessage> msgs) {
+        TestHelper::on_loop(*c, [&] {
+            c->receive_messages(msgs, config::Namespace::Devices, true);
+            return 0;
+        });
+    };
+    auto request_from_new_device = [&](std::string hash) {
+        TempCore linker{core::predefined_seed{std::span<const std::byte, 32>{seed}}};
+        auto msg = linker->devices.build_link_request(await).message;
+        SwarmMessage sm{msg, std::move(hash), clock_now_ms(), clock_now_ms() + 1h};
+        deliver({&sm, 1});
+    };
+
+    ScopedClockOffset clock{0s};
+    request_from_new_device("h1");
+    REQUIRE(reqids.size() == 1);
+
+    // Aged out, which takes away the row holding the highest id: the one row whose id an insert
+    // would otherwise take next.  Any batch prunes; an empty one keeps this from being the batch
+    // that brings the next request.
+    clock.advance(Devices::LINK_REQUEST_MAX_AGE + 1s);
+    deliver({});
+    REQUIRE(TestHelper::on_loop(*c, [&] {
+                return c->database().conn().prepared_get<int64_t>(
+                        "SELECT count(*) FROM device_link_requests");
+            }) == 0);
+
+    request_from_new_device("h2");
+    REQUIRE(reqids.size() == 2);
+    CHECK(reqids[1] > reqids[0]);
+}
+
 TEST_CASE("Devices - establishing the group", "[core][devices]") {
 
     SECTION("a generated account establishes a group with itself") {

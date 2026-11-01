@@ -99,7 +99,8 @@ struct callbacks {
     ///
     /// Parameters:
     /// - reqid -- a unique identifier for this request that persists across Core restarts and can
-    ///   be used to correlate this request with a subsequent device_added callback.
+    ///   be used to correlate this request with a subsequent device_added callback.  Never reused,
+    ///   even once the request is accepted or expires, so a later request always has a new one.
     /// - new_device -- the new device metadata included in the link request.
     /// - sas -- a span of 21 string_views representing the short authentication string for this
     ///   request.  The first 7 are the standard display; all 21 are available for the extended

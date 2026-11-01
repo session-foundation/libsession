@@ -142,7 +142,10 @@ struct ProRevocationItem;
 
 namespace session::network {
 class Network;
+namespace config {
+    struct Config;
 }
+}  // namespace session::network
 
 namespace session {
 class TestHelper;
@@ -302,6 +305,9 @@ class Core {
     // Declared first, so it is constructed first and destroyed last: it must outlive every
     // component that uses it, and `_jq` below.
     quic::Loop _loop;
+
+    // See `disk_loop()`.  Before `_network`, which is handed it and so must not outlive it.
+    std::shared_ptr<quic::Loop> _disk_loop = std::make_shared<quic::Loop>();
 
     // Singly owned: a Network must not be kept alive by anything else, least of all by a callback
     // it hands out, so that its destructor never runs on its own loop thread.
@@ -635,29 +641,33 @@ class Core {
     /// swarm work quiesced before the old Network is dropped.
     void set_network(std::unique_ptr<network::Network> network);
 
-    /// Constructs the network in place and attaches it, forwarding the arguments to its
-    /// constructor.  Returns a reference to it, valid until it is replaced or this Core is
-    /// destroyed.
+    /// Constructs a Network from `args` and attaches it, returning a reference to it that is valid
+    /// for as long as this Core is.  The usual way to attach one:
     ///
-    ///     core.make_network(session::network::config::Config{});
+    ///     core.make_network(net::opt::netid{...}, net::opt::router::session_router());
     ///
-    /// The usual way to call `set_network`: the object exists only to be owned here, so building it
-    /// and handing it over in one step spares the caller a `make_unique` — and spares it the chance
-    /// to keep a copy of what it has just given away, which the ownership rule above forbids.
-    ///
-    /// `N` names a subclass when there is one, which in practice means a test double:
-    ///
-    ///     auto& net = core.make_network<MockNetwork>();
-    ///
-    /// This is a template, so `N` has to be complete where it is called — which it is, since the
-    /// caller is naming its constructor. `session::network::Network` is only forward declared here.
-    template <std::derived_from<network::Network> N = network::Network, typename... Args>
-    N& make_network(Args&&... args) {
-        auto net = std::make_unique<N>(std::forward<Args>(args)...);
-        auto& ref = *net;
-        set_network(std::move(net));
-        return ref;
+    /// Takes what `network::Network`'s constructor takes -- its options, or a `Config` -- and adds
+    /// this Core's disk loop, so that the Network's file work and this Core's run on one thread.  A
+    /// Network built some other way and handed to `set_network` keeps a disk loop of its own.
+    network::Network& make_network(network::config::Config config);
+
+    // `C` rather than `Config` by name: this header only declares it, and naming it here would need
+    // it complete where the template is defined rather than where it is used.
+    template <typename... Args, typename C = network::config::Config>
+    network::Network& make_network(Args&&... args) {
+        return make_network(C{std::forward<Args>(args)...});
     }
+
+    /// The loop for blocking file I/O, so that none of it runs on this Core's loop or on the
+    /// network's, where it would hold up everything else waiting on them.  Shared by everything
+    /// built on this Core, and by the Network `make_network` attaches: one thread for all of this
+    /// account's work on disk.
+    ///
+    /// Shared, so that a user can keep it alive for as long as it needs to.  One that must not have
+    /// its jobs outlive itself puts them on a `quic::JobQueue` of its own over this loop, stops
+    /// that queue as it is torn down, and holds the loop at least as long as the queue: a queue has
+    /// to go before its loop does.
+    const std::shared_ptr<quic::Loop>& disk_loop() { return _disk_loop; }
 
     /// How long a cached PFS key is considered fresh (no re-fetch needed).
     static constexpr auto PFS_KEY_FRESH_DURATION = 24h;

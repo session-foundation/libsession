@@ -48,7 +48,7 @@ endif()
 # provides oxen::quic transitively; otherwise pull in oxen-libquic on its own.
 if(NOT TARGET oxen::quic)
     set(LIBQUIC_BUILD_TESTS OFF CACHE BOOL "")
-    sessiondep_or_submodule(liboxenquic 1.8.0 session-router/external/oxen-libquic oxen::quic)
+    sessiondep_or_submodule(liboxenquic 1.12.0 session-router/external/oxen-libquic oxen::quic)
 endif()
 
 if(NOT TARGET oxen::logging)

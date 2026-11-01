@@ -43,24 +43,12 @@ static std::string srouter_address(std::span<const std::byte, 32> remote_pubkey)
     return "{:a}.snode"_format(remote_pubkey);
 }
 
-// The inner QUIC connection's UDP payload size, fixed rather than derived from the tunnel's
-// suggestion.
-//
-// The suggestion cannot be made to mean what it needs to.  It is computed from the outer
-// *endpoint's* configured max_udp_payload, which is a policy knob and not a measurement -- it is
-// unset in the default configuration, so the calculation does not even run there.  The two values
-// that are real are no better suited: a connection's max_datagram_size is deliberately the size
-// reachable *by splitting a packet in two*, so sizing the inner from it guarantees every inner
-// packet splits, and the per-piece size that would actually avoid splitting belongs to a connection
-// this layer does not hold.  Nor would knowing it once be enough: it moves when the first hop
-// changes, and nothing here would hear about that.
-//
-// So the inner is pinned to the one size QUIC guarantees every path carries.  libquic splits
-// datagrams that do not fit, so a larger value would buy throughput when the outer path is roomy
-// and cost a split packet per datagram when it is not -- and we cannot tell which we have.  The
-// outer connection still discovers its own path MTU; that is where the gain is, and an application
-// that needs to pin it (iOS, where discovery has misbehaved) still can, through
-// opt::quic_max_udp_payload.
+// The inner QUIC connection's UDP payload size: the minimum QUIC guarantees every path carries.
+// Session Router sends each of its packets in a datagram on its link to the first hop, adding 172
+// bytes of framing, so an inner packet goes in one piece as long as that link's path carries 1372
+// bytes of UDP payload, which a typical 1500-byte MTU path does with room to spare.  A larger inner
+// size would have its packets split in two whenever the link's path carries less than it plus that
+// framing, which we can't tell from here; a smaller one would only waste space.
 static constexpr size_t TUNNELED_QUIC_MAX_UDP_PAYLOAD = 1200;
 
 namespace {
@@ -266,7 +254,11 @@ std::optional<PathInfo> SessionRouter::get_path_to(const service_node& node) {
         try {
             info.hops.push_back({*pubkey, oxen::quic::ipv4{ip}});
         } catch (const std::exception& e) {
-            log::warning(cat, "Omitting path hop {} with an unparseable ip {}", address, ip);
+            log::warning(
+                    cat,
+                    "Omitting path hop {} with an unparseable ip {}",
+                    pubkey->short_string(),
+                    ip);
         }
     }
 

@@ -1,12 +1,17 @@
 #pragma once
 
 #include <filesystem>
+#include <memory>
 #include <type_traits>
 #include <variant>
 
 #include "session/network/service_node.hpp"
 #include "session/network/session_network_types.hpp"
 #include "session/types.hpp"
+
+namespace oxen::quic {
+class Loop;
+}
 
 namespace session::network {
 class Endpoint;
@@ -283,6 +288,25 @@ namespace opt {
         min_resume_clock_resync_interval(std::chrono::minutes duration) : duration{duration} {}
     };
 
+    /// Can be used to override the default (5s) smallest network offset that is applied.  A clock
+    /// resync whose median offset is smaller than this, in either direction, leaves the device
+    /// clock as it is: a device keeping its own time is closer than the nodes it would correct
+    /// against, and an adjustment of a second or so reorders messages exchanged with anything
+    /// that applied a different one.
+    struct min_network_offset {
+        std::chrono::milliseconds duration;
+
+        min_network_offset(std::chrono::milliseconds duration) : duration{duration} {}
+    };
+
+    /// A loop to run the network's blocking I/O on -- reading and writing its caches -- shared
+    /// with whoever supplied it, rather than one the network starts for itself.
+    /// `Core::make_network` supplies Core's, so that everything an account does on disk goes
+    /// through one thread.
+    struct disk_loop {
+        std::shared_ptr<oxen::quic::Loop> loop;
+    };
+
     // MARK: Snode Pool Options
 
     /// Can be used to override the default ('.') path the network uses to cache files (eg. snode
@@ -483,6 +507,8 @@ namespace opt {
             retry_delay,
             num_nodes_to_check_for_network_offset,
             min_resume_clock_resync_interval,
+            min_network_offset,
+            disk_loop,
 
             // Snode pool options
             cache_directory,

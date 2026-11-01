@@ -2,11 +2,18 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace session::attachment {
+class PushEncryptor;
+}
 
 /// A cache of files we downloaded, on disk, encrypted under one key of our own.
 ///
@@ -66,6 +73,15 @@ std::filesystem::path path_for(
 std::optional<std::vector<std::byte>> read(
         const std::filesystem::path& file, std::span<const std::byte, 32> key);
 
+/// `read`, a piece at a time: each decrypted piece is handed to `out` as it comes, so a file too
+/// large to hold whole never has to be.  False, having removed it, for a file that turns out to be
+/// unreadable -- in which case `out` may already have been handed part of it, and whatever it did
+/// with that is its to undo.
+bool read_into(
+        const std::filesystem::path& file,
+        std::span<const std::byte, 32> key,
+        const std::function<void(std::span<const std::byte>)>& out);
+
 /// Encrypts `data` and writes it to `file`, creating the directory if needed.
 ///
 /// Written to a temporary name in the same directory and renamed into place, so a crash or a
@@ -75,6 +91,41 @@ void write(
         const std::filesystem::path& file,
         std::span<const std::byte, 32> key,
         std::span<const std::byte> data);
+
+/// `write`, for bytes that arrive in pieces: each is encrypted and written as it comes, so a file
+/// too large to hold whole never has to be.
+///
+/// Made once the padding is known, which the encryption needs before the first byte since it pads
+/// at the front: for a download re-encrypted into the cache, the padding the download carried
+/// (`attachment::Decryptor::padding()`), and otherwise `attachment::encrypted_padding()` of a size
+/// that is known.  The length is never needed.
+///
+/// Constructing it opens the file, so a cache that cannot be written to throws there.  Nothing
+/// appears under `file` until `commit`; a Writer destroyed without one, whether abandoned or
+/// because something threw, removes what it had written, so a failed download leaves nothing.
+class Writer {
+  public:
+    Writer(std::filesystem::path file, std::span<const std::byte, 32> key, size_t padding);
+    ~Writer();
+
+    Writer(const Writer&) = delete;
+    Writer& operator=(const Writer&) = delete;
+
+    /// Throws if the disk write fails.
+    void write(std::span<const std::byte> data);
+
+    /// Finishes the file and renames it into place.  Throws if finishing the file fails.
+    void commit();
+
+  private:
+    std::filesystem::path _file, _tmp;
+    std::ofstream _out;
+    std::unique_ptr<attachment::PushEncryptor> _enc;
+    bool _committed = false;
+
+    // Closes and removes the temporary: what an unfinished write leaves.
+    void _discard() noexcept;
+};
 
 /// The suffix an in-progress write carries.  A sweep must skip these: it decides what to delete by
 /// what is *not* referenced, and a download that has not finished is not referenced yet.

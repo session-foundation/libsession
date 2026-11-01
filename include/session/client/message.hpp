@@ -137,6 +137,9 @@ struct Reply {
 struct Message {
     /// Client-assigned, database-local message id.  Stable for the life of the message; not the
     /// swarm hash and not Core's send id.
+    ///
+    /// Never reused, even after the message is deleted, so an id held across a deletion can only
+    /// fail to find its message, never find a different one.
     int64_t id;
 
     ConversationId conversation;

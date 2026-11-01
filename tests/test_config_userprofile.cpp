@@ -625,7 +625,7 @@ TEST_CASE("user profile timestamp update bug", "[config][user_profile]") {
     profile.set_blinded_msgreqs(true);
     profile.set_profile_pic(url, key);
     auto seconds_before_call = profile.get_profile_updated();
-    std::this_thread::sleep_for(2s);
+    ScopedClockOffset later{2s};
     profile.set_name("Nibbler");
     profile.set_blinded_msgreqs(true);
     profile.set_profile_pic(url, key);

@@ -245,7 +245,13 @@ struct Recorder {
 /// connection can see the row as it was, or not at all.  A test that waits on state written that
 /// way is testing the scheduler.  Wait on the observable outcome instead.
 inline void sync(Client& c) {
-    c.core.loop().call_get([] { return 0; });
+    // Work goes back and forth between the two: a download's bytes are handled on the disk loop,
+    // which reports its end onto Core's, which may send it back to read the file.  A few rounds
+    // covers the longest such exchange.
+    for (int i = 0; i < 3; i++) {
+        c.core.disk_loop()->call_get([] { return 0; });
+        c.core.loop().call_get([] { return 0; });
+    }
 }
 
 /// The body of a conversation's last-message preview, or "" if it has no preview at all.

@@ -175,9 +175,13 @@ TEST_CASE("thumbhash component ratio is not an aspect ratio", "[image][thumbhash
     }
 
     // The whole representable set, so a change to it cannot slip through silently.
+    //
+    // The grid stops at 20 because the stored counts are round(7 * w / max(w, h)) -- a function of
+    // the shape alone -- so every reachable bucket already appears within it, while encode cost is
+    // quadratic in the dimensions and, where libm has to emulate fma, ruinously so.
     std::set<double> seen;
-    for (int w = 1; w <= 100; w++)
-        for (int h = 1; h <= 100; h++)
+    for (int w = 1; w <= 20; w++)
+        for (int h = 1; h <= 20; h++)
             seen.insert(thumbhash::component_aspect_ratio(
                     thumbhash::encode(test_image(w, h, false), w, h)));
     CHECK(seen.size() == 13);
@@ -195,10 +199,13 @@ TEST_CASE("thumbhash component ratio is not an aspect ratio", "[image][thumbhash
 // check exact structural validity rather than a loose cap -- a cap would pass a blob of the right
 // size but arbitrary content.
 TEST_CASE("thumbhash validity is exact, not a length cap", "[image][thumbhash]") {
+    // Small shapes suffice: length depends only on the alpha flag and the stored component count,
+    // so all six reachable lengths already appear within 20x20, and encode cost is quadratic in
+    // the dimensions.
     std::set<size_t> lengths;
     for (auto alpha : {false, true})
-        for (int w = 1; w <= 100; w += 7)
-            for (int h = 1; h <= 100; h += 7) {
+        for (int w = 1; w <= 20; w++)
+            for (int h = 1; h <= 20; h++) {
                 auto hash = thumbhash::encode(test_image(w, h, alpha), w, h);
                 INFO(w << "x" << h << (alpha ? " rgba" : " rgb"));
                 CHECK(thumbhash::valid(hash));

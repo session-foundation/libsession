@@ -4,30 +4,52 @@
 # can have been created from it.  A file rather than a flag so that removing an entry is a
 # reviewable change rather than a silent one.
 #
+# The hashes must be those of the commits as merged.  A branch rebased after its entries were
+# written leaves them naming commits that are not in the history at all -- which skips nothing, and
+# which the walk refuses rather than quietly checking everything they were meant to cover.
+#
 # Format:  <short-hash>  <reason>
 
-# The attachment-availability branch: every commit of it except the last, which is the only state
-# of it anything can start from.
+# The attachment-availability branch (#168): every commit of it except the last, e5e14363, which is
+# the only state of it anything can start from.
 #
 # It grew its schema over four migrations while it was being built and collapsed them into one
-# (client 005_attachment_availability) before merging, so a database made partway through has some
-# of those four recorded and cannot take the replacement.  None exists outside the branch, which is
-# the whole reason they were collapsed -- one migration per merged change, not one per commit.
+# (client 005_attachment_availability) before merging, then went on adding to that one -- the
+# thumbhash column last.  So a database made partway through has either some of those four recorded
+# and cannot take the replacement, or the replacement recorded without what was added to it later.
+# None exists outside the branch, which is the whole reason they were collapsed -- one migration per
+# merged change, not one per commit.
 #
 # Listed in full rather than only the commits that touched full_schema.sql.  The walk skips before
 # it deduplicates, so omitting one merely promotes it to stand for the schema of the commit before
 # it; and "no intermediate state of this work is a starting point" is the rule worth writing down,
 # whichever commits happened to carry the schema.
-e7a17b9e  attachment-availability, mid-branch
-0d555328  attachment-availability, mid-branch
-6fde73a5  attachment-availability, mid-branch
-a5a04a44  attachment-availability, mid-branch
-32e59159  attachment-availability, mid-branch
-acd0d4c0  attachment-availability, mid-branch
-2ea60e86  attachment-availability, mid-branch
-50526798  attachment-availability, mid-branch
-6013a715  attachment-availability, mid-branch
-9f3d393a  attachment-availability, mid-branch
-9f6cd961  attachment-availability, mid-branch
-4a062b4d  attachment-availability, mid-branch
-fdccb881  attachment-availability, mid-branch
+6c305030  attachment-availability, mid-branch
+80857ce6  attachment-availability, mid-branch
+6858592c  attachment-availability, mid-branch
+285dac6d  attachment-availability, mid-branch
+a324fc38  attachment-availability, mid-branch
+dae9ff00  attachment-availability, mid-branch
+63b88294  attachment-availability, mid-branch
+e2242ac4  attachment-availability, mid-branch
+9b6d2fd4  attachment-availability, mid-branch
+a8e9b2f6  attachment-availability, mid-branch
+e7ef2136  attachment-availability, mid-branch
+8cf94a65  attachment-availability, mid-branch
+7690c36c  attachment-availability, mid-branch
+2f90bada  attachment-availability, mid-branch
+4553ce8e  attachment-availability, mid-branch
+4152eb04  attachment-availability, mid-branch
+29a41d24  attachment-availability, mid-branch
+dd4560fe  attachment-availability, mid-branch
+65c6137d  attachment-availability, mid-branch
+61267b50  attachment-availability, mid-branch
+95e3150a  attachment-availability, mid-branch
+86148b55  attachment-availability, mid-branch
+fdb6fd57  attachment-availability, mid-branch
+f43debae  attachment-availability, mid-branch
+e19507d6  attachment-availability, mid-branch
+a80ea641  attachment-availability, mid-branch
+b075fa2e  attachment-availability, mid-branch
+c2ee7a45  attachment-availability, mid-branch
+9dfba1c6  attachment-availability, mid-branch

@@ -371,6 +371,7 @@ class Decryptor {
     bool failed = false;
     bool finished = false;
     bool hit_final = false;
+    size_t padding_seen = 0;
     cleared_b32 key;
     unsigned char st_data[52];  // crypto_secretstream_xchacha20poly1305_state data
 
@@ -398,6 +399,52 @@ class Decryptor {
     ///
     /// Throws std::logic_error if called after a successful finalize().
     [[nodiscard]] bool finalize();
+
+    /// How many bytes of padding came before the data -- the zeros and the marker that ends them --
+    /// or nullopt until decryption has got past them.
+    ///
+    /// Known by the time the first byte of data reaches `output`, which is what makes it useful: a
+    /// copy re-encrypted with the same padding (see `PushEncryptor`) can be started then, without
+    /// knowing how long the data is.
+    std::optional<size_t> padding() const;
+};
+
+/// API: crypto/attachment::PushEncryptor
+///
+/// Encrypts data handed to it as it arrives, into the same format `Encryptor` produces, for data
+/// whose length is not known when it starts.  The counterpart of `Decryptor`: data goes in through
+/// `update()` and encrypted output comes out through the callback given at construction.
+///
+/// `Encryptor` cannot do this: it pulls its input, and it needs the length up front, both to choose
+/// the padding and to know which chunk is last.  Here the padding is given instead -- typically
+/// that of the file being re-encrypted, as `Decryptor::padding()` reports, or `encrypted_padding()`
+/// of a length that is known -- and the last chunk is held back until `finalize()` says it is last.
+///
+/// Uses a random nonce, so it is for encrypting to our own storage under a key of our own, like
+/// `Encryptor`'s key-taking constructor, and never for a file server.
+class PushEncryptor {
+    std::function<void(std::span<const std::byte> encrypted)> output;
+    std::vector<std::byte> buf;
+    bool finished = false;
+    unsigned char st_data[52];  // crypto_secretstream_xchacha20poly1305_state data
+
+    // Encrypts one chunk of `buf`'s front and hands it on.
+    void push(size_t size, bool is_final);
+
+  public:
+    /// Emits the header and the padding.  `padding` counts the marker ending it, as
+    /// `encrypted_padding()` and `Decryptor::padding()` do, and so must be at least 1.
+    PushEncryptor(
+            std::span<const std::byte, ENCRYPT_KEY_SIZE> key,
+            size_t padding,
+            std::function<void(std::span<const std::byte> encrypted)> output);
+
+    /// Encrypts `data`, calling `output` once for each chunk that completes.  Throws
+    /// std::logic_error if called after `finalize()`.
+    void update(std::span<const std::byte> data);
+
+    /// Encrypts what is held back as the final chunk.  Throws std::logic_error if called twice.
+    void finalize();
 };
 
 /// API: crypto/attachment::Encryptor

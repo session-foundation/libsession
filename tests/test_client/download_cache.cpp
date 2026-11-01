@@ -100,6 +100,66 @@ TEST_CASE("Cache: what goes in comes back out", "[client][cache]") {
     CHECK_FALSE(std::filesystem::exists(file));
 }
 
+TEST_CASE("Cache: a file can be written as it arrives", "[client][cache]") {
+    TempDir dir;
+    auto key = a_key();
+    auto file = cache::path_for(dir.path, cache::ATTACHMENT_DIR, key, "http://fs.example/file/3");
+
+    // Several chunks' worth, arriving in pieces that line up with nothing: the encryption works a
+    // chunk at a time, and must neither run dry partway through one nor hold more than it needs.
+    auto size = GENERATE(0, 1, 32768, 32769, 200'000);
+    auto piece = GENERATE(1, 7, 4096, 40'000);
+    std::vector<std::byte> data(size);
+    session::random::fill(data);
+
+    {
+        cache::Writer w{file, key, session::attachment::encrypted_padding(data.size())};
+        for (std::span rest{data}; !rest.empty();) {
+            auto n = std::min<size_t>(piece, rest.size());
+            w.write(rest.first(n));
+            rest = rest.subspan(n);
+        }
+        // Nothing to be found until it is finished, so a reader either misses or gets all of it.
+        CHECK_FALSE(std::filesystem::exists(file));
+        w.commit();
+    }
+
+    auto got = cache::read(file, key);
+    REQUIRE(got);
+    CHECK(*got == data);
+    CHECK(cache::list(dir.path, cache::ATTACHMENT_DIR).size() == 1);
+}
+
+TEST_CASE("Cache: a write that does not finish leaves nothing", "[client][cache]") {
+    TempDir dir;
+    auto key = a_key();
+    auto file = cache::path_for(dir.path, cache::ATTACHMENT_DIR, key, "http://fs.example/file/4");
+    std::vector<std::byte> data(100'000);
+    session::random::fill(data);
+
+    auto leftovers = [&] {
+        size_t n = 0;
+        for (const auto& e : std::filesystem::directory_iterator{file.parent_path()}) {
+            (void)e;
+            n++;
+        }
+        return n;
+    };
+
+    // Abandoned partway, as a failed download is.
+    {
+        cache::Writer w{file, key, session::attachment::encrypted_padding(data.size())};
+        w.write(std::span{data}.first(50'000));
+    }
+    CHECK(leftovers() == 0);
+    CHECK_FALSE(cache::read(file, key));
+
+    // One that cannot even start throws there, before anything is fetched on its account.
+    auto blocked = dir.path / "not-a-directory";
+    std::ofstream{blocked} << "in the way";
+    CHECK_THROWS(cache::Writer{blocked / "file", key, 1});
+}
+
 TEST_CASE("Cache: a corrupted entry is a miss, not a throw", "[client][cache]") {
     TempDir dir;
     auto key = a_key();

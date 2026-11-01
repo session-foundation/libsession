@@ -37,6 +37,10 @@ inline constexpr std::string_view file_unreadable = "file.unreadable";
 /// lost connection, or our own side -- so trying again may work.  The message says which.
 inline constexpr std::string_view download_failed = "file.download_failed";
 
+/// The request was withdrawn through `Client::cancel_attachment_transfer`, or because the
+/// attachment it was for was deleted.
+inline constexpr std::string_view download_cancelled = "file.download_cancelled";
+
 /// An upload to the file server did not complete.  The message carries the status.
 inline constexpr std::string_view upload_failed = "file.upload_failed";
 

@@ -35,7 +35,8 @@ inline nlohmann::json parse_json(std::span<const std::byte> body) {
 /// `sent_requests` to observe outgoing requests and fire their callbacks.
 class MockNetwork : public network::Network {
   public:
-    MockNetwork() : network::Network(network::config::Config{}) {}
+    explicit MockNetwork(network::config::Config config = {}) :
+            network::Network(std::move(config)) {}
 
     struct SentRequest {
         network::Request request;
@@ -151,10 +152,14 @@ class MockNetwork : public network::Network {
 /// Gives `core` a fresh MockNetwork and hands back a non-owning pointer to it.  A Core owns its
 /// Network outright -- nothing else may hold it alive -- so a test that goes on poking at the mock
 /// keeps a raw pointer rather than a second reference.
-inline MockNetwork* attach_mock_network(core::Core& core) {
-    auto& net = core.make_network<MockNetwork>();
-    net.core = &core;
-    return &net;
+///
+/// `config` for a test that depends on how the network is configured -- which router it uses, say.
+inline MockNetwork* attach_mock_network(core::Core& core, network::config::Config config = {}) {
+    auto net = std::make_unique<MockNetwork>(std::move(config));
+    auto* raw = net.get();
+    raw->core = &core;
+    core.set_network(std::move(net));
+    return raw;
 }
 
 /// Answers one captured download with `data`, delivered in chunks as a transport would rather than
@@ -162,16 +167,23 @@ inline MockNetwork* attach_mock_network(core::Core& core) {
 /// meant to catch -- and stops the moment its caller asks it to, as a router does.  Returns how
 /// many chunks were delivered, which is how a test tells a transfer that was cut short from one
 /// that ran to the end.
+///
+/// `between` runs after each chunk.  A consumer that handles chunks on a thread of its own only
+/// asks to stop once it has got to one, and a test counting how soon that happens lets it catch up
+/// here -- as a real transfer's pace would -- rather than having every chunk delivered first.
 inline size_t serve_one_download(
         network::DownloadRequest& r,
         std::string id,
         std::span<const std::byte> data,
-        size_t chunk = 4096) {
+        size_t chunk = 4096,
+        std::function<void()> between = nullptr) {
     network::file_metadata meta{std::move(id), static_cast<int64_t>(data.size()), {}, {}};
     size_t delivered = 0;
     for (size_t at = 0; at < data.size() && !r.is_cancelled(); at += chunk) {
         r.on_data(meta, data.subspan(at, std::min(chunk, data.size() - at)));
         delivered++;
+        if (between)
+            between();
     }
     if (r.is_cancelled())
         r.on_complete(network::ERROR_REQUEST_CANCELLED, false);
@@ -383,6 +395,17 @@ class FakeRouter : public network::IRouter {
 
 class TestHelper {
   public:
+    /// Completes a clock resync on `net`'s loop as though its requests had measured `measured`
+    /// (nullopt for one that failed), without sending any.
+    static void finish_clock_resync(
+            network::Network& net, std::vector<std::optional<std::chrono::milliseconds>> measured) {
+        net._loop->call_get([&] {
+            net._current_clock_resync_id = "test";
+            net._clock_resync_results = std::move(measured);
+            net._on_clock_resync_complete(static_cast<uint8_t>(net._clock_resync_results.size()));
+        });
+    }
+
     /// Polls the way the ticker does: on the loop.
     ///
     /// Not `core._poll()` on the caller's thread.  A poll reaches component state, which is the
@@ -436,6 +459,7 @@ class TestHelper {
         net._router = std::move(router);
     }
     static network::SnodePool& snode_pool(network::Network& net) { return *net._snode_pool; }
+    static oxen::quic::Loop& disk_loop(network::Network& net) { return *net._disk_loop; }
 
     static sqlite::Connection db_conn(core::Core& core) { return core.db.conn(); }
 

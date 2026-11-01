@@ -6,7 +6,7 @@
 #   run-dev-backend.sh <path-to-testAll> [catch2 args...]
 #
 # It:
-#   1. generates an ephemeral Ed25519 signing key   (session-router-config -k)
+#   1. generates an ephemeral Ed25519 signing key   (PyNaCl, from the backend's own venv)
 #   2. spins up a throwaway PostgreSQL cluster       (initdb + pg_ctl, unix socket in a temp dir)
 #   3. starts the backend                            (flask --app main, KEY_PATH, no dev mode)
 #   4. polls /status until ready
@@ -42,7 +42,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -x "$TESTALL" ] || { echo "!! testAll not executable: $TESTALL" >&2; exit 2; }
 [ -x "$VENV_PY" ] || { echo "!! backend venv python missing: $VENV_PY" >&2; exit 2; }
 [ -n "$PGBIN" ]   || { echo "!! postgres bin dir not found under /usr/lib/postgresql" >&2; exit 2; }
-command -v session-router-config >/dev/null || { echo "!! session-router-config not on PATH" >&2; exit 2; }
 
 WORK="$(mktemp -d)"
 PGDATA="$WORK/pgdata"
@@ -61,7 +60,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo ">> ephemeral signing key: $KEYFILE"
-session-router-config -f -k "$KEYFILE" >/dev/null
+# The backend's key file format: hex of the 32-byte seed followed by the 32-byte public key.
+"$VENV_PY" -c '
+import sys, nacl.signing
+k = nacl.signing.SigningKey.generate()
+open(sys.argv[1], "w").write((bytes(k) + bytes(k.verify_key)).hex())
+' "$KEYFILE"
 
 echo ">> initdb: $PGDATA"
 "$PGBIN/initdb" -D "$PGDATA" --encoding=UTF8 --auth-local=trust --no-instructions -U "$USER" >/dev/null

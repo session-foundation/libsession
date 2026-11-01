@@ -71,41 +71,101 @@ std::optional<std::vector<std::byte>> read(
     }
 }
 
+bool read_into(
+        const std::filesystem::path& file,
+        std::span<const std::byte, 32> key,
+        const std::function<void(std::span<const std::byte>)>& out) {
+    std::error_code ec;
+    if (!std::filesystem::exists(file, ec))
+        return false;
+
+    try {
+        std::ifstream in;
+        in.exceptions(std::ios::badbit);
+        in.open(file, std::ios::binary);
+
+        attachment::Decryptor d{key, out};
+        std::vector<std::byte> chunk(attachment::ENCRYPTED_CHUNK_TOTAL);
+        while (in) {
+            in.read(reinterpret_cast<char*>(chunk.data()),
+                    static_cast<std::streamsize>(chunk.size()));
+            auto got = static_cast<size_t>(in.gcount());
+            if (got > 0 && !d.update(std::span{chunk}.first(got)))
+                throw std::runtime_error{"decryption failed"};
+        }
+        if (!d.finalize())
+            throw std::runtime_error{"entry ends partway"};
+        return true;
+    } catch (const std::exception& e) {
+        // As for `read`.  The caller may already have been handed some of it, which is theirs to
+        // discard: a failure here is a failure of the whole read.
+        log::warning(cat, "Discarding unreadable cache entry {}: {}", file.string(), e.what());
+        std::filesystem::remove(file, ec);
+        return false;
+    }
+}
+
 void write(
         const std::filesystem::path& file,
         std::span<const std::byte, 32> key,
         std::span<const std::byte> data) {
-    std::filesystem::create_directories(file.parent_path());
+    Writer w{file, key, attachment::encrypted_padding(data.size())};
+    w.write(data);
+    w.commit();
+}
+
+Writer::Writer(std::filesystem::path file, std::span<const std::byte, 32> key, size_t padding) :
+        _file{std::move(file)} {
+    std::filesystem::create_directories(_file.parent_path());
 
     // Unique, so two writes of the same url cannot land on one temporary and interleave.
-    auto tmp = file;
-    tmp += "{}{}"_format(random::unique_id("-", 8), PARTIAL_SUFFIX);
+    _tmp = _file;
+    _tmp += "{}{}"_format(random::unique_id("-", 8), PARTIAL_SUFFIX);
 
-    {
-        std::ofstream out{tmp, std::ios::binary | std::ios::trunc};
-        out.exceptions(std::ios::failbit | std::ios::badbit);
+    _out.exceptions(std::ios::failbit | std::ios::badbit);
+    _out.open(_tmp, std::ios::binary | std::ios::trunc);
 
-        attachment::Encryptor enc{key};
-        size_t pos = 0;
-        enc.start_encryption(
-                [&](std::span<std::byte> buf) -> size_t {
-                    auto n = std::min(buf.size(), data.size() - pos);
-                    std::memcpy(buf.data(), data.data() + pos, n);
-                    pos += n;
-                    return n;
-                },
-                true,
-                data.size());
-
-        for (auto chunk = enc.next(); !chunk.empty(); chunk = enc.next())
-            out.write(
-                    reinterpret_cast<const char*>(chunk.data()),
-                    static_cast<std::streamsize>(chunk.size()));
+    // The encryptor writes the header and padding as it is made.  A constructor that throws gets
+    // no destructor, so the file just opened has to be removed here if that fails.
+    try {
+        _enc = std::make_unique<attachment::PushEncryptor>(
+                key, padding, [this](std::span<const std::byte> encrypted) {
+                    _out.write(
+                            reinterpret_cast<const char*>(encrypted.data()),
+                            static_cast<std::streamsize>(encrypted.size()));
+                });
+    } catch (...) {
+        _discard();
+        throw;
     }
+}
+
+Writer::~Writer() {
+    if (!_committed)
+        _discard();
+}
+
+void Writer::write(std::span<const std::byte> data) {
+    _enc->update(data);
+}
+
+void Writer::commit() {
+    _enc->finalize();
+    _out.close();
 
     // Atomic: the finished name never exists holding a partial file, so a reader either misses or
     // gets the whole thing.
-    std::filesystem::rename(tmp, file);
+    std::filesystem::rename(_tmp, _file);
+    _committed = true;
+}
+
+void Writer::_discard() noexcept {
+    try {
+        _out.close();
+    } catch (...) {
+    }
+    std::error_code ec;
+    std::filesystem::remove(_tmp, ec);
 }
 
 std::vector<std::string> list(const std::filesystem::path& dir, std::string_view kind) {

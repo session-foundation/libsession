@@ -10,7 +10,6 @@
 #include <session/crypto/ed25519.hpp>
 #include <session/util.hpp>
 #include <string_view>
-#include <thread>
 
 #include "utils.hpp"
 
@@ -729,8 +728,11 @@ TEST_CASE("multipart message expiry", "[config][multipart][contacts][expiry]") {
 
     auto c2 = std::make_unique<session::config::Contacts>(seed, std::nullopt);
 
-    c2->MULTIPART_MAX_WAIT = 200ms;
-    c2->MULTIPART_MAX_REMEMBER = 600ms;
+    // Long enough that the time the test itself takes never matters (it can run for many seconds
+    // unoptimized under emulation); the clock is moved past them instead of waiting them out.
+    c2->MULTIPART_MAX_WAIT = 10min;
+    c2->MULTIPART_MAX_REMEMBER = 30min;
+    ScopedClockOffset clock{0s};
 
     auto old_seqno = std::get<seqno_t>(c2->push());
     REQUIRE(old_seqno == 0);
@@ -749,8 +751,8 @@ TEST_CASE("multipart message expiry", "[config][multipart][contacts][expiry]") {
     CHECK_FALSE(c2->needs_push());
     CHECK(std::get<seqno_t>(c2->push()) == 0);
 
-    // Wait for the stored part to expire
-    std::this_thread::sleep_for(220ms);
+    // Let the stored part expire
+    clock.advance(11min);
 
     // Dump should trigger a cleanup of cached parts:
     dump = c2->dump();
@@ -807,11 +809,11 @@ TEST_CASE("multipart message expiry", "[config][multipart][contacts][expiry]") {
 
     // test that the remember timer is getting properly applied for a completed set rather than the
     // wait timer by making sure we don't lose anything in the repeated dump:
-    std::this_thread::sleep_for(220ms);
+    clock.advance(11min);
     dump = c2->dump();
     CHECK(dump.size() == full_size);  // expect no change
 
-    std::this_thread::sleep_for(420ms);
+    clock.advance(21min);
     // Now we should hit the remember timer, and should discard the cached completed set data when
     // we dump:
     dump = c2->dump();

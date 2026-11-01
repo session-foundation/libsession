@@ -62,3 +62,21 @@ TEST_CASE(
     CHECK(observer.expired());
     CHECK(answered);
 }
+
+TEST_CASE("Network: a disk loop it is given is the one it uses", "[network]") {
+    // Shared, so that one thread does all of an account's work on disk: Core hands its own to the
+    // Network it makes.
+    auto shared = std::make_shared<oxen::quic::Loop>();
+    {
+        Network net{opt::disk_loop{shared}};
+        CHECK(&TestHelper::disk_loop(net) == shared.get());
+    }
+
+    // And outlives the Network it was lent to, which only lets go of it.
+    CHECK(shared.use_count() == 1);
+    CHECK(shared->call_get([] { return 42; }) == 42);
+
+    // Without one, a Network starts its own as it always has.
+    Network own{network::config::Config{}};
+    CHECK(&TestHelper::disk_loop(own) != shared.get());
+}

@@ -82,6 +82,11 @@ struct AttachmentProgress {
     int64_t message_id;
     size_t index;
 
+    /// The request this reports on, as `attachment_data` and `save_attachment` return it, for
+    /// `Client::cancel_attachment_transfer`.  Several requests sharing one download each have their
+    /// own, and an auto-download has one too, which reaches the application only through here.
+    uint64_t token = 0;
+
     /// Encrypted bytes so far, and how many are expected.  Encrypted rather than the file's own
     /// size because that is what is actually being moved and therefore what a proportion should be
     /// computed from; the two differ by padding and framing.
@@ -121,6 +126,10 @@ enum class AttachmentAvailability {
     /// A transfer is already under way, whoever started it -- an auto-download, another message
     /// quoting the same file, or another part of the application.  `attachment_data` joins it
     /// rather than starting a second one, and reports progress from wherever it has reached.
+    ///
+    /// Except behind a `save_attachment` of a file too big for `requested_cache_max_size`: that
+    /// writes straight to its destination and keeps nothing, so there is nothing to serve anyone
+    /// joining partway, and `attachment_data` (or another save) fetches the file for itself.
     ///
     /// This outranks either failure below: a transfer running is about to settle the question,
     /// so what the last one found is not what to draw.

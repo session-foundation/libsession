@@ -66,6 +66,7 @@ list(APPEND LIB_SESSION_UTESTS_SOURCES
     test_backend_session_file_server.cpp
     test_backed_session_open_group_server.cpp
     test_ip_country.cpp
+    test_network_clock.cpp
     test_network_swarm.cpp
     test_onionreq.cpp
     test_onion_request_router.cpp

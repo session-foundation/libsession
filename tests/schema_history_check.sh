@@ -46,7 +46,7 @@ SKIPLIST=tests/schema_history_skip.txt
 # list because the property is a cutoff: once one database has to be recreated, so does every older
 # one.  Everything after it is still walked, which is what keeps a development branch honest between
 # cutoffs -- consecutive commits do have to upgrade cleanly.
-SCHEMA_FLOOR=33812a80035dbfd500f7c7d030699697bfc10cd0
+SCHEMA_FLOOR=3df4ae5207714dbc7cbb31ea8541321a6d1589a0
 
 revs=$(
     git tag
@@ -57,6 +57,18 @@ revs=$(
         git rev-list HEAD
     fi
 )
+
+# An entry naming no commit in this history skips nothing while looking as though it does, which is
+# how a rebase after the entries were written goes unnoticed.  Refused outright instead.
+if [[ -f "$SKIPLIST" ]]; then
+    while read -r entry _; do
+        [[ -z "$entry" || "$entry" == \#* ]] && continue
+        if ! git merge-base --is-ancestor "$entry" HEAD 2>/dev/null; then
+            echo "$SKIPLIST: $entry is not a commit in this history" >&2
+            exit 1
+        fi
+    done <"$SKIPLIST"
+fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT

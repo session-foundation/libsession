@@ -16,10 +16,10 @@
 /// of the same columns.  The pragmas describe the schema as SQLite understands it, which is what we
 /// actually care about.
 ///
-/// The pragmas do not cover everything, though.  CHECK constraints have no pragma at all, partial
-/// indexes report only that they are partial and not on what, and trigger bodies exist solely as
-/// text.  Those three are recovered from sqlite_master.sql, normalised for whitespace and comments,
-/// which is safe because ALTER TABLE does not rewrite an expression's own text.
+/// The pragmas do not cover everything, though.  CHECK constraints and AUTOINCREMENT have no pragma
+/// at all, partial indexes report only that they are partial and not on what, and trigger bodies
+/// exist solely as text.  Those are recovered from sqlite_master.sql, normalised for whitespace and
+/// comments, which is safe because ALTER TABLE does not rewrite an expression's own text.
 namespace session::test {
 
 namespace detail {
@@ -50,15 +50,18 @@ namespace detail {
         return out;
     }
 
+    inline std::string uppercase(std::string s) {
+        std::ranges::transform(
+                s, s.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+        return s;
+    }
+
     /// Extracts every CHECK constraint from a CREATE TABLE statement, by balancing parentheses from
     /// the one that opens each `CHECK(`.  Does not attempt to skip string literals, so a CHECK
     /// containing an unbalanced paren inside quotes would confuse it; none does.
     inline std::vector<std::string> extract_checks(std::string_view sql) {
         auto norm = normalise_sql(sql);
-        auto upper = norm;
-        std::ranges::transform(upper, upper.begin(), [](unsigned char ch) {
-            return static_cast<char>(std::toupper(ch));
-        });
+        auto upper = uppercase(norm);
 
         std::vector<std::string> checks;
         for (size_t pos = upper.find("CHECK"); pos != std::string::npos;
@@ -115,6 +118,12 @@ inline std::string schema_fingerprint(sqlite::Connection& c) {
 
         for (const auto& check : detail::extract_checks(sql))
             out += "  check {}\n"_format(check);
+
+        // No pragma reports AUTOINCREMENT, and its sqlite_sequence row is skipped above along with
+        // every other internal table.
+        if (detail::uppercase(detail::normalise_sql(sql)).find("AUTOINCREMENT") !=
+            std::string::npos)
+            out += "  autoincrement\n";
 
         for (auto [id, seq, ref_table, from, to, on_update, on_delete, match] :
              c.prepared_results<

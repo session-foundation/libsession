@@ -49,7 +49,11 @@ CREATE TABLE device_unknown (
 -- the short authentication string emoji are derived (stored to avoid re-running the expensive
 -- hash on every display).
 CREATE TABLE device_link_requests (
-    id INTEGER PRIMARY KEY NOT NULL,
+    -- The `reqid` the application is given to tell requests apart, and to match a request to the
+    -- device_added that follows it.  AUTOINCREMENT because rows go -- accepted, or aged out -- and
+    -- without it the next request would take the id of the newest one gone, so an application
+    -- still holding that id would take one device's request for another's.
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     device INTEGER UNIQUE NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     received_at INTEGER NOT NULL,  -- unix timestamp of when this request was stored locally
     sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16)  -- 16-byte Argon2id output for SAS display

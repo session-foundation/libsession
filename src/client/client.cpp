@@ -14,6 +14,8 @@
 #include <session/config/contacts.hpp>
 #include <session/config/convo_info_volatile.hpp>
 #include <session/config/expiring.hpp>
+#include <session/config/local.hpp>
+#include <session/config/user_groups.hpp>
 #include <session/config/user_profile.hpp>
 #include <session/format.hpp>
 #include <session/hash.hpp>
@@ -401,6 +403,9 @@ core::callbacks Client::_core_callbacks() {
 }
 
 void Client::_init() {
+    _disk_loop = core.disk_loop();
+    _disk_jq.emplace(*_disk_loop);
+
     // Core's send queue is in-memory, so anything still mid-flight when the last run ended is not
     // resumed and its outcome is unknowable.  Say so rather than guessing either way.
     auto c = core.database().conn();
@@ -799,38 +804,41 @@ void Client::set_cache_dir(std::filesystem::path dir) {
 }
 
 Client::~Client() {
-    // Before the loop it hands its listing back to, and before the members that listing is about.
-    if (_sweeper.joinable())
-        _sweeper.join();
+    // First, while everything a disk job reaches is still here.  On the disk loop, so that a job
+    // already running there finishes before the queue stops rather than alongside it.
+    _disk_loop->call_get([this] { _disk_jq->stop(); });
+}
+
+void Client::_post_disk(std::function<void()> job) {
+    try {
+        _disk_jq->call_soon(std::move(job));
+    } catch (const std::exception&) {
+        // Stopped: this Client is going away.
+    }
 }
 
 void Client::_sweep_cache() {
     if (_cache_dir.empty())
         return;
 
-    if (_sweeper.joinable())
-        _sweeper.join();
-
-    // Split so that the walk -- the slow half, which reads nothing but the directory -- stays off
-    // the loop, and the deciding -- the quick half, which reads the database -- stays on it.  That
-    // split is also the whole of the concurrency argument: a file is written and its row inserted
-    // by one loop job, so a reconcile running on the loop cannot land between the two and take a
-    // freshly cached file for an orphan.  Files that appear after the listing are simply not in it.
-    _sweeper = std::thread{[this, dir = _cache_dir] {
+    // Listed on the disk loop and decided on Core's, where the rows are.  A download landing
+    // meanwhile cannot be taken for an orphan, because both halves of one run in the same order: a
+    // file is committed on the disk loop and then recorded on Core's.  So a file the listing saw
+    // was committed before it, and its recording is queued on Core's loop ahead of this reconcile;
+    // one committed after the listing is simply not in it.
+    _post_disk([this, dir = _cache_dir] {
         auto attachments = cache::list(dir, cache::ATTACHMENT_DIR);
         auto pictures = cache::list(dir, cache::PROFILE_DIR);
-
-        // `call_get`, not `call`: the destructor joins this thread to know the sweep is over, and a
-        // thread that had only posted the job would finish while the job was still queued.
-        call_get([this, &attachments, &pictures] {
+        call([this,
+              attachments = std::move(attachments),
+              pictures = std::move(pictures)]() mutable {
             try {
                 _reconcile_cache(std::move(attachments), std::move(pictures));
             } catch (const std::exception& e) {
                 log::warning(cat, "Cache sweep failed: {}", e.what());
             }
-            return 0;
         });
-    }};
+    });
 }
 
 void Client::_reconcile_cache(
@@ -839,12 +847,11 @@ void Client::_reconcile_cache(
 
     // An attachment file without a row cannot be found by a lookup or counted by eviction, so it is
     // not a cache entry at all -- it is a file taking up room under a name nobody can resolve.
-    size_t orphans = 0;
-    for (const auto& name : attachments)
+    std::vector<std::string> orphans;
+    for (auto& name : attachments)
         if (!c.prepared_get<int64_t>(
-                    "SELECT EXISTS(SELECT 1 FROM attachment_cache WHERE name = ?)", name) &&
-            cache::remove(_cache_dir, cache::ATTACHMENT_DIR, name))
-            orphans++;
+                    "SELECT EXISTS(SELECT 1 FROM attachment_cache WHERE name = ?)", name))
+            orphans.push_back(std::move(name));
 
     // The other direction, which is not cosmetic: eviction totals `size` over the rows, so a row
     // naming a file that is gone makes the cache look fuller than it is and evicts live files to
@@ -852,26 +859,13 @@ void Client::_reconcile_cache(
     //
     // Rows the listing covers are fine by definition.  The rest are checked against the disk rather
     // than assumed missing, because a row inserted after the listing was taken is legitimately
-    // absent from it and dropping it would strand the file it names.  Collected before deleting
-    // any, rather than deleted as they are found: this is a read of the table it would modify.
+    // absent from it and dropping it would strand the file it names.
     std::set<std::string> listed{attachments.begin(), attachments.end()};
-    std::vector<std::pair<int64_t, std::string>> stale;
+    std::vector<std::pair<int64_t, std::string>> unlisted;
     for (auto&& [id, name] :
-         c.prepared_results<int64_t, std::string>("SELECT id, name FROM attachment_cache")) {
-        std::error_code ec;
-        if (!listed.contains(name) &&
-            !std::filesystem::exists(_cache_dir / cache::ATTACHMENT_DIR / name, ec))
-            stale.emplace_back(id, std::move(name));
-    }
-    // Through the same path an eviction takes, so a file that went missing behind our back is
-    // reported to the messages drawing it exactly as one we deleted on purpose would be -- and as
-    // one report for the sweep, not one per file.
-    std::vector<int64_t> affected;
-    for (const auto& [id, name] : stale) {
-        auto showing = _drop_cached(c, id, name);
-        affected.insert(affected.end(), showing.begin(), showing.end());
-    }
-    _emit_messages_showing(c, affected);
+         c.prepared_results<int64_t, std::string>("SELECT id, name FROM attachment_cache"))
+        if (!listed.contains(name))
+            unlisted.emplace_back(id, std::move(name));
 
     // A picture is referenced by an account naming its url and by nothing else, so the referenced
     // set is that column.  Recomputed here rather than passed in, so that an account that appeared
@@ -880,20 +874,53 @@ void Client::_reconcile_cache(
     for (auto url : c.prepared_results<std::string>(
                  "SELECT profile_pic_url FROM accounts WHERE profile_pic_url IS NOT NULL"))
         keep.insert(_cache_name(url));
+    std::vector<std::string> unreferenced;
+    for (auto& name : pictures)
+        if (!keep.contains(name))
+            unreferenced.push_back(std::move(name));
 
-    size_t unreferenced = 0;
-    for (const auto& name : pictures)
-        if (!keep.contains(name) && cache::remove(_cache_dir, cache::PROFILE_DIR, name))
-            unreferenced++;
+    // What only the disk can answer, and do: removing what nothing refers to, and whether each row
+    // the listing did not cover still has its file.
+    _post_disk([this,
+                dir = _cache_dir,
+                orphans = std::move(orphans),
+                unlisted = std::move(unlisted),
+                unreferenced = std::move(unreferenced)]() mutable {
+        size_t dropped_files = 0, dropped_pictures = 0;
+        for (const auto& name : orphans)
+            dropped_files += cache::remove(dir, cache::ATTACHMENT_DIR, name);
+        for (const auto& name : unreferenced)
+            dropped_pictures += cache::remove(dir, cache::PROFILE_DIR, name);
 
-    if (orphans || !stale.empty() || unreferenced)
-        log::info(
-                cat,
-                "Cache sweep: dropped {} untracked attachment(s), {} row(s) for missing files, {} "
-                "unreferenced picture(s)",
-                orphans,
-                stale.size(),
-                unreferenced);
+        std::vector<std::pair<int64_t, std::string>> gone;
+        for (auto& [id, name] : unlisted) {
+            std::error_code ec;
+            if (!std::filesystem::exists(dir / cache::ATTACHMENT_DIR / name, ec))
+                gone.emplace_back(id, std::move(name));
+        }
+
+        call([this, gone = std::move(gone), dropped_files, dropped_pictures] {
+            // Through the same path an eviction takes, so a file that went missing behind our back
+            // is reported to the messages drawing it exactly as one we deleted on purpose would be
+            // -- and as one report for the sweep, not one per file.
+            auto c = core.database().conn();
+            std::vector<int64_t> affected;
+            for (const auto& [id, name] : gone) {
+                auto showing = _drop_cached(c, id, name);
+                affected.insert(affected.end(), showing.begin(), showing.end());
+            }
+            _emit_messages_showing(c, affected);
+
+            if (dropped_files || !gone.empty() || dropped_pictures)
+                log::info(
+                        cat,
+                        "Cache sweep: dropped {} untracked attachment(s), {} row(s) for missing "
+                        "files, {} unreferenced picture(s)",
+                        dropped_files,
+                        gone.size(),
+                        dropped_pictures);
+        });
+    });
 }
 
 std::filesystem::path Client::_cache_path(std::string_view kind, std::string_view url) {
@@ -970,29 +997,9 @@ void Client::_profile_picture(
 
     _fetch_cached(
             {{pic.url, pic.key, {}, std::nullopt}, DownloadKind::display_pic, cache::PROFILE_DIR},
-            on_progress ? _dispatch_progress(std::move(on_progress)) : nullptr,
-            std::move(bytes),
-            _store_picture(pic.url));
-}
-
-// Writes a fetched picture into the cache, or nothing at all when there is nowhere to put it.
-std::function<bool(std::span<const std::byte>)> Client::_store_picture(std::string url) {
-    if (_cache_dir.empty())
-        return nullptr;
-
-    return [this, url = std::move(url), key = _cache_encryption_key()](
-                   std::span<const std::byte> data) {
-        try {
-            cache::write(_cache_path(cache::PROFILE_DIR, url), key, data);
-        } catch (const std::exception& e) {
-            // A cache that cannot be written is a cache that misses next time, which is not worth
-            // failing the caller's fetch over.
-            log::warning(cat, "Could not cache a profile picture: {}", e.what());
-        }
-        // Never: what the answer is for is whether the messages showing this file have been told it
-        // arrived, and a picture belongs to a conversation rather than to any message.
-        return false;
-    };
+            true,
+            {.progress = on_progress ? _dispatch_progress(std::move(on_progress)) : nullptr,
+             .cb = std::move(bytes)});
 }
 
 namespace {
@@ -1000,7 +1007,18 @@ namespace {
     // fetching unasked, are properties of this machine and not of the account.
     constexpr auto CACHE_LIMIT_KEY = "client:attachment_cache_limit";
     constexpr auto AUTO_DL_MAX_KEY = "client:auto_download_max_size";
+    constexpr auto REQUESTED_MAX_KEY = "client:requested_cache_max_size";
+    constexpr auto AUTO_DL_CONCURRENCY_KEY = "client:auto_download_concurrency";
+    constexpr int DEFAULT_AUTO_DL_CONCURRENCY = 4;
 }  // namespace
+
+// Checked on the calling thread, so that a caller's mistake surfaces where they made it rather than
+// in a callback.
+static std::optional<int64_t> checked_limit(std::string_view setter, std::optional<int64_t> bytes) {
+    if (bytes && *bytes < 0)
+        throw std::invalid_argument{"{}: a limit cannot be negative"_format(setter)};
+    return bytes;
+}
 
 // Absent rather than sentinel: "no limit" is the key not being there, so nothing has to reserve a
 // magic value or decide whether 0 means unlimited or refuse-everything.
@@ -1012,10 +1030,16 @@ static void set_limit(core::Globals& g, std::string_view key, std::optional<int6
 }
 
 void Client::set_attachment_cache_limit(std::optional<int64_t> bytes, result_function<> cb) {
-    _async([this, bytes] { set_limit(core.globals, CACHE_LIMIT_KEY, bytes); }, std::move(cb));
+    _async(
+            [this, bytes = checked_limit("set_attachment_cache_limit", bytes)] {
+                set_limit(core.globals, CACHE_LIMIT_KEY, bytes);
+            },
+            std::move(cb));
 }
 void Client::set_attachment_cache_limit(std::optional<int64_t> bytes, await_t) {
-    call_get([this, bytes] { set_limit(core.globals, CACHE_LIMIT_KEY, bytes); });
+    call_get([this, bytes = checked_limit("set_attachment_cache_limit", bytes)] {
+        set_limit(core.globals, CACHE_LIMIT_KEY, bytes);
+    });
 }
 void Client::attachment_cache_limit(result_function<std::optional<int64_t>> cb) {
     _async([this] { return core.globals.get_integer(CACHE_LIMIT_KEY); }, std::move(cb));
@@ -1041,17 +1065,107 @@ int64_t Client::attachment_cache_size(await_t) {
     return call_get([this] { return _attachment_cache_size(); });
 }
 
+std::unordered_map<std::string, int> Client::_config_sizes() {
+    if (!core.globals.have_account())
+        return {};
+    auto& configs = core.configs;
+    auto size = [](config::ConfigBase& conf) { return static_cast<int>(conf.make_dump().size()); };
+    return {
+            {"user_profile", size(configs.user_profile())},
+            {"contacts", size(configs.contacts())},
+            {"convo_info_volatile", size(configs.convo_info_volatile())},
+            {"user_groups", size(configs.user_groups())},
+            {"local", size(configs.local())},
+    };
+}
+
+void Client::config_sizes(result_function<std::unordered_map<std::string, int>> cb) {
+    _async([this] { return _config_sizes(); }, std::move(cb));
+}
+std::unordered_map<std::string, int> Client::config_sizes(await_t) {
+    return call_get([this] { return _config_sizes(); });
+}
+
 void Client::set_auto_download_max_size(std::optional<int64_t> bytes, result_function<> cb) {
-    _async([this, bytes] { set_limit(core.globals, AUTO_DL_MAX_KEY, bytes); }, std::move(cb));
+    _async(
+            [this, bytes = checked_limit("set_auto_download_max_size", bytes)] {
+                set_limit(core.globals, AUTO_DL_MAX_KEY, bytes);
+            },
+            std::move(cb));
 }
 void Client::set_auto_download_max_size(std::optional<int64_t> bytes, await_t) {
-    call_get([this, bytes] { set_limit(core.globals, AUTO_DL_MAX_KEY, bytes); });
+    call_get([this, bytes = checked_limit("set_auto_download_max_size", bytes)] {
+        set_limit(core.globals, AUTO_DL_MAX_KEY, bytes);
+    });
 }
 void Client::auto_download_max_size(result_function<std::optional<int64_t>> cb) {
     _async([this] { return core.globals.get_integer(AUTO_DL_MAX_KEY); }, std::move(cb));
 }
 std::optional<int64_t> Client::auto_download_max_size(await_t) {
     return call_get([this] { return core.globals.get_integer(AUTO_DL_MAX_KEY); });
+}
+
+void Client::set_requested_cache_max_size(std::optional<int64_t> bytes, result_function<> cb) {
+    _async(
+            [this, bytes = checked_limit("set_requested_cache_max_size", bytes)] {
+                set_limit(core.globals, REQUESTED_MAX_KEY, bytes);
+            },
+            std::move(cb));
+}
+void Client::set_requested_cache_max_size(std::optional<int64_t> bytes, await_t) {
+    call_get([this, bytes = checked_limit("set_requested_cache_max_size", bytes)] {
+        set_limit(core.globals, REQUESTED_MAX_KEY, bytes);
+    });
+}
+void Client::requested_cache_max_size(result_function<std::optional<int64_t>> cb) {
+    _async([this] { return core.globals.get_integer(REQUESTED_MAX_KEY); }, std::move(cb));
+}
+std::optional<int64_t> Client::requested_cache_max_size(await_t) {
+    return call_get([this] { return core.globals.get_integer(REQUESTED_MAX_KEY); });
+}
+
+static std::optional<int> checked_concurrency(std::optional<int> n) {
+    if (n && *n < 1)
+        throw std::invalid_argument{
+                "set_auto_download_concurrency: at least one download has to be allowed"};
+    return n;
+}
+static std::optional<int> get_concurrency(core::Globals& g) {
+    if (auto n = g.get_integer(AUTO_DL_CONCURRENCY_KEY))
+        return static_cast<int>(*n);
+    return std::nullopt;
+}
+
+void Client::set_auto_download_concurrency(std::optional<int> n, result_function<> cb) {
+    _async(
+            [this, n = checked_concurrency(n)] {
+                set_limit(core.globals, AUTO_DL_CONCURRENCY_KEY, n);
+                // Raising it starts what is now allowed to, rather than waiting for something to
+                // finish first.
+                _pump_auto_downloads();
+            },
+            std::move(cb));
+}
+void Client::set_auto_download_concurrency(std::optional<int> n, await_t) {
+    call_get([this, n = checked_concurrency(n)] {
+        set_limit(core.globals, AUTO_DL_CONCURRENCY_KEY, n);
+        _pump_auto_downloads();
+    });
+}
+void Client::auto_download_concurrency(result_function<std::optional<int>> cb) {
+    _async([this] { return get_concurrency(core.globals); }, std::move(cb));
+}
+std::optional<int> Client::auto_download_concurrency(await_t) {
+    return call_get([this] { return get_concurrency(core.globals); });
+}
+
+bool Client::_caches_requested(std::optional<int64_t> size) {
+    if (_cache_dir.empty())
+        return false;
+    // Unlimited when unset, so a file that declares no size is only turned away by a limit it
+    // cannot be shown to fit.
+    auto max = core.globals.get_integer(REQUESTED_MAX_KEY);
+    return !max || (size && *size <= *max);
 }
 
 void Client::display_name(result_function<std::string> cb) {
@@ -1098,43 +1212,49 @@ bool Client::delete_message_everywhere(int64_t message_id, await_t) {
     return call_get([this, message_id] { return _delete_message_everywhere(message_id); });
 }
 
-void Client::attachment_data(
+uint64_t Client::attachment_data(
         int64_t message_id,
         size_t index,
         std::function<void(const AttachmentProgress&)> on_progress,
         result_function<std::vector<std::byte>> cb) {
-    call([this, message_id, index, on_progress = std::move(on_progress), cb]() mutable {
+    auto token = _next_token++;
+    call([this, message_id, index, token, on_progress = std::move(on_progress), cb]() mutable {
         try {
-            _attachment_data(message_id, index, std::move(on_progress), cb);
+            _attachment_data(message_id, index, false, token, std::move(on_progress), cb);
         } catch (const std::exception& e) {
             log_operation_failure(e);
             _fail<std::vector<std::byte>>(cb, error_from(e));
         }
     });
+    return token;
 }
 
 void Client::_attachment_data(
         int64_t message_id,
         size_t index,
+        bool automatic,
+        uint64_t token,
         std::function<void(const AttachmentProgress&)> on_progress,
-        result_function<std::vector<std::byte>> cb) {
+        result_function<std::vector<std::byte>> cb,
+        std::function<void()> ended) {
 
     auto remote = _remote_file(message_id, index);
-
-    auto progress = _attachment_progress(message_id, index, std::move(on_progress));
-
-    std::function<bool(std::span<const std::byte>)> store;
-    if (!_cache_dir.empty())
-        store = [this, url = remote.url, k = _cache_encryption_key()](
-                        std::span<const std::byte> data) {
-            return _cache_attachment(url, k, data);
-        };
+    // An auto-download exists to fill the cache, and has already been held to its own limit.
+    bool caching = automatic || _caches_requested(remote.size);
 
     _fetch_cached(
             {std::move(remote), DownloadKind::attachment, cache::ATTACHMENT_DIR},
-            std::move(progress),
-            std::move(cb),
-            std::move(store));
+            caching,
+            {token,
+             message_id,
+             index,
+             _attachment_progress(message_id, index, token, std::move(on_progress)),
+             std::move(cb),
+             std::move(ended)});
+}
+
+void Client::cancel_attachment_transfer(uint64_t token) {
+    call([this, token] { _cancel(token); });
 }
 
 std::string Client::_transfer_key(const RemoteFile& f) {
@@ -1150,11 +1270,79 @@ std::string Client::_transfer_key(const RemoteFile& f) {
     return key;
 }
 
-void Client::_fetch_cached(
-        FetchTarget target,
-        transfer_progress progress,
-        result_function<std::vector<std::byte>> cb,
-        std::function<bool(std::span<const std::byte>)> store) {
+// The registry entry for one download.  Two threads share it, each with fields of its own: Core's
+// loop owns the lists of who wants it, and the disk loop, where every delivery runs, owns whatever
+// keeps the bytes -- so neither needs a lock.
+struct Client::Transfer {
+    FetchTarget target;
+
+    // Core's loop's.  The figures are the last reported, so somebody joining midway can be told
+    // where it has got to rather than being left with nothing to draw until the next chunk lands.
+    int64_t done = 0, total = 0;
+    std::vector<Waiter> waiting;
+
+    // Core's loop's: stops the download, once nobody is left on it.  Null until it has started,
+    // and for one that ended as it did.
+    std::shared_ptr<std::atomic<bool>> abort;
+
+    // Set before the transfer starts and read by both.  Where the cached copy goes, or empty for a
+    // transfer that is not caching.
+    std::filesystem::path cache_file;
+
+    // The disk loop's.  The writer is made on the first delivery, which is when the padding it
+    // needs is known, and dropped if it fails: the download carries on for whoever is waiting, and
+    // they are served another way.
+    std::unique_ptr<cache::Writer> cache;
+    bool cache_failed = false;
+
+    // The whole file, for a transfer that is not caching and so has nowhere to read it back from.
+    // The disk loop's until the transfer ends, when it is handed to Core's.
+    std::unique_ptr<std::vector<std::byte>> memory;
+
+    // Saves written to as the bytes arrive: those that started this transfer.  Set before it
+    // starts; the disk loop's after that.
+    std::vector<std::shared_ptr<Save>> sinks;
+
+    // The same saves, as Core's loop sees them: those not yet withdrawn, which are the ones
+    // finished once the transfer ends.  Withdrawing one does not take it out of `sinks`, since that
+    // is the disk loop's; it is settled there instead, which is what stops it being written.
+    std::vector<std::shared_ptr<Save>> writing;
+
+    // Saves that joined partway, and are served from what the transfer kept once it ends.  Core's
+    // loop's.
+    std::vector<std::shared_ptr<Save>> saves;
+
+    // Core's loop's: whether anything is left that wants the bytes.  The cache copy is not
+    // counted, since nobody is waiting for it.
+    bool wanted() const { return !waiting.empty() || !writing.empty() || !saves.empty(); }
+};
+
+// A save_attachment on its way to disk: written under a temporary name beside the destination and
+// renamed only once it is whole, so an interrupted save leaves nothing that looks finished.
+//
+// The file, whether the save has failed, and whether it is settled are the disk loop's; whether it
+// was cancelled and whether it has been reported are Core's; the rest is set before any of it runs.
+// Settling is what makes a cancel and a finish that cross come out as one of them: whichever the
+// disk loop reaches first is the save's ending, and the other finds it settled and does nothing.
+struct Client::Save {
+    uint64_t token;
+    RemoteFile remote;
+    int64_t message_id;
+    size_t index;
+    std::filesystem::path dest;
+    bool replace, notify_sender;
+    result_function<std::filesystem::path> cb;
+    transfer_progress report;
+
+    std::filesystem::path partial;
+    std::ofstream out;
+    std::optional<Error> failed;
+    bool settled = false;
+
+    bool cancelled = false, reported = false;
+};
+
+void Client::_fetch_cached(FetchTarget target, bool caching, Waiter w) {
 
     if (!_cache_dir.empty()) {
         // An attachment's copy is found through the rows referencing it, under whatever name the
@@ -1171,105 +1359,171 @@ void Client::_fetch_cached(
         } else
             file = _cache_path(target.dir, target.remote.url);
 
-        if (!file.empty())
-            if (auto cached = cache::read(file, _cache_encryption_key())) {
-                // Nothing to report: there is no transfer, and a progress bar for a local read is a
-                // flicker that means nothing.  The caller gets the bytes.
-                if (entry_id)
-                    _touch_cached(*entry_id);
-                _report(cb, Expected<std::vector<std::byte>>{std::move(*cached)});
-                return;
-            }
+        // Read on the disk loop and decided back here, since what a miss goes on to do -- join a
+        // transfer or start one -- is this loop's registry to touch.
+        if (!file.empty()) {
+            _post_disk([this,
+                        file = std::move(file),
+                        key = _cache_encryption_key(),
+                        entry_id,
+                        target = std::move(target),
+                        caching,
+                        w = std::move(w)]() mutable {
+                auto cached = cache::read(file, key);
+                call([this,
+                      cached = std::move(cached),
+                      entry_id,
+                      target = std::move(target),
+                      caching,
+                      w = std::move(w)]() mutable {
+                    if (!cached)
+                        return _fetch_uncached(std::move(target), caching, std::move(w));
+                    // Nothing to report: there is no transfer, and a progress bar for a local read
+                    // is a flicker that means nothing.  The caller gets the bytes.
+                    if (entry_id)
+                        _touch_cached(*entry_id);
+                    _report(w.cb, Expected<std::vector<std::byte>>{std::move(*cached)});
+                    if (w.ended)
+                        w.ended();
+                });
+            });
+            return;
+        }
     }
 
+    _fetch_uncached(std::move(target), caching, std::move(w));
+}
+
+void Client::_fetch_uncached(FetchTarget target, bool caching, Waiter w) {
     // Already being fetched under the same claim: wait on that rather than asking for the same
     // bytes again.
+    //
+    // Joined even by a waiter that wants neither the bytes nor to hear about them -- a fetch that
+    // is only filling the cache -- so that it counts as somebody on the transfer, and the others
+    // on it withdrawing does not stop it.
     auto name = _transfer_key(target.remote);
     if (auto found = _in_flight.find(name); found != _in_flight.end()) {
-        if (progress) {
-            // Told where it has got to before anything else happens, so a display that arrives
-            // halfway through starts from halfway rather than from nothing.
-            progress(found->second.done, found->second.total, std::nullopt);
-            found->second.progress.push_back(std::move(progress));
-        }
-        if (cb)
-            found->second.waiting.push_back(std::move(cb));
+        // Told where it has got to before anything else happens, so a display that arrives
+        // halfway through starts from halfway rather than from nothing.
+        if (w.progress)
+            w.progress(found->second->done, found->second->total, std::nullopt);
+        found->second->waiting.push_back(std::move(w));
         return;
     }
 
-    auto& entry = _in_flight[name];
-    entry.plain = std::make_shared<std::vector<std::byte>>();
-    if (progress)
-        entry.progress.push_back(std::move(progress));
-    if (cb)
-        entry.waiting.push_back(std::move(cb));
-    auto plain = entry.plain;
+    auto t = std::make_shared<Transfer>();
+    t->target = std::move(target);
+    if (caching && !_cache_dir.empty())
+        t->cache_file = _cache_path(t->target.dir, t->target.remote.url);
+    else
+        t->memory = std::make_unique<std::vector<std::byte>>();
+    t->waiting.push_back(std::move(w));
+    _start_transfer(std::move(name), std::move(t));
+}
 
-    auto on_plain = [plain](std::span<const std::byte> chunk) {
-        plain->insert(plain->end(), chunk.begin(), chunk.end());
+void Client::_start_transfer(std::string name, std::shared_ptr<Transfer> t) {
+    _in_flight[name] = t;
+    const auto& target = t->target;
+
+    // On the disk loop, straight into whatever keeps the bytes.
+    b32 key{};
+    if (!t->cache_file.empty())
+        key = _cache_encryption_key();
+    auto on_data = [t, key](std::span<const std::byte> plain, size_t padding) {
+        if (!t->cache_file.empty() && !t->cache && !t->cache_failed) {
+            try {
+                t->cache = std::make_unique<cache::Writer>(t->cache_file, key, padding);
+            } catch (const std::exception& e) {
+                log::warning(cat, "Could not start caching {}: {}", t->target.remote.url, e.what());
+                t->cache_failed = true;
+            }
+        }
+        if (t->cache) {
+            try {
+                t->cache->write(plain);
+            } catch (const std::exception& e) {
+                log::warning(cat, "Could not cache {}: {}", t->target.remote.url, e.what());
+                t->cache.reset();
+                t->cache_failed = true;
+            }
+        }
+        if (t->memory)
+            t->memory->insert(t->memory->end(), plain.begin(), plain.end());
+        for (const auto& s : t->sinks)
+            _save_write(*s, plain);
     };
 
-    // Onto the loop before touching the registry -- this arrives on the network thread, and
-    // `_in_flight` is ours.
-    auto on_progress = [this, name](int64_t done, int64_t total, std::optional<Expected<void>> r) {
-        call([this, name, done, total, r = std::move(r)] {
+    // Onto Core's loop before touching the registry -- this arrives on the disk loop, and
+    // `_in_flight` is Core's loop's.
+    auto on_progress = [this, name, t](
+                               int64_t done, int64_t total, std::optional<Expected<void>> r) {
+        call([this, name, t, done, total, r = std::move(r)] {
             auto found = _in_flight.find(name);
-            if (found == _in_flight.end())
+            if (found == _in_flight.end() || found->second != t)
                 return;
-            found->second.done = done;
-            found->second.total = total;
-            for (const auto& p : found->second.progress)
-                p(done, total, r);
+            t->done = done;
+            t->total = total;
+            for (const auto& w : t->waiting)
+                if (w.progress)
+                    w.progress(done, total, r);
+            for (const auto* saves : {&t->writing, &t->saves})
+                for (const auto& s : *saves)
+                    if (s->report)
+                        s->report(done, total, r);
         });
     };
 
-    auto on_done = [this, name, dir = target.dir, claim = target.remote, store = std::move(store)](
-                           DownloadResult result, std::string why) {
-        call([this, name, dir, claim, store, result, why = std::move(why)]() mutable {
+    auto on_done = [this, name, t](DownloadResult result, std::string why) {
+        // Settled on the disk loop, where the copy was written: it is the file only if the
+        // download was, so it is committed on success and otherwise discarded with its writer,
+        // which removes what it had written.
+        //
+        // Its size is taken here too, while this is the loop touching the disk: what the file
+        // actually takes, rather than anything computed, since the cache limit is a limit on disk
+        // and padding and framing are part of what it costs.
+        std::optional<int64_t> cached_size;
+        if (auto writer = std::move(t->cache); writer && result == DownloadResult::ok) {
+            try {
+                writer->commit();
+                cached_size = static_cast<int64_t>(std::filesystem::file_size(t->cache_file));
+            } catch (const std::exception& e) {
+                log::warning(cat, "Could not cache {}: {}", t->target.remote.url, e.what());
+            }
+        }
+        std::optional<std::vector<std::byte>> memory;
+        if (t->memory)
+            memory = std::move(*t->memory);
+
+        call([this,
+              name,
+              t,
+              result,
+              why = std::move(why),
+              cached_size,
+              memory = std::move(memory)]() mutable {
             auto found = _in_flight.find(name);
-            if (found == _in_flight.end())
+            if (found == _in_flight.end() || found->second != t)
                 return;
 
-            // Lifted out before anything else, because everything below can be seen from outside
-            // and none of it should show a transfer that has finished as still running.  Storing
-            // the file tells the messages showing it, and would report them as `fetching` while
-            // this entry stood; a waiter may ask for the same file again, and must find a finished
-            // transfer rather than join one about to be erased.
-            auto entry = std::move(found->second);
+            // Lifted out before anything else, because everything that follows can be seen from
+            // outside and none of it should show a transfer that has finished as still running.
+            // Storing the file tells the messages showing it, and would report them as `fetching`
+            // while this entry stood; a waiter may ask for the same file again, and must find a
+            // finished transfer rather than join one about to be erased.
             _in_flight.erase(found);
 
-            // Stored before anyone is told, since a waiter may go straight back to the cache --
-            // and only on success, because what a failed download produced is not the file.
-            bool ok = result == DownloadResult::ok;
-            bool stored = false;
-            if (ok && store)
-                stored = store(*entry.plain);
+            // The saves written as it arrived are finished from here rather than on the disk loop
+            // where their files are, because which of them are still wanted is this loop's to
+            // know: one withdrawn meanwhile must not be renamed into place.  Everything written to
+            // them was queued there before this was.
+            std::optional<Error> failed;
+            if (result != DownloadResult::ok)
+                failed = _to_error(result, why);
+            for (auto& s : t->writing)
+                _save_complete(std::move(s), failed);
+            t->writing.clear();
 
-            // The transfer has stopped either way, so what a message can offer has changed -- and
-            // it is `absent` for every outcome this has to report itself.  A success that was kept
-            // has already said so from where the keeping happened; what is left here is a download
-            // that failed, one whose file could not be written, and one with nowhere to put it at
-            // all, none of which leave anything behind.
-            //
-            // A failure that says retrying is pointless is recorded first, so the same report
-            // carries why.  The report is still for every message showing the file even when the
-            // verdict is narrower: all of them were `fetching` while this ran.
-            //
-            // Before the waiters, so that one of them reading a message finds the settled state
-            // rather than the old one.
-            if (dir == cache::ATTACHMENT_DIR && !stored) {
-                if (auto verdict = _to_unavailable(result)) {
-                    auto c = core.database().conn();
-                    _mark_unavailable(c, claim, *verdict);
-                }
-                _emit_attachment_availability(claim.url);
-            }
-
-            auto answer = ok ? Expected<std::vector<std::byte>>{*entry.plain}
-                             : Expected<std::vector<std::byte>>{
-                                       unexpected{_to_error(result, std::move(why))}};
-            for (const auto& w : entry.waiting)
-                _report(w, answer);
+            _finish_transfer(std::move(t), result, std::move(why), cached_size, std::move(memory));
         });
     };
 
@@ -1282,18 +1536,20 @@ void Client::_fetch_cached(
     // every caller still holds it to report through.  The entry is new, so nobody else is on it --
     // nothing can join before this returns.
     try {
-        _download_decrypted(
+        t->abort = _download_decrypted(
                 target.remote,
                 target.kind,
-                std::move(on_plain),
+                std::move(on_data),
                 std::move(on_progress),
                 std::move(on_done));
     } catch (const std::exception& e) {
         log::warning(cat, "Could not start a fetch of {}: {}", target.remote.url, e.what());
-        auto dead = std::move(_in_flight.at(name));
         _in_flight.erase(name);
-        for (const auto& w : dead.waiting)
-            _report(w, Expected<std::vector<std::byte>>{unexpected{error_from(e)}});
+        auto error = error_from(e);
+        _serve_waiters(*t, unexpected{error});
+        // Nothing of theirs has been opened yet: a save's file is opened by its first bytes.
+        for (const auto& s : t->writing)
+            _saved(*s, unexpected{error});
         return;
     }
 
@@ -1306,6 +1562,217 @@ void Client::_fetch_cached(
     // `_download_decrypted` returns; its end has reported the state it left behind.
     if (target.dir == cache::ATTACHMENT_DIR && _in_flight.contains(name))
         _emit_attachment_availability(target.remote.url);
+}
+
+void Client::_finish_transfer(
+        std::shared_ptr<Transfer> t,
+        DownloadResult result,
+        std::string why,
+        std::optional<int64_t> cached_size,
+        std::optional<std::vector<std::byte>> memory) {
+    const auto& target = t->target;
+    bool ok = result == DownloadResult::ok;
+
+    // Recorded before anyone is told, since a waiter may go straight back to the cache.
+    bool told = cached_size && target.dir == cache::ATTACHMENT_DIR &&
+                _record_cached(target.remote.url, t->cache_file, *cached_size);
+
+    // The transfer has stopped either way, so what a message can offer has changed -- and it is
+    // `absent` for every outcome not already reported by the recording: a download that failed,
+    // one whose copy could not be kept, and one with nowhere to keep it at all, none of which leave
+    // anything behind.
+    //
+    // A failure that says retrying is pointless is recorded first, so the same report carries why.
+    // The report is still for every message showing the file even when the verdict is narrower:
+    // all of them were `fetching` while this ran.
+    //
+    // Before the waiters, so that one of them reading a message finds the settled state rather
+    // than the old one.
+    if (target.dir == cache::ATTACHMENT_DIR && !told) {
+        if (auto verdict = _to_unavailable(result)) {
+            auto c = core.database().conn();
+            _mark_unavailable(c, target.remote, *verdict);
+        }
+        _emit_attachment_availability(target.remote.url);
+    }
+
+    // Some waiters only wanted the file fetched -- an auto-download, a picture prefetch -- and have
+    // had all they asked for, whatever else happens: a refetch would not cache.
+    for (const auto& w : t->waiting)
+        if (!w.cb && w.ended)
+            w.ended();
+    std::erase_if(t->waiting, [](const Waiter& w) { return !w.cb; });
+
+    if (t->waiting.empty() && t->saves.empty())
+        return;
+
+    if (!ok) {
+        auto error = _to_error(result, std::move(why));
+        for (const auto& s : t->saves)
+            _saved(*s, unexpected{error});
+        return _serve_waiters(*t, unexpected{std::move(error)});
+    }
+
+    if (memory) {
+        for (const auto& s : t->saves)
+            _save_bytes(s, *memory);
+        return _serve_waiters(*t, std::move(*memory));
+    }
+    if (!cached_size)
+        return _refetch(std::move(t));
+
+    // A save that joined partway copies from the cache a chunk at a time, going back to fetching
+    // the file if that turns out not to be readable after all.
+    for (auto& s : t->saves)
+        _save_from_cache(std::move(s), t->cache_file, std::nullopt);
+    t->saves.clear();
+    if (t->waiting.empty())
+        return;
+
+    // Read back rather than kept as it arrived, so that nothing held the whole file while it
+    // downloaded -- and now only because somebody asked for it that way.  Decided here rather than
+    // on the disk loop because who is waiting is this loop's to know, and is final only now that
+    // the transfer is out of `_in_flight`.
+    _post_disk([this, t = std::move(t), key = _cache_encryption_key()]() mutable {
+        auto bytes = cache::read(t->cache_file, key);
+        call([this, t = std::move(t), bytes = std::move(bytes)]() mutable {
+            if (bytes)
+                _serve_waiters(*t, std::move(*bytes));
+            else
+                _refetch(std::move(t));
+        });
+    });
+}
+
+void Client::_serve_waiters(const Transfer& t, Expected<std::vector<std::byte>> answer) {
+    for (const auto& w : t.waiting) {
+        _report(w.cb, answer);
+        if (w.ended)
+            w.ended();
+    }
+}
+
+void Client::_refetch(std::shared_ptr<Transfer> t) {
+    // The download worked but the copy its waiters were to be served from did not: a cache that
+    // could not be written, or not read back.  Fetched again for them without one, which is the
+    // only way left to have the bytes -- their progress sees that as a second transfer, which it
+    // is.
+    auto again = std::make_shared<Transfer>();
+    again->target = t->target;
+    again->memory = std::make_unique<std::vector<std::byte>>();
+    again->waiting = std::move(t->waiting);
+    again->saves = std::move(t->saves);
+    auto name = _transfer_key(again->target.remote);
+    _start_transfer(std::move(name), std::move(again));
+}
+
+void Client::_cancel(uint64_t token, std::string_view why) {
+    if (token == 0)
+        return;
+    const Error cancelled{err::download_cancelled, std::string{why}};
+
+    std::shared_ptr<Save> save;
+    if (auto found = _saves.find(token); found != _saves.end())
+        save = found->second;
+
+    // Where it had got to, for a save taken off a transfer still running: its progress has not
+    // ended, and is owed an ending of its own.  One not on a transfer has already had its last
+    // report, or never had any.
+    std::optional<std::pair<int64_t, int64_t>> progressed;
+
+    for (auto it = _in_flight.begin(); it != _in_flight.end(); ++it) {
+        auto& t = *it->second;
+        if (save) {
+            if (std::erase(t.writing, save) + std::erase(t.saves, save) == 0)
+                continue;
+            progressed.emplace(t.done, t.total);
+            _abort_if_unwanted(it);
+            break;
+        }
+
+        auto w = std::ranges::find(t.waiting, token, &Waiter::token);
+        if (w == t.waiting.end())
+            continue;
+        auto waiter = std::move(*w);
+        t.waiting.erase(w);
+        if (waiter.progress)
+            waiter.progress(t.done, t.total, unexpected{cancelled});
+        _report(waiter.cb, Expected<std::vector<std::byte>>{unexpected{cancelled}});
+        _abort_if_unwanted(it);
+        if (waiter.ended)
+            waiter.ended();
+        return;
+    }
+
+    if (!save)
+        return;
+
+    // Settled on the disk loop, where the save's file is: if it has not finished by the time this
+    // gets there, it never will, and what it had written goes.  If it has, it has already been
+    // reported, and was not cancelled after all.
+    save->cancelled = true;
+    _post_disk([this, save, cancelled, progressed] {
+        if (save->settled)
+            return;
+        save->settled = true;
+        _save_discard(*save);
+        call([this, save, cancelled, progressed] {
+            if (progressed && save->report)
+                save->report(progressed->first, progressed->second, unexpected{cancelled});
+            _saved(*save, unexpected{cancelled});
+        });
+    });
+}
+
+void Client::_withdraw_orphaned_requests() {
+    if (_in_flight.empty() && _saves.empty())
+        return;
+
+    auto c = core.database().conn();
+    auto gone = [&](int64_t message_id, size_t index) {
+        return !c.prepared_get<int64_t>(
+                "SELECT EXISTS(SELECT 1 FROM message_attachments WHERE message = ? AND idx = ?)",
+                message_id,
+                static_cast<int64_t>(index));
+    };
+
+    // Collected first: withdrawing one can end its transfer, which takes it out of `_in_flight`.
+    std::vector<uint64_t> tokens;
+    for (const auto& [name, t] : _in_flight)
+        for (const auto& w : t->waiting)
+            if (w.token && w.message_id && gone(*w.message_id, w.index))
+                tokens.push_back(w.token);
+    for (const auto& [token, s] : _saves)
+        if (!s->cancelled && gone(s->message_id, s->index))
+            tokens.push_back(token);
+
+    for (auto token : tokens)
+        _cancel(token, "the attachment was deleted");
+}
+
+bool Client::_abort_if_unwanted(std::map<std::string, std::shared_ptr<Transfer>>::iterator found) {
+    auto t = found->second;
+    if (t->wanted())
+        return false;
+
+    // Out of the registry first, so that its own ending -- whenever the network gets round to it --
+    // finds itself replaced and does nothing, and a request for the same file from here on starts
+    // afresh rather than joining one on its way out.
+    _in_flight.erase(found);
+    if (t->abort)
+        t->abort->store(true);
+
+    // What it was keeping goes now, on the disk loop where it is written, rather than whenever the
+    // network lets go of the transfer.  A chunk still on its way there after this finds it failed.
+    _post_disk([t] {
+        t->cache.reset();
+        t->cache_failed = true;
+        t->memory.reset();
+    });
+
+    if (t->target.dir == cache::ATTACHMENT_DIR)
+        _emit_attachment_availability(t->target.remote.url);
+    return true;
 }
 
 void Client::set_gallery(int64_t message_id, bool gallery, result_function<bool> cb) {
@@ -1435,7 +1902,7 @@ void Client::message(int64_t id, result_function<std::optional<Message>> cb) {
     _async([this, id] { return _message(id); }, std::move(cb));
 }
 
-void Client::save_attachment(
+uint64_t Client::save_attachment(
         int64_t message_id,
         size_t index,
         std::filesystem::path dest,
@@ -1454,9 +1921,11 @@ void Client::save_attachment(
     // Not _async: what that reports is the *start* of the transfer, and the answer a caller wants
     // is whether the file arrived, which is minutes away.  So the callback is carried down to the
     // download's own completion, and only the failures that happen before it starts come back here.
+    auto token = _next_token++;
     call([this,
           message_id,
           index,
+          token,
           dest = std::move(dest),
           on_progress = std::move(on_progress),
           cb,
@@ -1466,6 +1935,7 @@ void Client::save_attachment(
             _save_attachment(
                     message_id,
                     index,
+                    token,
                     std::move(dest),
                     std::move(on_progress),
                     cb,
@@ -1476,6 +1946,7 @@ void Client::save_attachment(
             _fail<std::filesystem::path>(cb, error_from(e));
         }
     });
+    return token;
 }
 
 // -- Conversations ----------------------------------------------------------------------------
@@ -1760,7 +2231,7 @@ AnyConversation Client::_create_conversation(const ConversationId& id) {
     bool created, contacted = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
         created = ensure_conversation(c, id, clock_now_ms()).created;
 
         // Opening a conversation with someone makes them an approved contact: choosing to write to
@@ -1784,7 +2255,7 @@ void Client::_mark_read(const ConversationId& id, std::optional<sys_ms> up_to) {
     int changed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -1836,7 +2307,7 @@ void Client::_set_marked_unread(const ConversationId& id, bool unread) {
     int changed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -1862,7 +2333,7 @@ void Client::_set_conversation_setting(const ConversationId& id, std::string_vie
     int changed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -1898,7 +2369,7 @@ void Client::_set_expiry(
     int changed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -1924,7 +2395,7 @@ void Client::_set_auto_download(const ConversationId& id, AutoDownload mode) {
     int changed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -1961,7 +2432,7 @@ void Client::_set_nickname(const ConversationId& id, std::string_view nickname) 
     bool changed = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto account = identity_id(c, id);
 
@@ -1988,7 +2459,7 @@ void Client::_set_priority(const ConversationId& id, int priority) {
     bool request = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         // Not ensure_conversation() for one that already exists: that moves last_activity forward,
         // and pinning is not activity -- it would reorder the very list it is being used to order.
@@ -2017,7 +2488,7 @@ void Client::_set_blocked(const ConversationId& id, bool blocked) {
     bool changed = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
         auto account = identity_id(c, id);
 
         // Blocking someone we have never made a contact of is the ordinary case rather than the
@@ -2043,7 +2514,7 @@ void Client::_clear_messages(const ConversationId& id) {
     bool emptied = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -2058,6 +2529,7 @@ void Client::_clear_messages(const ConversationId& id) {
     _set_delete_before(id, now);
 
     if (emptied) {
+        _withdraw_orphaned_requests();
         _emit_history_replaced(id);
         _touch(id);
     }
@@ -2068,7 +2540,7 @@ void Client::_delete_conversation(const ConversationId& id, bool keep_messages) 
     bool emptied = false, hidden = false, request = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -2095,8 +2567,10 @@ void Client::_delete_conversation(const ConversationId& id, bool keep_messages) 
         _set_delete_before(id, now);
     _sync_conversation(id);
 
-    if (emptied)
+    if (emptied) {
+        _withdraw_orphaned_requests();
         _emit_history_replaced(id);
+    }
     if (hidden)
         _report_lists_replaced(!request, request);
 }
@@ -2105,7 +2579,7 @@ void Client::_delete_contact(const ConversationId& id) {
     bool removed = false, was_request = false, was_listed = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto account = c.prepared_maybe_get<int64_t>(
                 "SELECT id FROM accounts WHERE session_id = ?", id.session_id());
@@ -2140,6 +2614,7 @@ void Client::_delete_contact(const ConversationId& id) {
     _sync_contact(id);
 
     if (removed) {
+        _withdraw_orphaned_requests();
         _emit_conversation_removed(id);
         // The one list it was in.  A conversation is in exactly one of the two, so deleting it
         // outright leaves the other exactly as it was.
@@ -2151,7 +2626,7 @@ bool Client::_delete_message(int64_t message_id, Deletion how_far) {
     std::optional<ConversationId> convo;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo_row = c.prepared_maybe_get<int64_t>(
                 "SELECT conversation FROM messages WHERE id = ?", message_id);
@@ -2195,6 +2670,8 @@ bool Client::_delete_message(int64_t message_id, Deletion how_far) {
         convo = conversation_id_at(c, *convo_row);
         tx.commit();
     }
+
+    _withdraw_orphaned_requests();
 
     if (convo) {
         // Updated rather than removed: the row is still there, and a client that draws a gap where
@@ -2399,6 +2876,7 @@ void Client::_auto_download(const ConversationId& convo_id, int64_t message_id) 
 
     auto max_size = core.globals.get_integer(AUTO_DL_MAX_KEY);
 
+    std::vector<PendingAutoDownload> wanted;
     for (const auto& a : msg->attachments) {
         if (!auto_download_wants(*mode, a.content_type))
             continue;
@@ -2409,33 +2887,72 @@ void Client::_auto_download(const ConversationId& convo_id, int64_t message_id) 
         if (max_size && (!a.size || *a.size > *max_size))
             continue;
 
+        wanted.push_back({convo_id, message_id, a.index});
+    }
+
+    // Ahead of everything already waiting, and in the message's own order among themselves.
+    _auto_pending.insert(_auto_pending.begin(), wanted.begin(), wanted.end());
+    _pump_auto_downloads();
+}
+
+void Client::_pump_auto_downloads() {
+    if (_auto_pumping)
+        return;
+    _auto_pumping = true;
+
+    size_t limit = 1;
+    if (auto net = core.network();
+        net && net->router() != network::opt::router::Type::onion_requests)
+        limit = get_concurrency(core.globals).value_or(DEFAULT_AUTO_DL_CONCURRENCY);
+
+    while (_auto_running < limit && !_auto_pending.empty()) {
+        auto next = std::move(_auto_pending.front());
+        _auto_pending.pop_front();
+
+        // Once, however it ends: an ending that throws after the waiter has already been told would
+        // otherwise give back its slot twice.
+        ++_auto_running;
+        auto ended = [this, once = std::make_shared<bool>(false)] {
+            if (std::exchange(*once, true))
+                return;
+            --_auto_running;
+            _pump_auto_downloads();
+        };
+
         // No completion handler: this wants the cache filled and nothing else, and whoever
         // eventually displays the file joins the transfer rather than starting another.
         //
         // Progress is broadcast rather than handed to a caller, because there is no caller: a
         // display that opens midway learns from this that something is already happening.
         //
-        // Best effort, per attachment.  This runs while the message is still arriving and before it
-        // is announced, so a pointer that cannot be fetched -- one with no url, say -- must cost
-        // that one attachment, not the rest of them and not the announcement.
+        // Best effort, per attachment.  This can run while the message is still arriving and before
+        // it is announced, so a pointer that cannot be fetched -- one with no url, say, or one
+        // deleted while it waited -- must cost that one attachment, not the rest of the queue and
+        // not the announcement.
         try {
             _attachment_data(
-                    message_id,
-                    a.index,
-                    [this, convo_id](const AttachmentProgress& p) {
+                    next.message_id,
+                    next.index,
+                    true,
+                    _next_token++,
+                    [this, convo = next.convo](const AttachmentProgress& p) {
                         if (const auto& h = _cbs->attachment_progress)
-                            h(convo_id, p);
+                            h(convo, p);
                     },
-                    nullptr);
+                    nullptr,
+                    ended);
         } catch (const std::exception& e) {
             log::warning(
                     cat,
                     "Not auto-downloading attachment {} of message {}: {}",
-                    a.index,
-                    message_id,
+                    next.index,
+                    next.message_id,
                     e.what());
+            ended();
         }
     }
+
+    _auto_pumping = false;
 }
 
 bool Client::_set_gallery(int64_t message_id, bool gallery) {
@@ -2472,7 +2989,7 @@ bool Client::_purge_deleted_message(int64_t message_id) {
     std::optional<ConversationId> convo;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo_row = c.prepared_maybe_get<int64_t>(
                 "SELECT conversation FROM messages WHERE id = ? AND deleted IS NOT NULL",
@@ -2496,7 +3013,7 @@ size_t Client::_purge_deleted(const ConversationId& id) {
     int removed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -2795,9 +3312,8 @@ void Client::_fetch_picture(const ConversationId& id, std::string url, std::vect
                 {{url, std::move(key), {}, std::nullopt},
                  DownloadKind::display_pic,
                  cache::PROFILE_DIR},
-                std::move(progress),
-                nullptr,
-                _store_picture(url));
+                true,
+                {.progress = std::move(progress)});
     } catch (const std::exception& e) {
         log::warning(cat, "Could not fetch a profile picture: {}", e.what());
     }
@@ -2813,8 +3329,10 @@ void Client::_drop_unused_picture(sqlite::Connection& c, std::string_view url) {
                 "SELECT EXISTS(SELECT 1 FROM accounts WHERE profile_pic_url = ?)", url))
         return;
 
-    std::error_code ec;
-    std::filesystem::remove(_cache_path(cache::PROFILE_DIR, url), ec);
+    _post_disk([file = _cache_path(cache::PROFILE_DIR, url)] {
+        std::error_code ec;
+        std::filesystem::remove(file, ec);
+    });
 }
 
 void Client::_reconcile_contacts() {
@@ -2829,7 +3347,7 @@ void Client::_reconcile_contacts() {
 
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         // Ordered rather than a vector because the deletion pass below looks every stored contact
         // up in it: scanning instead would make a routine merge quadratic in the size of the
@@ -3003,6 +3521,9 @@ WHERE id = ?1
         tx.commit();
     }
 
+    if (!cleared.empty() || !removed.empty())
+        _withdraw_orphaned_requests();
+
     for (const auto& id : added)
         _emit_conversation_added(id);
     for (const auto& id : cleared)
@@ -3037,7 +3558,7 @@ void Client::_reconcile_convo_volatile() {
     std::vector<ConversationId> touched;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         for (auto it = volatiles.begin_1to1(); it != volatiles.end(); ++it) {
             const auto& entry = *it;
@@ -3302,7 +3823,7 @@ void Client::_reconcile_user_profile() {
 
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         std::optional<std::string_view> pic_url;
         std::optional<std::span<const std::byte>> pic_key;
@@ -3362,6 +3883,9 @@ WHERE id = ?1 AND (exp_mode, exp_timer) IS NOT (?2, ?3)
 
         tx.commit();
     }
+
+    if (history_changed)
+        _withdraw_orphaned_requests();
 
     if (created)
         _emit_conversation_added(me);
@@ -3844,7 +4368,7 @@ Client::CacheStatus Client::_attachment_availability(
     prefix += '\0';
     if (auto found = _in_flight.lower_bound(prefix);
         found != _in_flight.end() && found->first.starts_with(prefix))
-        return {AttachmentAvailability::fetching, found->second.done, found->second.total};
+        return {AttachmentAvailability::fetching, found->second->done, found->second->total};
 
     // No lookup for the rest: the reference came back with the row, and the foreign key is what
     // makes it trustworthy -- an entry cannot go without taking this with it.
@@ -3978,7 +4502,7 @@ int64_t Client::_send_message(const ConversationId& id, const OutgoingMessage& m
     int64_t client_id;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = ensure_conversation(c, id, now);
         created = convo.created;
@@ -4154,7 +4678,7 @@ int64_t Client::_send_message(
     int64_t client_id;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = ensure_conversation(c, id, now);
         created = convo.created;
@@ -4250,18 +4774,43 @@ void Client::_upload_next(int64_t client_id, Conversation::upload_progress on_up
         return _finish_attachment_send(client_id);
 
     auto [idx, path] = *next;
-    auto index = static_cast<size_t>(idx);
 
     // Checked here rather than only at send_message, because that check is on the other side of
     // however long the message sat waiting: a file present when it was attached can be gone by the
     // time its turn comes, and a message resumed in a later run may have been waiting for days.
-    std::error_code ec;
-    auto plaintext_size = static_cast<int64_t>(std::filesystem::file_size(path, ec));
-    if (ec || !std::filesystem::is_regular_file(path, ec) || ec) {
+    // On the disk loop, and carried on with back here.
+    _post_disk([this,
+                client_id,
+                index = static_cast<size_t>(idx),
+                path = std::move(path),
+                on_upload = std::move(on_upload)]() mutable {
+        std::optional<int64_t> size;
+        std::error_code ec;
+        auto found = std::filesystem::file_size(path, ec);
+        if (!ec && std::filesystem::is_regular_file(path, ec) && !ec)
+            size = static_cast<int64_t>(found);
+        call([this,
+              client_id,
+              index,
+              path = std::move(path),
+              size,
+              on_upload = std::move(on_upload)]() mutable {
+            _upload_one(client_id, index, std::move(path), size, std::move(on_upload));
+        });
+    });
+}
+
+void Client::_upload_one(
+        int64_t client_id,
+        size_t index,
+        std::string path,
+        std::optional<int64_t> file_size,
+        Conversation::upload_progress on_upload) {
+    if (!file_size) {
         log::warning(
                 cat,
                 "Attachment {} of message {} is gone ({}); the message cannot be sent",
-                idx,
+                index,
                 client_id,
                 path);
         if (on_upload)
@@ -4272,13 +4821,14 @@ void Client::_upload_next(int64_t client_id, Conversation::upload_progress on_up
                     unexpected{Error{err::attachment_file_missing, "{} is gone"_format(path)}});
         return _fail_attachment_send(client_id, /*permanent=*/true);
     }
+    auto plaintext_size = *file_size;
 
     auto net = core.network();
     if (!net) {
         log::warning(
                 cat,
                 "Cannot upload attachment {} of message {}: no network is attached",
-                idx,
+                index,
                 client_id);
         if (on_upload)
             on_upload(
@@ -4392,7 +4942,7 @@ void Client::_upload_next(int64_t client_id, Conversation::upload_progress on_up
         });
     };
 
-    log::debug(cat, "Uploading attachment {} of message {}: {}", idx, client_id, path);
+    log::debug(cat, "Uploading attachment {} of message {}: {}", index, client_id, path);
     // Bound to a name: the accessor's span is deliberately unavailable on a temporary.
     auto seed_access = core.globals.account_seed();
     net->upload_file(std::move(req), seed_access.seed());
@@ -4503,7 +5053,7 @@ static std::filesystem::path open_partial(std::ofstream& out, const std::filesys
     throw std::runtime_error{"Cannot write a scratch file beside {}"_format(dest.string())};
 }
 
-// `name (2).pdf`, not `name.pdf (2)`: only the first still opens on a double-click, and it is what
+// `name (1).pdf`, not `name.pdf (1)`: only the first still opens on a double-click, and it is what
 // browsers and both desktop file managers produce.
 static std::filesystem::path numbered(const std::filesystem::path& dest, int n) {
     auto out = dest;
@@ -4537,14 +5087,16 @@ static std::filesystem::path final_path(const std::filesystem::path& dest, bool 
 Client::transfer_progress Client::_attachment_progress(
         int64_t message_id,
         size_t index,
+        uint64_t token,
         std::function<void(const AttachmentProgress&)> on_progress) {
     if (!on_progress)
         return {};
-    return _dispatch_progress(
-            [on_progress = std::move(on_progress), message_id, index](
-                    int64_t done, int64_t total, std::optional<Expected<void>> r) {
-                on_progress(AttachmentProgress{message_id, index, done, total, std::move(r)});
-            });
+    return _dispatch_progress([on_progress = std::move(on_progress), message_id, index, token](
+                                      int64_t done,
+                                      int64_t total,
+                                      std::optional<Expected<void>> r) {
+        on_progress(AttachmentProgress{message_id, index, token, done, total, std::move(r)});
+    });
 }
 
 Client::transfer_progress Client::_dispatch_progress(transfer_progress cb) {
@@ -4558,10 +5110,10 @@ Client::transfer_progress Client::_dispatch_progress(transfer_progress cb) {
     };
 }
 
-void Client::_download_decrypted(
+std::shared_ptr<std::atomic<bool>> Client::_download_decrypted(
         RemoteFile remote,
         DownloadKind kind,
-        std::function<void(std::span<const std::byte>)> on_plain,
+        std::function<void(std::span<const std::byte>, size_t)> on_data,
         transfer_progress on_progress,
         std::function<void(DownloadResult, std::string)> on_done) {
     auto& [url, key, digest, claimed_size] = remote;
@@ -4576,8 +5128,10 @@ void Client::_download_decrypted(
     // Before the network, because a claim that could never be fetched is the file's fault whether
     // or not we are online, and a verdict is worth more to the user than "try again later".
     auto info = network::file_server::parse_download_url(url);
-    if (!info)
-        return end_failed(DownloadResult::unreadable, "{} is not a download url"_format(url));
+    if (!info) {
+        end_failed(DownloadResult::unreadable, "{} is not a download url"_format(url));
+        return nullptr;
+    }
 
     // The whole of the format question, answered once.  See the header for why `kind` is passed in
     // rather than guessed from how long the key happens to be.
@@ -4609,8 +5163,10 @@ void Client::_download_decrypted(
                         "we have {}"_format(url, attachment::LEGACY_DIGEST_SIZE, digest.size());
             break;
     }
-    if (unusable)
-        return end_failed(DownloadResult::unreadable, std::move(*unusable));
+    if (unusable) {
+        end_failed(DownloadResult::unreadable, std::move(*unusable));
+        return nullptr;
+    }
 
     auto net = core.network();
     if (!net)
@@ -4618,7 +5174,7 @@ void Client::_download_decrypted(
 
     bool stream = scheme == Scheme::stream;
 
-    // Shared with the network's thread, where every callback below runs.  The stream case hands
+    // Shared with the disk loop, where every callback below runs.  The stream case hands
     // plaintext over as it decrypts and so never holds the whole thing; the legacy case has to
     // accumulate, because its MAC and digest cover the whole ciphertext and neither can be checked
     // until all of it is here.
@@ -4646,9 +5202,9 @@ void Client::_download_decrypted(
 
     // The consumer's failures kept apart from the file's: a sink that cannot take the bytes is our
     // problem, and recording it as the file's would tell every message quoting it not to try again.
-    auto deliver = [on_plain, give_up](std::span<const std::byte> plain) {
+    auto deliver = [on_data, give_up](std::span<const std::byte> plain, size_t padding) {
         try {
-            on_plain(plain);
+            on_data(plain, padding);
         } catch (const std::exception& e) {
             give_up(DownloadResult::failed, e.what());
         }
@@ -4673,7 +5229,8 @@ void Client::_download_decrypted(
                                 DownloadResult::unreadable,
                                 "attachment is longer than the {}B its sender said"_format(
                                         *claimed_size));
-                    deliver(plain);
+                    // Known by now: the decryptor strips the padding before any data comes out.
+                    deliver(plain, *state->decryptor->padding());
                 });
     }
 
@@ -4687,8 +5244,9 @@ void Client::_download_decrypted(
     req.request_timeout = ATTACHMENT_REQUEST_TIMEOUT;
     req.overall_timeout = ATTACHMENT_OVERALL_TIMEOUT;
 
-    req.on_data = [state, stream, on_progress, throttle, give_up](
-                          const network::file_metadata& meta, std::span<const std::byte> data) {
+    auto handle_data = [state, stream, on_progress, throttle, give_up](
+                               const network::file_metadata& meta,
+                               std::span<const std::byte> data) {
         // Needed even though giving up cancels: a chunk already in flight arrives either way.
         if (state->failure)
             return;
@@ -4715,16 +5273,17 @@ void Client::_download_decrypted(
         }
     };
 
-    req.on_complete = [state,
-                       scheme,
-                       deliver,
-                       on_progress,
-                       on_done,
-                       end_failed,
-                       key = std::move(key),
-                       digest = std::move(digest),
-                       claimed_size](
-                              std::variant<network::file_metadata, int16_t> result, bool timeout) {
+    auto handle_complete = [state,
+                            scheme,
+                            deliver,
+                            on_progress,
+                            on_done,
+                            end_failed,
+                            key = std::move(key),
+                            digest = std::move(digest),
+                            claimed_size](
+                                   std::variant<network::file_metadata, int16_t> result,
+                                   bool timeout) {
         auto gave_up = [&] {
             auto& [result, why] = *state->failure;
             end_failed(result, std::move(why));
@@ -4748,6 +5307,8 @@ void Client::_download_decrypted(
                 case Scheme::stream:
                     if (!state->decryptor->finalize())
                         throw std::runtime_error{"download ended mid-stream"};
+                    if (!state->decryptor->padding())
+                        throw std::runtime_error{"download is all padding, with no end to it"};
                     // The claim is exact or it is wrong: the file server is told the precise byte
                     // count at upload and refuses anything else, so there is no reason to accept a
                     // file that turns out to be a different size from the one described.  Nothing
@@ -4786,10 +5347,14 @@ void Client::_download_decrypted(
             return end_failed(DownloadResult::unreadable, e.what());
         }
 
+        // A stream file with no data at all never reached its consumers, and must still reach them
+        // once: an empty file is a file, and a copy of it is made on its first delivery.
         if (scheme == Scheme::plaintext)
-            deliver(state->buffered);
+            deliver(state->buffered, attachment::encrypted_padding(state->buffered.size()));
         else if (scheme != Scheme::stream)
-            deliver(decrypted);
+            deliver(decrypted, attachment::encrypted_padding(decrypted.size()));
+        else if (state->delivered == 0 && !state->failure)
+            deliver({}, *state->decryptor->padding());
 
         // Again, because finalize() hands the stream's last bytes over and the consumer may fail to
         // take them, as may a consumer handed a legacy file whole.
@@ -4801,7 +5366,34 @@ void Client::_download_decrypted(
         on_done(DownloadResult::ok, {});
     };
 
+    // The network's loop does no more than copy each chunk -- it has to, since the span is the
+    // transport's buffer -- and hand it on: everything above runs on the disk loop, one job at a
+    // time and in arrival order, so the state it shares needs no lock.  The completion goes the
+    // same way, which is what puts it after the last chunk.
+    //
+    // The network can deliver after this Client has begun going away, until `core` tears it down;
+    // a post then finds the queue stopped and is dropped.
+    req.on_data = [this,
+                   cancel,
+                   handle = std::make_shared<decltype(handle_data)>(std::move(handle_data))](
+                          const network::file_metadata& meta, std::span<const std::byte> data) {
+        if (cancel->load())
+            return;
+        _post_disk([handle, meta, bytes = std::vector<std::byte>(data.begin(), data.end())] {
+            (*handle)(meta, bytes);
+        });
+    };
+    req.on_complete =
+            [this,
+             handle = std::make_shared<decltype(handle_complete)>(std::move(handle_complete))](
+                    std::variant<network::file_metadata, int16_t> result, bool timeout) {
+                _post_disk([handle, result = std::move(result), timeout]() mutable {
+                    (*handle)(std::move(result), timeout);
+                });
+            };
+
     net->download(std::move(req));
+    return cancel;
 }
 
 Error Client::_to_error(DownloadResult result, std::string why) {
@@ -4921,16 +5513,10 @@ void Client::_cache_outgoing_attachment(int64_t client_id, size_t index, const s
     if (auto max_size = core.globals.get_integer(AUTO_DL_MAX_KEY); max_size && size > *max_size)
         return;
 
-    // The fixed one bounds the loop, and applies whether or not the other is set.  What follows
-    // reads and encrypts the whole file here, as caching a download does -- but a download is
-    // refused past this size and an upload is not, so without it the cost of sending a large file
-    // would be unbounded.  The price is that such a file cannot be drawn from the sender's own
-    // transcript, which is where it already stands for every recipient: none of them can fetch it.
-    //
-    // TODO: copy it in chunks across turns of the loop, through a cache writer that encrypts as it
-    // goes, and bound it by a setting for what a requested file may cost the cache rather than by
-    // this fixed limit.  The same whole-file read happens wherever the cache is filled or read.
-    if (size > static_cast<int64_t>(attachment::MAX_REGULAR_SIZE))
+    // And the one a requested file is held to, since that is what this copy stands in for: a
+    // sender drawing their own message would otherwise have fetched it back and kept it under the
+    // same rule.
+    if (!_caches_requested(size))
         return;
 
     // Not on `Attachment`, deliberately: where a file is locally is the application's business, and
@@ -4941,62 +5527,66 @@ void Client::_cache_outgoing_attachment(int64_t client_id, size_t index, const s
             static_cast<int64_t>(index));
     if (!stored)
         return;
-    std::filesystem::path path{*stored};
 
-    // Re-read rather than kept from the upload, which streams the file rather than holding it.
-    // Best effort throughout: a file moved or replaced between the upload finishing and this leaves
-    // nothing cached, which costs a download if the message is ever drawn again and nothing else.
-    //
-    // The length has to still match what was uploaded.  A url names one particular encrypted body,
-    // so storing something else under it would leave the cache answering for that url with bytes
-    // that are not the ones it identifies -- and unlike a missing cache entry, that is wrong rather
-    // than merely slow.
-    std::error_code ec;
-    if (std::filesystem::file_size(path, ec) != static_cast<uintmax_t>(size) || ec) {
-        log::debug(
-                cat,
-                "Not caching attachment of message {}: {} is no longer the file that was uploaded",
+    // Copied on the disk loop, a chunk at a time, and recorded back here.  Re-read rather than kept
+    // from the upload, which streams the file rather than holding it.  Best effort throughout: a
+    // file moved or replaced between the upload finishing and this leaves nothing cached, which
+    // costs a download if the message is ever drawn again and nothing else.
+    _post_disk([this,
                 client_id,
-                path.string());
-        return;
-    }
+                url,
+                size,
+                source = std::filesystem::path{*stored},
+                file = _cache_path(cache::ATTACHMENT_DIR, url),
+                key = _cache_encryption_key()] {
+        // The length has to still match what was uploaded.  A url names one particular encrypted
+        // body, so storing something else under it would leave the cache answering for that url
+        // with bytes that are not the ones it identifies -- and unlike a missing cache entry, that
+        // is wrong rather than merely slow.
+        std::error_code ec;
+        if (std::filesystem::file_size(source, ec) != static_cast<uintmax_t>(size) || ec) {
+            log::debug(
+                    cat,
+                    "Not caching attachment of message {}: {} is no longer the file that was "
+                    "uploaded",
+                    client_id,
+                    source.string());
+            return;
+        }
 
-    std::vector<std::byte> data(static_cast<size_t>(size));
-    std::ifstream in{path, std::ios::binary};
-    in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
-    if (!in) {
-        log::debug(
-                cat,
-                "Not caching attachment of message {}: {} could not be read back",
-                client_id,
-                path.string());
-        return;
-    }
+        int64_t on_disk;
+        try {
+            std::ifstream in;
+            in.exceptions(std::ios::badbit);
+            in.open(source, std::ios::binary);
+            cache::Writer w{file, key, attachment::encrypted_padding(static_cast<size_t>(size))};
+            std::vector<std::byte> chunk(attachment::ENCRYPT_CHUNK_SIZE);
+            int64_t copied = 0;
+            while (copied < size) {
+                in.read(reinterpret_cast<char*>(chunk.data()),
+                        static_cast<std::streamsize>(chunk.size()));
+                auto got = static_cast<size_t>(in.gcount());
+                if (got == 0)
+                    throw std::runtime_error{"{} ended early"_format(source.string())};
+                w.write(std::span{chunk}.first(got));
+                copied += static_cast<int64_t>(got);
+            }
+            w.commit();
+            on_disk = static_cast<int64_t>(std::filesystem::file_size(file));
+        } catch (const std::exception& e) {
+            // A cache that cannot be written is a cache that misses next time, which is not worth
+            // anything more than a note.
+            log::warning(cat, "Could not cache attachment of message {}: {}", client_id, e.what());
+            return;
+        }
 
-    _cache_attachment(url, _cache_encryption_key(), data);
+        call([this, url, file, on_disk] { _record_cached(url, file, on_disk); });
+    });
 }
 
-bool Client::_cache_attachment(
-        const std::string& url,
-        std::span<const std::byte, 32> key,
-        std::span<const std::byte> data) {
-    auto file = _cache_path(cache::ATTACHMENT_DIR, url);
-    try {
-        cache::write(file, key, data);
-    } catch (const std::exception& e) {
-        // A cache that cannot be written is a cache that misses next time, which is not worth
-        // failing the caller's fetch over.
-        log::warning(cat, "Could not cache an attachment: {}", e.what());
-        return false;
-    }
-
-    // Recorded after the file exists, so a row never describes something that is not there.  The
-    // size is what the file actually takes, read back rather than computed: the cache limit is a
-    // limit on disk, and padding and framing are part of what it costs.
-    std::error_code ec;
-    auto on_disk = std::filesystem::file_size(file, ec);
-    if (ec)
-        return false;
+bool Client::_record_cached(
+        const std::string& url, const std::filesystem::path& file, int64_t on_disk) {
+    // Recorded after the file exists, so a row never describes something that is not there.
 
     auto c = core.database().conn();
     auto name = file.filename().string();
@@ -5006,7 +5596,7 @@ bool Client::_cache_attachment(
         ON CONFLICT (name) DO UPDATE SET size = ?2, last_used = ?3
     )",
             name,
-            static_cast<int64_t>(on_disk),
+            on_disk,
             epoch_ms(clock_now_ms()));
 
     auto id = c.prepared_get<int64_t>("SELECT id FROM attachment_cache WHERE name = ?", name);
@@ -5089,9 +5679,15 @@ std::vector<int64_t> Client::_drop_cached(
 
     // The row is an index, not the truth: a file that is already gone still costs a row, and
     // removing it is as much progress as unlinking one.
-    std::error_code ec;
-    std::filesystem::remove(_cache_dir / cache::ATTACHMENT_DIR / name, ec);
     c.prepared_exec("DELETE FROM attachment_cache WHERE id = ?", id);
+
+    // The file goes after the row, on the disk loop.  In order there, so a read of it posted while
+    // the row still stood finishes first, and a download of the same file started after this
+    // commits after it.
+    _post_disk([file = _cache_dir / cache::ATTACHMENT_DIR / name] {
+        std::error_code ec;
+        std::filesystem::remove(file, ec);
+    });
 
     return showing;
 }
@@ -5114,166 +5710,212 @@ void Client::_touch_cached(int64_t id) {
 void Client::_save_attachment(
         int64_t message_id,
         size_t index,
+        uint64_t token,
         std::filesystem::path dest,
         std::function<void(const AttachmentProgress&)> on_progress,
         result_function<std::filesystem::path> cb,
         bool notify_sender,
         bool replace) {
 
-    auto remote = _remote_file(message_id, index);
-    const auto& url = remote.url;
-
-    // Written to a temporary name beside the destination and renamed only once it is whole, so an
-    // interrupted save leaves nothing that looks finished.
-    struct SaveState {
-        std::filesystem::path dest, partial, saved_to;
-        std::ofstream out;
-    };
-    auto state = std::make_shared<SaveState>();
-    state->dest = std::move(dest);
-    state->partial = open_partial(state->out, state->dest);
-
-    auto report = _attachment_progress(message_id, index, std::move(on_progress));
-
-    auto finish = [this, state, message_id, index, notify_sender, replace, cb](
-                          Expected<void> fetched) {
-        auto fail = [&](Error why) {
-            state->out.close();
-            std::error_code ec;
-            std::filesystem::remove(state->partial, ec);
-            _fail<std::filesystem::path>(cb, std::move(why));
-        };
-
-        if (!fetched)
-            return fail(std::move(fetched).error());
-
-        try {
-            state->out.close();
-            if (!state->out)
-                throw std::runtime_error{"writing {} failed"_format(state->partial.string())};
-
-            // Only now does it get a name a user would recognise -- and only now can it be
-            // known whether the one they asked for is still free, which is why the choice
-            // is here rather than where the caller made it.
-            state->saved_to = final_path(state->dest, replace);
-            std::filesystem::rename(state->partial, state->saved_to);
-        } catch (const std::exception& e) {
-            return fail(Error{err::save_failed, e.what()});
-        }
-
-        _report(cb, Expected<std::filesystem::path>{state->saved_to});
-
-        // Both of these say the same thing -- that the recipient now has the file -- one to
-        // ourselves and one to the sender, and neither is true until it is on disk under
-        // its final name, which is why they are here rather than anywhere earlier.
-        // Recording it does not depend on telling them: a caller who saved privately still
-        // gets to see that they did.
-        //
-        // Both are also only true when the recipient is *us*.  `saved_at` says the
-        // recipient saved it, which is what lets a sender read it as "the file reached a
-        // person rather than a file server", so stamping it for our own save of something
-        // we sent would claim they have a file they may never have opened.  A note to self
-        // is exempt: there the recipient is us, so saving it really is the recipient
-        // saving it.
-        call([this, message_id, index, notify_sender] {
-            if (_saved_by_recipient(message_id))
-                _record_saved(message_id, index, clock_now_ms());
-
-            // The account's own answer overrides the caller's, and only downwards.
-            // Somebody who has said not to report their saves has said it for every client
-            // on the account, and a client that forgot to ask -- or never grew the setting
-            // -- would otherwise report them anyway.  A caller passing false is still
-            // respected: this can refuse a notification, never require one.
-            if (notify_sender && core.configs.user_profile().get_notify_media_saved())
-                _notify_media_saved(message_id, index);
-        });
-    };
-
-    // Writes what was fetched to the destination and finishes as a completed download would, for
-    // the two paths that hand over a whole buffer rather than streaming into it.  Neither records a
-    // verdict: a cache hit did not fail, and a transfer this joined records its own.
-    auto write_and_finish = [state, finish](Expected<std::vector<std::byte>> fetched) {
-        if (!fetched)
-            return finish(unexpected{std::move(fetched).error()});
-        state->out.write(
-                reinterpret_cast<const char*>(fetched->data()),
-                static_cast<std::streamsize>(fetched->size()));
-        finish({});
-    };
+    auto s = std::make_shared<Save>();
+    s->token = token;
+    s->remote = _remote_file(message_id, index);
+    s->message_id = message_id;
+    s->index = index;
+    s->dest = std::move(dest);
+    s->replace = replace;
+    s->notify_sender = notify_sender;
+    s->cb = std::move(cb);
+    s->report = _attachment_progress(message_id, index, token, std::move(on_progress));
+    _saves.emplace(token, s);
 
     // Served from the cache when it is there.  Indistinguishable to everyone else: the file lands
     // where it was asked to, and the sender is still told we saved it, because being able to skip
     // the download is our business and says nothing about whether the recipient has the file.
     //
     // No progress is reported for it -- there is no transfer to watch, and a bar that appears and
-    // completes in the same frame is noise.  A save does not *fill* the cache, only read it: it has
-    // a destination of its own, and writing a second encrypted copy would double what it costs.
+    // completes in the same frame is noise.
     if (!_cache_dir.empty()) {
         auto c = core.database().conn();
-        if (auto entry = _cached_entry(c, url))
-            if (auto cached = cache::read(
-                        _cache_dir / cache::ATTACHMENT_DIR / entry->second,
-                        _cache_encryption_key())) {
-                _touch_cached(entry->first);
-                write_and_finish(std::move(*cached));
-                return;
-            }
+        if (auto entry = _cached_entry(c, s->remote.url))
+            return _save_from_cache(
+                    std::move(s), _cache_dir / cache::ATTACHMENT_DIR / entry->second, entry->first);
     }
 
-    // Already being accumulated for somebody else -- a gallery, or the auto-downloader.  Waiting on
-    // that costs nothing: the buffer is committed either way, and asking for the same bytes again
-    // would mean two transfers of one file.
-    //
-    // The reverse does not hold, which is why nothing is registered below: this streams to the
-    // destination as bytes arrive and keeps none of them, so there would be nothing to give a
-    // joiner that turned up midway.
-    //
-    // TODO: which also means a save is invisible while it runs.  Every message showing the file
-    // reads `absent` rather than `fetching`, and a display asking meanwhile starts a second
-    // transfer of the same bytes.  The fix is a transfer that fans each decrypted chunk out to all
-    // of its consumers -- a cache sink, save destinations, waiters -- and aborts only when the last
-    // one detaches, so that a save is registered like anything else.
-    if (auto found = _in_flight.find(_transfer_key(remote)); found != _in_flight.end()) {
-        if (report) {
-            report(found->second.done, found->second.total, std::nullopt);
-            found->second.progress.push_back(report);
-        }
-        found->second.waiting.push_back(write_and_finish);
+    _save_uncached(std::move(s));
+}
+
+void Client::_save_uncached(std::shared_ptr<Save> s) {
+    // Already being fetched: waited on and served from what that transfer keeps once it ends,
+    // rather than asking for the same bytes again.
+    auto name = _transfer_key(s->remote);
+    if (auto found = _in_flight.find(name); found != _in_flight.end()) {
+        if (s->report)
+            s->report(found->second->done, found->second->total, std::nullopt);
+        found->second->saves.push_back(std::move(s));
         return;
     }
 
-    // A download that cannot start never calls `finish`, which is what removes the temporary file,
-    // so it has to go here or be left beside the destination.  Rethrown for `save_attachment` to
-    // report, which still holds the caller's handler.
-    try {
-        _download_decrypted(
-                remote,
-                DownloadKind::attachment,
-                [state](std::span<const std::byte> plain) {
-                    state->out.write(reinterpret_cast<const char*>(plain.data()), plain.size());
-                },
-                report,
-                [this, claim = remote, finish](DownloadResult result, std::string why) {
-                    // A save is as good a witness as a background fetch, and records the same
-                    // verdict on the same rows.  Onto the loop like the rest of the save's state
-                    // changes, since this arrives on the network thread.
-                    if (auto verdict = _to_unavailable(result))
-                        call([this, claim, verdict = *verdict] {
-                            auto c = core.database().conn();
-                            _emit_messages_showing(c, _mark_unavailable(c, claim, verdict));
-                        });
-
-                    if (result == DownloadResult::ok)
-                        finish({});
-                    else
-                        finish(unexpected{_to_error(result, std::move(why))});
-                });
-    } catch (...) {
-        state->out.close();
-        std::error_code ec;
-        std::filesystem::remove(state->partial, ec);
-        throw;
+    // Written straight to its destination as the bytes arrive, and into the cache alongside, so
+    // that the next save of the same file -- common: a file saved and saved again -- or a display
+    // of it does not download it a second time.  One that is not kept leaves nothing a newcomer
+    // could be served, so it is registered under a name nothing can find to join.
+    auto t = std::make_shared<Transfer>();
+    t->target = {s->remote, DownloadKind::attachment, cache::ATTACHMENT_DIR};
+    if (_caches_requested(s->remote.size))
+        t->cache_file = _cache_path(cache::ATTACHMENT_DIR, s->remote.url);
+    else {
+        name += '\0';
+        name += random::unique_id("save", 8);
     }
+    t->writing.push_back(s);
+    t->sinks.push_back(std::move(s));
+    _start_transfer(std::move(name), std::move(t));
+}
+
+void Client::_save_from_cache(
+        std::shared_ptr<Save> s, std::filesystem::path file, std::optional<int64_t> entry_id) {
+    _post_disk([this,
+                s = std::move(s),
+                file = std::move(file),
+                key = _cache_encryption_key(),
+                entry_id]() mutable {
+        if (s->settled)
+            return;
+        std::optional<Expected<std::filesystem::path>> result;
+        if (cache::read_into(file, key, [&](std::span<const std::byte> d) { _save_write(*s, d); }))
+            result = _save_finish(*s, std::nullopt);
+        else
+            // Gone, or unreadable: back to where the save started, to be fetched instead.
+            _save_discard(*s);
+
+        call([this, s = std::move(s), entry_id, result = std::move(result)]() mutable {
+            if (!result) {
+                // Unless it was withdrawn meanwhile, in which case the cancel on its way to the
+                // disk loop is its ending.
+                if (!s->cancelled)
+                    _save_uncached(std::move(s));
+                return;
+            }
+            if (entry_id)
+                _touch_cached(*entry_id);
+            _saved(*s, std::move(*result));
+        });
+    });
+}
+
+void Client::_save_bytes(std::shared_ptr<Save> s, std::vector<std::byte> bytes) {
+    _post_disk([this, s = std::move(s), bytes = std::move(bytes)]() mutable {
+        if (s->settled)
+            return;
+        _save_write(*s, bytes);
+        auto result = _save_finish(*s, std::nullopt);
+        call([this, s = std::move(s), result = std::move(result)]() mutable {
+            _saved(*s, std::move(result));
+        });
+    });
+}
+
+void Client::_save_write(Save& s, std::span<const std::byte> data) {
+    if (s.failed || s.settled)
+        return;
+    try {
+        if (!s.out.is_open())
+            s.partial = open_partial(s.out, s.dest);
+        s.out.write(
+                reinterpret_cast<const char*>(data.data()),
+                static_cast<std::streamsize>(data.size()));
+        if (!s.out)
+            throw std::runtime_error{"writing {} failed"_format(s.partial.string())};
+    } catch (const std::exception& e) {
+        // Given up on here, not the transfer: whatever else wants these bytes still gets them.
+        s.failed = Error{err::save_failed, e.what()};
+        _save_discard(s);
+    }
+}
+
+Expected<std::filesystem::path> Client::_save_finish(Save& s, std::optional<Error> error) {
+    s.settled = true;
+    if (!error && s.failed)
+        error = std::move(s.failed);
+    if (error) {
+        _save_discard(s);
+        return unexpected{std::move(*error)};
+    }
+    try {
+        // An empty file is never written to, and is still a file.
+        if (!s.out.is_open())
+            s.partial = open_partial(s.out, s.dest);
+        s.out.close();
+        if (!s.out)
+            throw std::runtime_error{"writing {} failed"_format(s.partial.string())};
+
+        // Only now does it get a name a user would recognise -- and only now can it be known
+        // whether the one they asked for is still free, which is why the choice is here rather
+        // than where the caller made it.
+        auto saved_to = final_path(s.dest, s.replace);
+        std::filesystem::rename(s.partial, saved_to);
+        return saved_to;
+    } catch (const std::exception& e) {
+        _save_discard(s);
+        return unexpected{Error{err::save_failed, e.what()}};
+    }
+}
+
+void Client::_save_complete(std::shared_ptr<Save> s, std::optional<Error> error) {
+    _post_disk([this, s = std::move(s), error = std::move(error)]() mutable {
+        if (s->settled)
+            return;
+        auto result = _save_finish(*s, std::move(error));
+        call([this, s = std::move(s), result = std::move(result)]() mutable {
+            _saved(*s, std::move(result));
+        });
+    });
+}
+
+void Client::_save_discard(Save& s) {
+    try {
+        s.out.close();
+    } catch (...) {
+    }
+    if (!s.partial.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(s.partial, ec);
+        s.partial.clear();
+    }
+}
+
+void Client::_saved(Save& s, Expected<std::filesystem::path> result) {
+    if (s.reported)
+        return;
+    s.reported = true;
+    // Held until this returns: the registry's may be the last reference to `s`.
+    auto registered = _saves.extract(s.token);
+
+    bool ok = result.has_value();
+    _report(s.cb, std::move(result));
+    if (!ok)
+        return;
+
+    // Both of these say the same thing -- that the recipient now has the file -- one to ourselves
+    // and one to the sender, and neither is true until it is on disk under its final name, which is
+    // why they are here rather than anywhere earlier.  Recording it does not depend on telling
+    // them: a caller who saved privately still gets to see that they did.
+    //
+    // Both are also only true when the recipient is *us*.  `saved_at` says the recipient saved it,
+    // which is what lets a sender read it as "the file reached a person rather than a file server",
+    // so stamping it for our own save of something we sent would claim they have a file they may
+    // never have opened.  A note to self is exempt: there the recipient is us, so saving it really
+    // is the recipient saving it.
+    if (_saved_by_recipient(s.message_id))
+        _record_saved(s.message_id, s.index, clock_now_ms());
+
+    // The account's own answer overrides the caller's, and only downwards.  Somebody who has said
+    // not to report their saves has said it for every client on the account, and a client that
+    // forgot to ask -- or never grew the setting -- would otherwise report them anyway.  A caller
+    // passing false is still respected: this can refuse a notification, never require one.
+    if (s.notify_sender && core.configs.user_profile().get_notify_media_saved())
+        _notify_media_saved(s.message_id, s.index);
 }
 
 void Client::_on_media_saved(
@@ -5551,7 +6193,7 @@ void Client::_finish_attachment_send(int64_t client_id) {
 
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
         c.prepared_exec(
                 "UPDATE messages SET send_state = ?, sync_send_state = ? WHERE id = ?",
                 static_cast<int>(SendState::pending),
@@ -5778,7 +6420,7 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
     std::vector<std::string> arrived_urls;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         // A blocked account is refused here rather than filtered when drawing, so that nothing it
         // sends becomes history, an unread count or a notification.  Only what *they* sent: our own
@@ -5990,7 +6632,7 @@ void Client::_apply_send_status(
     std::optional<ConversationId> convo;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
         // The two sends own one column each, so a status for one never disturbs the other.
         auto column = sync ? "sync_send_state"sv : "send_state"sv;
         bool changed =

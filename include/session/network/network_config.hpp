@@ -41,6 +41,8 @@ struct Config {
     opt::retry_delay retry_delay = opt::retry_delay(200ms, 5s);
     uint8_t num_nodes_to_check_for_network_offset = 3;
     std::chrono::minutes min_resume_clock_resync_interval = 10min;
+    std::chrono::milliseconds min_network_offset = 5s;
+    std::shared_ptr<oxen::quic::Loop> disk_loop;
 
     // Netid Options
     std::vector<service_node> seed_nodes;
@@ -117,6 +119,8 @@ struct Config {
     void handle_config_opt(opt::retry_delay rd);
     void handle_config_opt(opt::num_nodes_to_check_for_network_offset nncno);
     void handle_config_opt(opt::min_resume_clock_resync_interval mrcri);
+    void handle_config_opt(opt::min_network_offset mno);
+    void handle_config_opt(opt::disk_loop dl);
 
     // Snode pool options
     void handle_config_opt(opt::cache_directory dir);

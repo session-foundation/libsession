@@ -586,3 +586,26 @@ TEST_CASE("Client: no picture is nullopt rather than a failure", "[client][confi
     CHECK_FALSE(err.has_value());
     CHECK_FALSE(got.has_value());
 }
+
+TEST_CASE("Client: config sizes are the size of each config's dump", "[client][configs]") {
+    SECTION("nothing to measure before there is an account") {
+        TempClient c{core::defer_account{}};
+        CHECK(c->config_sizes(await).empty());
+    }
+
+    SECTION("one entry per config, growing with what is put in it") {
+        TempClient c;
+        auto before = c->config_sizes(await);
+        CHECK(before.size() == 5);
+        for (auto name :
+             {"user_profile", "contacts", "convo_info_volatile", "user_groups", "local"})
+            CHECK(before.contains(name));
+
+        c->set_display_name("A name long enough to make the dump measurably larger", await);
+        auto after = c->config_sizes(await);
+        CHECK(after.at("user_profile") > before.at("user_profile"));
+        CHECK(after.at("user_profile") == in_configs(*c, [](auto& cfg) {
+                  return static_cast<int>(cfg.user_profile().make_dump().size());
+              }));
+    }
+}

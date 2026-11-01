@@ -632,15 +632,19 @@ void Decryptor::process_chunk(std::span<const std::byte> chunk, [[maybe_unused]]
     if (!depadded) {
         auto padend = std::find_if_not(
                 out.begin(), out.end(), [](const std::byte c) { return c == std::byte{0x00}; });
-        if (padend != out.end()) {
-            if (*padend != std::byte{0x01}) {
-                failed = true;
-                return;
-            }
-            depadded = true;
-            if (++padend != out.end())
-                output(std::span<const std::byte>{padend, out.end()});
+        if (padend == out.end()) {
+            padding_seen += out.size();
+            return;
         }
+        if (*padend != std::byte{0x01}) {
+            failed = true;
+            return;
+        }
+        ++padend;
+        padding_seen += static_cast<size_t>(padend - out.begin());
+        depadded = true;
+        if (padend != out.end())
+            output(std::span<const std::byte>{padend, out.end()});
         return;
     }
 
@@ -720,6 +724,80 @@ void Decryptor::process_chunk(std::span<const std::byte> chunk, [[maybe_unused]]
     }
 
     return true;
+}
+
+std::optional<size_t> Decryptor::padding() const {
+    if (!depadded)
+        return std::nullopt;
+    return padding_seen;
+}
+
+PushEncryptor::PushEncryptor(
+        std::span<const std::byte, ENCRYPT_KEY_SIZE> key,
+        size_t padding,
+        std::function<void(std::span<const std::byte> encrypted)> output_) :
+        output{std::move(output_)} {
+    if (padding < 1)
+        throw std::invalid_argument{"PushEncryptor: padding counts its marker, so is at least 1"};
+
+    static_assert(
+            sizeof(crypto_secretstream_xchacha20poly1305_state) == sizeof(PushEncryptor::st_data));
+
+    std::array<std::byte, 1 + ENCRYPT_HEADER> header;
+    header[0] = std::byte{'S'};
+    crypto_secretstream_xchacha20poly1305_init_push(
+            st(st_data), to_unsigned(header.data() + 1), to_unsigned(key.data()));
+    output(header);
+
+    // A chunk at a time, so that the padding of a large file -- which can be many chunks -- is
+    // never held whole.
+    for (size_t zeros = padding - 1; zeros > 0;) {
+        auto n = std::min(zeros, ENCRYPT_CHUNK_SIZE);
+        buf.insert(buf.end(), n, std::byte{0});
+        zeros -= n;
+        while (buf.size() > ENCRYPT_CHUNK_SIZE)
+            push(ENCRYPT_CHUNK_SIZE, false);
+    }
+    buf.push_back(std::byte{0x01});
+}
+
+void PushEncryptor::update(std::span<const std::byte> data) {
+    if (finished)
+        throw std::logic_error{"PushEncryptor::update() called after finalize()"};
+
+    // Strictly more than a chunk before one goes, so that a full one is always held back: whether
+    // it is the last is only known at finalize(), and the last carries the final tag.
+    while (!data.empty()) {
+        auto n = std::min(data.size(), ENCRYPT_CHUNK_SIZE);
+        buf.insert(buf.end(), data.begin(), data.begin() + static_cast<ptrdiff_t>(n));
+        data = data.subspan(n);
+        while (buf.size() > ENCRYPT_CHUNK_SIZE)
+            push(ENCRYPT_CHUNK_SIZE, false);
+    }
+}
+
+void PushEncryptor::finalize() {
+    if (finished)
+        throw std::logic_error{"PushEncryptor::finalize() called twice"};
+    // Never empty: the marker alone guarantees a byte, and update() always holds some back.
+    push(buf.size(), true);
+    finished = true;
+}
+
+void PushEncryptor::push(size_t size, bool is_final) {
+    std::array<std::byte, ENCRYPTED_CHUNK_TOTAL> out;
+    unsigned long long len;
+    crypto_secretstream_xchacha20poly1305_push(
+            st(st_data),
+            to_unsigned(out.data()),
+            &len,
+            to_unsigned(buf.data()),
+            size,
+            nullptr,
+            0,
+            is_final ? crypto_secretstream_xchacha20poly1305_TAG_FINAL : 0);
+    buf.erase(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(size));
+    output(std::span<const std::byte>{out.data(), static_cast<size_t>(len)});
 }
 
 void decrypt(

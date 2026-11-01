@@ -1,13 +1,12 @@
 #!/bin/bash
 
-# Script used with Drone CI to upload docs 
+# Script used by CI to upload the built API docs, from docs/api.  SSH_KEY holds the upload key.
 
 set -o errexit
 
 if [ -z "$SSH_KEY" ]; then
-    echo -e "\n\n\n\e[31;1mUnable to upload debs: SSH_KEY not set\e[0m"
-    # Just warn but don't fail, so that this doesn't trigger a build failure for untrusted builds
-    exit 0
+    echo -e "\n\n\n\e[31;1mUnable to upload docs: SSH_KEY not set\e[0m"
+    exit 1
 fi
 
 echo "$SSH_KEY" >~/ssh_key

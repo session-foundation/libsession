@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
 
-# Script used with Drone CI to upload build artifacts (because specifying all this in
-# .drone.jsonnet is too painful).
-
-
+# Script used by CI to upload a packaged build to builds.session.codes, from the directory holding
+# it.  SSH_KEY holds the upload key.
 
 set -o errexit
 
 if [ -z "$SSH_KEY" ]; then
     echo -e "\n\n\n\e[31;1mUnable to upload artifact: SSH_KEY not set\e[0m"
-    # Just warn but don't fail, so that this doesn't trigger a build failure for untrusted builds
-    exit 0
+    exit 1
 fi
 
 echo "$SSH_KEY" >ssh_key
@@ -19,9 +16,10 @@ set -o xtrace  # Don't start tracing until *after* we write the ssh key
 
 chmod 600 ssh_key
 
-branch_or_tag=${DRONE_BRANCH:-${DRONE_TAG:-unknown}}
+# Tag first: a tag build has a branch too, which Woodpecker sets to the tag's ref (refs/tags/v1.2.3).
+branch_or_tag=${CI_COMMIT_TAG:-${CI_COMMIT_BRANCH:-unknown}}
 
-upload_to="oxen.rocks/${DRONE_REPO// /_}/${branch_or_tag// /_}"
+upload_to="builds.session.codes/${CI_REPO// /_}/${branch_or_tag// /_}"
 
 shopt -s nullglob
 filename=(libsession-util-*.tar.xz libsession-util-*.zip)
@@ -42,7 +40,7 @@ for p in "${upload_dirs[@]}"; do
 -mkdir $dir_tmp"
 done
 
-sftp -i ssh_key -b - -o StrictHostKeyChecking=off drone@oxen.rocks <<SFTP
+sftp -i ssh_key -b - -o StrictHostKeyChecking=off drone@builds.session.codes <<SFTP
 $mkdirs
 put $filename $upload_to
 SFTP
