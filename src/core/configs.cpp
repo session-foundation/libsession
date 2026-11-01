@@ -1,6 +1,5 @@
 #include "session/core/configs.hpp"
 
-#include <SQLiteCpp/Transaction.h>
 #include <sqlite3.h>
 
 #include <algorithm>
@@ -290,15 +289,18 @@ void Configs::store_dumps() {
         return;
 
     // One write transaction across every comparison and write in _store, which would be worth
-    // nothing if another process could write in between.  A caller's open transaction is joined.
+    // nothing if another process could write in between.  A caller's open transaction is joined:
+    // begin_immediate() refuses to nest on one thread.
     auto c = conn();
-    std::optional<SQLite::Transaction> tx;
-    if (sqlite3_get_autocommit(c.sql.getHandle()))
-        tx.emplace(c.sql, SQLite::TransactionBehavior::IMMEDIATE);
-    for (auto* conf : confs)
-        _store(*conf);
-    if (tx)
-        tx->commit();
+    auto store = [&] {
+        for (auto* conf : confs)
+            _store(*conf);
+    };
+    if (!sqlite3_get_autocommit(c.sql.getHandle()))
+        return store();
+    auto tx = c.begin_immediate();
+    store();
+    tx.commit();
 }
 
 Configs::Batch::Batch(Configs& configs) : _configs{configs} {
