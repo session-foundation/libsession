@@ -588,7 +588,9 @@ void Core::_swarm_attempt(std::shared_ptr<SwarmOp> op) {
                         return _swarm_chosen(op, swarm);
                     } catch (const sqlite::database_suspended&) {
                     } catch (const SQLite::Exception& e) {
-                        if (!_storage_suspended || (e.getErrorCode() & 0xff) != SQLITE_INTERRUPT)
+                        // Not checked against `_storage_suspended`: a resume can clear it between
+                        // the interrupt and here, and nothing but a suspend interrupts.
+                        if ((e.getErrorCode() & 0xff) != SQLITE_INTERRUPT)
                             throw;
                     }
                 }
