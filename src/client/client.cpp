@@ -2150,7 +2150,7 @@ AnyConversation Client::_create_conversation(const ConversationId& id) {
     bool created, contacted = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
         created = ensure_conversation(c, id, clock_now_ms()).created;
 
         // Opening a conversation with someone makes them an approved contact: choosing to write to
@@ -2174,7 +2174,7 @@ void Client::_mark_read(const ConversationId& id, std::optional<sys_ms> up_to) {
     int changed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -2226,7 +2226,7 @@ void Client::_set_marked_unread(const ConversationId& id, bool unread) {
     int changed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -2252,7 +2252,7 @@ void Client::_set_conversation_setting(const ConversationId& id, std::string_vie
     int changed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -2288,7 +2288,7 @@ void Client::_set_expiry(
     int changed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -2314,7 +2314,7 @@ void Client::_set_auto_download(const ConversationId& id, AutoDownload mode) {
     int changed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -2351,7 +2351,7 @@ void Client::_set_nickname(const ConversationId& id, std::string_view nickname) 
     bool changed = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto account = identity_id(c, id);
 
@@ -2377,7 +2377,7 @@ void Client::_set_priority(const ConversationId& id, int priority) {
     int changed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         // Not ensure_conversation() for one that already exists: that moves last_activity forward,
         // and pinning is not activity -- it would reorder the very list it is being used to order.
@@ -2401,7 +2401,7 @@ void Client::_set_blocked(const ConversationId& id, bool blocked) {
     bool changed = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
         auto account = identity_id(c, id);
 
         // Blocking someone we have never made a contact of is the ordinary case rather than the
@@ -2427,7 +2427,7 @@ void Client::_clear_messages(const ConversationId& id) {
     bool emptied = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -2453,7 +2453,7 @@ void Client::_delete_conversation(const ConversationId& id, bool keep_messages) 
     bool emptied = false, hidden = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -2488,7 +2488,7 @@ void Client::_delete_contact(const ConversationId& id) {
     bool removed = false;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto account = c.prepared_maybe_get<int64_t>(
                 "SELECT id FROM accounts WHERE session_id = ?", id.session_id());
@@ -2521,7 +2521,7 @@ bool Client::_delete_message(int64_t message_id, Deletion how_far) {
     std::optional<ConversationId> convo;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo_row = c.prepared_maybe_get<int64_t>(
                 "SELECT conversation FROM messages WHERE id = ?", message_id);
@@ -2885,7 +2885,7 @@ bool Client::_purge_deleted_message(int64_t message_id) {
     std::optional<ConversationId> convo;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo_row = c.prepared_maybe_get<int64_t>(
                 "SELECT conversation FROM messages WHERE id = ? AND deleted IS NOT NULL",
@@ -2909,7 +2909,7 @@ size_t Client::_purge_deleted(const ConversationId& id) {
     int removed = 0;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = find_conversation(c, id);
         if (!convo)
@@ -3169,7 +3169,7 @@ void Client::_reconcile_contacts() {
 
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         // Ordered rather than a vector because the deletion pass below looks every stored contact
         // up in it: scanning instead would make a routine merge quadratic in the size of the
@@ -3377,7 +3377,7 @@ void Client::_reconcile_convo_volatile() {
     std::vector<ConversationId> touched;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         for (auto it = volatiles.begin_1to1(); it != volatiles.end(); ++it) {
             const auto& entry = *it;
@@ -3642,7 +3642,7 @@ void Client::_reconcile_user_profile() {
 
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         std::optional<std::string_view> pic_url;
         std::optional<std::span<const std::byte>> pic_key;
@@ -4319,7 +4319,7 @@ int64_t Client::_send_message(const ConversationId& id, const OutgoingMessage& m
     int64_t client_id;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = ensure_conversation(c, id, now);
         created = convo.created;
@@ -4492,7 +4492,7 @@ int64_t Client::_send_message(
     int64_t client_id;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         auto convo = ensure_conversation(c, id, now);
         created = convo.created;
@@ -6004,7 +6004,7 @@ void Client::_finish_attachment_send(int64_t client_id) {
 
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
         c.prepared_exec(
                 "UPDATE messages SET send_state = ?, sync_send_state = ? WHERE id = ?",
                 static_cast<int>(SendState::pending),
@@ -6231,7 +6231,7 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
     std::vector<std::string> arrived_urls;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
 
         // A blocked account is refused here rather than filtered when drawing, so that nothing it
         // sends becomes history, an unread count or a notification.  Only what *they* sent: our own
@@ -6442,7 +6442,7 @@ void Client::_apply_send_status(
     std::optional<ConversationId> convo;
     {
         auto c = core.database().conn();
-        SQLite::Transaction tx{c.sql};
+        auto tx = c.begin_immediate();
         // The two sends own one column each, so a status for one never disturbs the other.
         auto column = sync ? "sync_send_state"sv : "send_state"sv;
         bool changed =
