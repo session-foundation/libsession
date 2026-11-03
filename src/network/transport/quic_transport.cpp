@@ -29,6 +29,22 @@ namespace {
         }
         return false;  // Shouldn't happen
     }
+
+    std::optional<quic::opt::congestion_control> to_quic(
+            std::optional<opt::quic_congestion_control::Algorithm> algorithm) {
+        if (!algorithm)
+            return std::nullopt;
+
+        switch (*algorithm) {
+            case opt::quic_congestion_control::Algorithm::bbr:
+                return quic::opt::congestion_control::bbr;
+            case opt::quic_congestion_control::Algorithm::cubic:
+                return quic::opt::congestion_control::cubic;
+            case opt::quic_congestion_control::Algorithm::reno:
+                return quic::opt::congestion_control::reno;
+        }
+        return std::nullopt;  // Shouldn't happen
+    }
 }  // namespace
 
 constexpr auto ALPN = "oxenstorage"sv;
@@ -325,6 +341,7 @@ void QuicTransport::_establish_connection(
                 oxen::quic::opt::outbound_alpn(ALPN),
                 oxen::quic::opt::handshake_timeout{_config.handshake_timeout},
                 oxen::quic::opt::keep_alive{_config.keep_alive},
+                to_quic(_config.congestion_control),
                 [weak_self = weak_from_this(), this, address_pubkey_hex, initiating_req_id](
                         oxen::quic::Connection& conn) {
                     auto self = weak_self.lock();

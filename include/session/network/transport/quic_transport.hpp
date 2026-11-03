@@ -25,6 +25,7 @@ namespace config {
         std::chrono::seconds keep_alive;
 
         std::optional<size_t> max_udp_payload;
+        std::optional<opt::quic_congestion_control::Algorithm> congestion_control;
     };
 }  // namespace config
 

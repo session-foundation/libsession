@@ -34,6 +34,13 @@ typedef enum {
     SESSION_NETWORK_TRANSPORT_QUIC = 0,
 } SESSION_NETWORK_TRANSPORT;
 
+typedef enum {
+    SESSION_NETWORK_QUIC_CONGESTION_CONTROL_DEFAULT = 0,  // libquic's default
+    SESSION_NETWORK_QUIC_CONGESTION_CONTROL_BBR = 1,
+    SESSION_NETWORK_QUIC_CONGESTION_CONTROL_CUBIC = 2,
+    SESSION_NETWORK_QUIC_CONGESTION_CONTROL_RENO = 3,
+} SESSION_NETWORK_QUIC_CONGESTION_CONTROL;
+
 typedef void (*session_network_request_t)(
         const char* url,
         const char* body_data,
@@ -98,6 +105,7 @@ typedef struct session_network_config {
     /// Maximum QUIC UDP payload size; 0 for no cap.  Must otherwise be at least 1200.  Takes
     /// precedence over quic_disable_mtu_discovery when non-zero.
     size_t quic_max_udp_payload;
+    SESSION_NETWORK_QUIC_CONGESTION_CONTROL quic_congestion_control;
 
 } session_network_config;
 

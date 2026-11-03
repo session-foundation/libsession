@@ -387,6 +387,30 @@ namespace opt {
     /// probe.
     struct quic_disable_mtu_discovery {};
 
+    /// Can be used to choose the congestion control algorithm Quic connections use for what they
+    /// send; without it libquic's default is used.  BBR keeps its sending rate through loss that
+    /// isn't caused by congestion, which suits jittery mobile networks, while cubic and reno back
+    /// off on any loss.
+    struct quic_congestion_control {
+        enum class Algorithm {
+            bbr,
+            cubic,
+            reno,
+        };
+
+        Algorithm algorithm;
+
+      private:
+        quic_congestion_control(Algorithm a) : algorithm{a} {}
+
+      public:
+        quic_congestion_control() = delete;
+
+        static quic_congestion_control bbr() { return quic_congestion_control(Algorithm::bbr); }
+        static quic_congestion_control cubic() { return quic_congestion_control(Algorithm::cubic); }
+        static quic_congestion_control reno() { return quic_congestion_control(Algorithm::reno); }
+    };
+
     // MARK: Onion Request Router Options
 
     /// Can be used to override the default (3) number of times a path can receive an error before
@@ -477,6 +501,7 @@ namespace opt {
             quic_keep_alive,
             quic_max_udp_payload,
             quic_disable_mtu_discovery,
+            quic_congestion_control,
 
             // Onion request router options
             onionreq_path_strike_threshold,
