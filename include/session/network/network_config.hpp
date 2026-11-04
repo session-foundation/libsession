@@ -65,7 +65,7 @@ struct Config {
     std::chrono::milliseconds quic_handshake_timeout{3s};
     std::chrono::seconds quic_keep_alive{10s};
     std::optional<size_t> quic_max_udp_payload;
-    std::optional<opt::quic_congestion_control::Algorithm> quic_congestion_control;
+    std::optional<opt::quic_congestion_control> quic_congestion_control;
 
     template <typename... Opt>
         requires(sizeof...(Opt) > 0 && (opt::is_option<std::decay_t<Opt>> && ...))

@@ -1547,13 +1547,13 @@ LIBSESSION_C_API bool session_network_init(
                 switch (config->quic_congestion_control) {
                     case SESSION_NETWORK_QUIC_CONGESTION_CONTROL_DEFAULT: break;
                     case SESSION_NETWORK_QUIC_CONGESTION_CONTROL_BBR:
-                        cpp_opts.emplace_back(opt::quic_congestion_control::bbr());
+                        cpp_opts.emplace_back(opt::quic_congestion_control::bbr);
                         break;
                     case SESSION_NETWORK_QUIC_CONGESTION_CONTROL_CUBIC:
-                        cpp_opts.emplace_back(opt::quic_congestion_control::cubic());
+                        cpp_opts.emplace_back(opt::quic_congestion_control::cubic);
                         break;
                     case SESSION_NETWORK_QUIC_CONGESTION_CONTROL_RENO:
-                        cpp_opts.emplace_back(opt::quic_congestion_control::reno());
+                        cpp_opts.emplace_back(opt::quic_congestion_control::reno);
                         break;
                 }
 

@@ -250,18 +250,18 @@ void Config::handle_config_opt(opt::quic_disable_mtu_discovery) {
 }
 
 void Config::handle_config_opt(opt::quic_congestion_control qcc) {
-    quic_congestion_control = qcc.algorithm;
+    quic_congestion_control = qcc;
 
-    switch (qcc.algorithm) {
-        case opt::quic_congestion_control::Algorithm::bbr:
+    switch (qcc) {
+        case opt::quic_congestion_control::bbr:
             log::debug(cat, "Network config quic congestion control set to BBR");
             break;
 
-        case opt::quic_congestion_control::Algorithm::cubic:
+        case opt::quic_congestion_control::cubic:
             log::debug(cat, "Network config quic congestion control set to cubic");
             break;
 
-        case opt::quic_congestion_control::Algorithm::reno:
+        case opt::quic_congestion_control::reno:
             log::debug(cat, "Network config quic congestion control set to Reno");
             break;
     }

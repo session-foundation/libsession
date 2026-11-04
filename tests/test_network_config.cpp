@@ -37,9 +37,9 @@ TEST_CASE("Network config: QUIC congestion control", "[network][config][quic]") 
         CHECK_FALSE(cfg.quic_congestion_control.has_value());
     }
     SECTION("explicit algorithm") {
-        config::Config cfg{opt::quic_congestion_control::bbr()};
+        config::Config cfg{opt::quic_congestion_control::bbr};
         REQUIRE(cfg.quic_congestion_control.has_value());
-        CHECK(*cfg.quic_congestion_control == opt::quic_congestion_control::Algorithm::bbr);
+        CHECK(*cfg.quic_congestion_control == opt::quic_congestion_control::bbr);
     }
     SECTION("C defaults leave libquic's default") {
         auto c = session_network_config_default();

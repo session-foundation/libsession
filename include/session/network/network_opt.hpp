@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <oxen/quic/opt.hpp>
 #include <type_traits>
 #include <variant>
 
@@ -391,25 +392,7 @@ namespace opt {
     /// send; without it libquic's default is used.  BBR keeps its sending rate through loss that
     /// isn't caused by congestion, which suits jittery mobile networks, while cubic and reno back
     /// off on any loss.
-    struct quic_congestion_control {
-        enum class Algorithm {
-            bbr,
-            cubic,
-            reno,
-        };
-
-        Algorithm algorithm;
-
-      private:
-        quic_congestion_control(Algorithm a) : algorithm{a} {}
-
-      public:
-        quic_congestion_control() = delete;
-
-        static quic_congestion_control bbr() { return quic_congestion_control(Algorithm::bbr); }
-        static quic_congestion_control cubic() { return quic_congestion_control(Algorithm::cubic); }
-        static quic_congestion_control reno() { return quic_congestion_control(Algorithm::reno); }
-    };
+    using quic_congestion_control = oxen::quic::opt::congestion_control;
 
     // MARK: Onion Request Router Options
 
