@@ -68,7 +68,8 @@ struct OutgoingAttachment {
 /// with a message.
 enum class AutoDownload : int {
     none = 0,               ///< Nothing; every attachment waits to be asked for.
-    image_attachments = 1,  ///< Attachments whose content type is an image.
+    image_attachments = 1,  ///< Attachments whose content type is one Session displays as an
+                            ///< image; see image::displayable_image_types.
     all = 2,                ///< Every attachment.
 };
 
