@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <oxen/quic/loop.hpp>
 #include <vector>
 
 #include "session/network/key_types.hpp"

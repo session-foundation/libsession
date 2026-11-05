@@ -3,6 +3,10 @@
 #include <atomic>
 #include <functional>
 #include <optional>
+#include <oxen/quic/address.hpp>
+#include <oxen/quic/connection_ids.hpp>
+#include <oxen/quic/endpoint.hpp>
+#include <oxen/quic/loop.hpp>
 #include <set>
 #include <string>
 #include <vector>

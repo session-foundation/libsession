@@ -2,6 +2,8 @@
 
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
+#include <oxen/quic/btstream.hpp>
+#include <oxen/quic/connection.hpp>
 #include <oxen/quic/gnutls_crypto.hpp>
 
 #include "session/ed25519.hpp"
