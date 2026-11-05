@@ -1174,11 +1174,7 @@ class Client {
             const ConversationId& id,
             transfer_progress on_progress,
             result_function<std::optional<std::vector<std::byte>>> cb);
-    std::vector<Message> _messages(
-            const ConversationId& id,
-            int limit,
-            std::optional<MessageCursor> before,
-            bool include_deleted);
+    std::vector<Message> _messages(const ConversationId& id, const MessagePage& page);
     std::vector<Message> _messages_after(
             const ConversationId& id, int limit, MessageCursor after, bool include_deleted);
     std::vector<Message> _messages_around(
@@ -1457,7 +1453,7 @@ class Client {
 
     void _require_dm(std::string_view op, const ConversationId& id);
     void _require_contact(std::string_view op, const ConversationId& id);
-    void _require_page(std::string_view op, int limit);
+    void _require_page(std::string_view op, const MessagePage& page);
     void _require_readable(const std::vector<OutgoingAttachment>& attachments);
 
     // Everything a send must be able to reject before storing anything: the conversation kind, the

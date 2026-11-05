@@ -25,46 +25,19 @@ namespace session::client {
 // -- Reading ------------------------------------------------------------------------------------
 
 void Conversation::messages(result_function<std::vector<Message>> cb) const {
-    messages(50, std::nullopt, std::move(cb));
+    messages(MessagePage{}, std::move(cb));
 }
-void Conversation::messages(int limit, result_function<std::vector<Message>> cb) const {
-    messages(limit, std::nullopt, std::move(cb));
-}
-void Conversation::messages(
-        int limit,
-        std::optional<MessageCursor> before,
-        result_function<std::vector<Message>> cb) const {
-    messages(limit, before, false, std::move(cb));
-}
-void Conversation::messages(
-        int limit,
-        std::optional<MessageCursor> before,
-        bool include_deleted,
-        result_function<std::vector<Message>> cb) const {
-    _client->_require_page("messages", limit);
-    _client->_async(
-            [c = _client, id = id, limit, before, include_deleted] {
-                return c->_messages(id, limit, before, include_deleted);
-            },
-            std::move(cb));
+void Conversation::messages(MessagePage page, result_function<std::vector<Message>> cb) const {
+    _client->_require_page("messages", page);
+    _client->_async([c = _client, id = id, page] { return c->_messages(id, page); }, std::move(cb));
 }
 
 std::vector<Message> Conversation::messages(await_t) const {
-    return messages(50, std::nullopt, await);
+    return messages(MessagePage{}, await);
 }
-std::vector<Message> Conversation::messages(int limit, await_t) const {
-    return messages(limit, std::nullopt, await);
-}
-std::vector<Message> Conversation::messages(
-        int limit, std::optional<MessageCursor> before, await_t) const {
-    return messages(limit, before, false, await);
-}
-std::vector<Message> Conversation::messages(
-        int limit, std::optional<MessageCursor> before, bool include_deleted, await_t) const {
-    _client->_require_page("messages", limit);
-    return _client->call_get([this, limit, before, include_deleted] {
-        return _client->_messages(id, limit, before, include_deleted);
-    });
+std::vector<Message> Conversation::messages(MessagePage page, await_t) const {
+    _client->_require_page("messages", page);
+    return _client->call_get([this, page] { return _client->_messages(id, page); });
 }
 
 void Conversation::messages_after(
@@ -76,7 +49,7 @@ void Conversation::messages_after(
         MessageCursor after,
         bool include_deleted,
         result_function<std::vector<Message>> cb) const {
-    _client->_require_page("messages_after", limit);
+    _client->_require_page("messages_after", {.limit = limit});
     _client->_async(
             [c = _client, id = id, limit, after, include_deleted] {
                 return c->_messages_after(id, limit, after, include_deleted);
@@ -88,7 +61,7 @@ std::vector<Message> Conversation::messages_after(int limit, MessageCursor after
 }
 std::vector<Message> Conversation::messages_after(
         int limit, MessageCursor after, bool include_deleted, await_t) const {
-    _client->_require_page("messages_after", limit);
+    _client->_require_page("messages_after", {.limit = limit});
     return _client->call_get([this, limit, after, include_deleted] {
         return _client->_messages_after(id, limit, after, include_deleted);
     });
@@ -103,7 +76,7 @@ void Conversation::messages_around(
         MessageCursor at,
         bool include_deleted,
         result_function<std::vector<Message>> cb) const {
-    _client->_require_page("messages_around", limit);
+    _client->_require_page("messages_around", {.limit = limit});
     _client->_async(
             [c = _client, id = id, limit, at, include_deleted] {
                 return c->_messages_around(id, limit, at, include_deleted);
@@ -115,7 +88,7 @@ std::vector<Message> Conversation::messages_around(int limit, MessageCursor at, 
 }
 std::vector<Message> Conversation::messages_around(
         int limit, MessageCursor at, bool include_deleted, await_t) const {
-    _client->_require_page("messages_around", limit);
+    _client->_require_page("messages_around", {.limit = limit});
     return _client->call_get([this, limit, at, include_deleted] {
         return _client->_messages_around(id, limit, at, include_deleted);
     });

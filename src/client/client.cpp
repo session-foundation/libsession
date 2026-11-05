@@ -670,12 +670,12 @@ void Client::_require_contact(std::string_view op, const ConversationId& id) {
         throw std::invalid_argument{"{}: not applicable to your own account"_format(op)};
 }
 
-void Client::_require_page(std::string_view op, int limit) {
+void Client::_require_page(std::string_view op, const MessagePage& page) {
     // The value reaches SQLite as `LIMIT ?`, where a negative is no limit at all and zero is the
     // end of the history -- so an unchecked one loads the whole conversation instead of failing.
-    if (limit <= 0)
+    if (page.limit <= 0)
         throw std::invalid_argument{
-                "{}: limit must be a positive page size (got {})"_format(op, limit)};
+                "{}: limit must be a positive page size (got {})"_format(op, page.limit)};
 }
 
 void Client::log_operation_failure(const std::exception& e) {
@@ -3979,11 +3979,7 @@ void Client::_load_reply_targets(
                 m.reply->message = found->second;
 }
 
-std::vector<Message> Client::_messages(
-        const ConversationId& id,
-        int limit,
-        std::optional<MessageCursor> before,
-        bool include_deleted) {
+std::vector<Message> Client::_messages(const ConversationId& id, const MessagePage& page) {
     auto c = core.database().conn();
     auto convo = find_conversation(c, id);
     if (!convo)
@@ -3992,9 +3988,9 @@ std::vector<Message> Client::_messages(
     // In the query rather than dropped from the result, so that `limit` counts rows the caller will
     // actually see: filtering afterwards would return short pages with nothing to say that another
     // page is warranted.
-    auto visible = include_deleted ? ""sv : "AND m.deleted IS NULL"sv;
+    auto visible = page.include_deleted ? ""sv : "AND m.deleted IS NULL"sv;
 
-    if (!before)
+    if (!page.before)
         return _query_messages(
                 c,
                 id,
@@ -4003,7 +3999,7 @@ std::vector<Message> Client::_messages(
             {} WHERE m.conversation = ? {} ORDER BY m.timestamp DESC, m.id DESC LIMIT ?
         )"_format(MESSAGE_COLUMNS, visible),
                 *convo,
-                limit);
+                page.limit);
 
     // Strictly-older-than comparison on (timestamp, id), spelled out rather than as an SQL row
     // value so this does not depend on the SQLite version's row-value support.
@@ -4017,9 +4013,9 @@ std::vector<Message> Client::_messages(
            ORDER BY m.timestamp DESC, m.id DESC LIMIT ?4
     )"_format(MESSAGE_COLUMNS, visible),
             *convo,
-            epoch_ms(before->timestamp),
-            before->id,
-            limit);
+            epoch_ms(page.before->timestamp),
+            page.before->id,
+            page.limit);
 }
 
 std::vector<Message> Client::_messages_after(

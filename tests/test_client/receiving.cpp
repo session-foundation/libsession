@@ -452,22 +452,26 @@ TEST_CASE("Client: message history pages backwards by cursor", "[client][message
     for (int i = 1; i <= 10; i++)
         deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
 
-    auto page1 = c->conversation(convo, await)->messages(4, await);
+    auto page1 = c->conversation(convo, await)->messages({.limit = 4}, await);
     REQUIRE(page1.size() == 4);
     CHECK(page1[0].body == "msg10");
     CHECK(page1[3].body == "msg7");
 
-    auto page2 = c->conversation(convo, await)->messages(4, page1.back().cursor(), await);
+    auto page2 = c->conversation(convo, await)
+                         ->messages({.limit = 4, .before = page1.back().cursor()}, await);
     REQUIRE(page2.size() == 4);
     CHECK(page2[0].body == "msg6");
     CHECK(page2[3].body == "msg3");
 
-    auto page3 = c->conversation(convo, await)->messages(4, page2.back().cursor(), await);
+    auto page3 = c->conversation(convo, await)
+                         ->messages({.limit = 4, .before = page2.back().cursor()}, await);
     REQUIRE(page3.size() == 2);
     CHECK(page3[0].body == "msg2");
     CHECK(page3[1].body == "msg1");
 
-    CHECK(c->conversation(convo, await)->messages(4, page3.back().cursor(), await).empty());
+    CHECK(c->conversation(convo, await)
+                  ->messages({.limit = 4, .before = page3.back().cursor()}, await)
+                  .empty());
 }
 
 namespace {
@@ -486,7 +490,7 @@ TEST_CASE("Client: message history pages forwards by cursor", "[client][messages
     for (int i = 1; i <= 10; i++)
         deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
     auto conversation = c->conversation(convo, await);
-    auto all = conversation->messages(10, await);
+    auto all = conversation->messages({.limit = 10}, await);
     auto third = all[7];
     REQUIRE(third.body == "msg3");
 
@@ -506,7 +510,7 @@ TEST_CASE("Client: a window around a message puts it in the middle", "[client][m
     for (int i = 1; i <= 10; i++)
         deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
     auto conversation = c->conversation(convo, await);
-    auto all = conversation->messages(10, await);
+    auto all = conversation->messages({.limit = 10}, await);
     auto at = [&](int n) { return all[10 - n].cursor(); };
 
     CHECK(bodies(conversation->messages_around(5, at(5), await)) ==
@@ -537,7 +541,7 @@ TEST_CASE("Client: a window around a message puts it in the middle", "[client][m
     SECTION("it carries on with before and messages_after") {
         auto window = conversation->messages_around(3, at(5), await);
         REQUIRE(bodies(window) == std::vector<std::string>{"msg6", "msg5", "msg4"});
-        CHECK(bodies(conversation->messages(2, window.back().cursor(), await)) ==
+        CHECK(bodies(conversation->messages({.limit = 2, .before = window.back().cursor()}, await)) ==
               std::vector<std::string>{"msg3", "msg2"});
         CHECK(bodies(conversation->messages_after(2, window.front().cursor(), await)) ==
               std::vector<std::string>{"msg8", "msg7"});
@@ -551,7 +555,7 @@ TEST_CASE("Client: first_unread is the oldest of what unread counts", "[client][
     for (int i = 1; i <= 10; i++)
         deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
     auto conversation = c->conversation(convo, await);
-    auto all = conversation->messages(10, await);
+    auto all = conversation->messages({.limit = 10}, await);
 
     // Never read: every message is unread, so it starts at the first one.
     CHECK(conversation->first_unread(await) == all.back().cursor());
@@ -578,7 +582,7 @@ TEST_CASE("Client: paging is stable across equal timestamps", "[client][messages
     std::vector<std::string> seen;
     std::optional<MessageCursor> cursor;
     while (true) {
-        auto page = c->conversation(convo, await)->messages(1, cursor, await);
+        auto page = c->conversation(convo, await)->messages({.limit = 1, .before = cursor}, await);
         if (page.empty())
             break;
         seen.push_back(page[0].body);
@@ -666,7 +670,7 @@ TEST_CASE(
     CHECK(visible[1].body == "one");
 
     // ...and in its original place when asked for, saying who and when but nothing else.
-    auto all = c->conversation(convo, await)->messages(50, std::nullopt, true, await);
+    auto all = c->conversation(convo, await)->messages({.include_deleted = true}, await);
     REQUIRE(all.size() == 3);
     CHECK(all[1].id == middle.id);
     CHECK(all[1].deleted == Deletion::here);
@@ -684,7 +688,7 @@ TEST_CASE(
 
     // A redelivery under the same hash is still recognised as one we have seen.
     deliver(*c, sender, "two", from_epoch_ms(2000), "h2");
-    CHECK(c->conversation(convo, await)->messages(50, std::nullopt, true, await).size() == 3);
+    CHECK(c->conversation(convo, await)->messages({.include_deleted = true}, await).size() == 3);
 
     // Deleting a message that does not exist is false, not an error.
     CHECK_FALSE(c->delete_message(middle.id + 10000, await));
@@ -729,7 +733,8 @@ TEST_CASE("Client: purging removes what a deletion left", "[client][messages][de
         CHECK(c->conversation(convo, await)->messages(await).size() == 1);
 
         CHECK(c->purge_deleted_message(msgs[1].id, await));
-        CHECK(c->conversation(convo, await)->messages(50, std::nullopt, true, await).size() == 2);
+        CHECK(c->conversation(convo, await)->messages({.include_deleted = true}, await).size() ==
+              2);
 
         // Purging the same row twice is false the second time rather than an error.
         CHECK_FALSE(c->purge_deleted_message(msgs[1].id, await));
@@ -738,7 +743,7 @@ TEST_CASE("Client: purging removes what a deletion left", "[client][messages][de
     SECTION("all of them at once") {
         CHECK(c->conversation(convo, await)->purge_deleted(await) == 2);
 
-        auto left = c->conversation(convo, await)->messages(50, std::nullopt, true, await);
+        auto left = c->conversation(convo, await)->messages({.include_deleted = true}, await);
         REQUIRE(left.size() == 1);
         CHECK(left[0].body == "three");
 
