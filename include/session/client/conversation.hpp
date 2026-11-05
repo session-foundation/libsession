@@ -186,59 +186,21 @@ class Conversation {
 
     // -- Reading ------------------------------------------------------------------------------
 
-    /// A page of history, newest first: the newest `MessagePage::limit` messages, or the page
-    /// next to a cursor.  The forms without a page read the newest 50.
+    /// A page of history, newest first: the newest `MessagePage::limit` messages, the page older
+    /// or newer than a cursor, or a window around one.  The forms without a page read the newest
+    /// 50.
     ///
     /// Deleted messages are filtered in the query rather than left to the caller, because the
     /// alternative breaks paging: a page of 50 that is mostly deleted would hand back a handful of
     /// rows with nothing to say that another page is warranted.
     ///
-    /// @throws std::invalid_argument if `limit` is not positive.  SQLite reads `LIMIT -1` as "all
-    /// of it"; this does not.  Reading all of history means paging with `before` until a page
-    /// comes back short.
+    /// @throws std::invalid_argument if `limit` is not positive, or if more than one of `before`,
+    /// `after` and `around` is set.  SQLite reads `LIMIT -1` as "all of it"; this does not.
+    /// Reading all of history means paging with `before` until a page comes back short.
     void messages(result_function<std::vector<Message>> cb) const;
     void messages(MessagePage page, result_function<std::vector<Message>> cb) const;
     std::vector<Message> messages(await_t) const;
     std::vector<Message> messages(MessagePage page, await_t) const;
-
-    /// The next page *newer* than `after`, newest first: the counterpart of `before`, for paging
-    /// forwards from a window that did not start at the newest message -- one opened by
-    /// `messages_around`.  The message at the cursor is not repeated, and a short page means there
-    /// is nothing newer.  Deleted messages as for `messages`.
-    ///
-    /// @throws std::invalid_argument if `limit` is not positive.
-    void messages_after(
-            int limit, MessageCursor after, result_function<std::vector<Message>> cb) const;
-    void messages_after(
-            int limit,
-            MessageCursor after,
-            bool include_deleted,
-            result_function<std::vector<Message>> cb) const;
-    std::vector<Message> messages_after(int limit, MessageCursor after, await_t) const;
-    std::vector<Message> messages_after(
-            int limit, MessageCursor after, bool include_deleted, await_t) const;
-
-    /// A window of `limit` messages around `at`, newest first, with the message at `at` as near the
-    /// middle as the history allows: of the rest, half older and half newer, and a side that runs
-    /// out gives what it lacks to the other, so the page is full wherever there are enough messages
-    /// to fill it.  For opening a conversation somewhere other than its newest message -- at
-    /// `first_unread()`, say -- with room to scroll both ways before the next page is needed;
-    /// `before` the oldest and `messages_after` the newest of it carry on in each direction.
-    ///
-    /// The message at `at` is in the window unless it is deleted and `include_deleted` is not set;
-    /// either way the window is placed by it.
-    ///
-    /// @throws std::invalid_argument if `limit` is not positive.
-    void messages_around(
-            int limit, MessageCursor at, result_function<std::vector<Message>> cb) const;
-    void messages_around(
-            int limit,
-            MessageCursor at,
-            bool include_deleted,
-            result_function<std::vector<Message>> cb) const;
-    std::vector<Message> messages_around(int limit, MessageCursor at, await_t) const;
-    std::vector<Message> messages_around(
-            int limit, MessageCursor at, bool include_deleted, await_t) const;
 
     /// Where the unread messages start: the cursor of the oldest message `unread` counts --
     /// incoming, not deleted, and newer than the read watermark -- or nullopt with nothing unread.
@@ -606,8 +568,6 @@ class AnyConversation {
         return base().name(std::forward<A>(a)...); \
     }
 
-    SESSION_CONVO_FORWARD(messages_after)
-    SESSION_CONVO_FORWARD(messages_around)
     SESSION_CONVO_FORWARD(first_unread)
     SESSION_CONVO_FORWARD(mark_read)
     SESSION_CONVO_FORWARD(set_marked_unread)

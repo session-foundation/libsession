@@ -676,6 +676,9 @@ void Client::_require_page(std::string_view op, const MessagePage& page) {
     if (page.limit <= 0)
         throw std::invalid_argument{
                 "{}: limit must be a positive page size (got {})"_format(op, page.limit)};
+    if (page.before.has_value() + page.after.has_value() + page.around.has_value() > 1)
+        throw std::invalid_argument{
+                "{}: a page is before, after or around one cursor, not several"_format(op)};
 }
 
 void Client::log_operation_failure(const std::exception& e) {
@@ -3980,6 +3983,11 @@ void Client::_load_reply_targets(
 }
 
 std::vector<Message> Client::_messages(const ConversationId& id, const MessagePage& page) {
+    if (page.after)
+        return _messages_after(id, page.limit, *page.after, page.include_deleted);
+    if (page.around)
+        return _messages_around(id, page.limit, *page.around, page.include_deleted);
+
     auto c = core.database().conn();
     auto convo = find_conversation(c, id);
     if (!convo)

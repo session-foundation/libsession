@@ -495,12 +495,12 @@ TEST_CASE("Client: message history pages forwards by cursor", "[client][messages
     REQUIRE(third.body == "msg3");
 
     // The four just newer than the cursor, newest first, the cursor's own message left out.
-    CHECK(bodies(conversation->messages_after(4, third.cursor(), await)) ==
+    CHECK(bodies(conversation->messages({.limit = 4, .after = third.cursor()}, await)) ==
           std::vector<std::string>{"msg7", "msg6", "msg5", "msg4"});
     // Short at the newest end, and empty past it.
-    CHECK(bodies(conversation->messages_after(4, all[1].cursor(), await)) ==
+    CHECK(bodies(conversation->messages({.limit = 4, .after = all[1].cursor()}, await)) ==
           std::vector<std::string>{"msg10"});
-    CHECK(conversation->messages_after(4, all[0].cursor(), await).empty());
+    CHECK(conversation->messages({.limit = 4, .after = all[0].cursor()}, await).empty());
 }
 
 TEST_CASE("Client: a window around a message puts it in the middle", "[client][messages]") {
@@ -513,38 +513,54 @@ TEST_CASE("Client: a window around a message puts it in the middle", "[client][m
     auto all = conversation->messages({.limit = 10}, await);
     auto at = [&](int n) { return all[10 - n].cursor(); };
 
-    CHECK(bodies(conversation->messages_around(5, at(5), await)) ==
+    CHECK(bodies(conversation->messages({.limit = 5, .around = at(5)}, await)) ==
           std::vector<std::string>{"msg7", "msg6", "msg5", "msg4", "msg3"});
     // An even limit's spare row goes newer.
-    CHECK(bodies(conversation->messages_around(4, at(5), await)) ==
+    CHECK(bodies(conversation->messages({.limit = 4, .around = at(5)}, await)) ==
           std::vector<std::string>{"msg7", "msg6", "msg5", "msg4"});
 
     SECTION("a side that runs out gives its share to the other") {
-        CHECK(bodies(conversation->messages_around(5, at(9), await)) ==
+        CHECK(bodies(conversation->messages({.limit = 5, .around = at(9)}, await)) ==
               std::vector<std::string>{"msg10", "msg9", "msg8", "msg7", "msg6"});
-        CHECK(bodies(conversation->messages_around(5, at(2), await)) ==
+        CHECK(bodies(conversation->messages({.limit = 5, .around = at(2)}, await)) ==
               std::vector<std::string>{"msg5", "msg4", "msg3", "msg2", "msg1"});
     }
 
     SECTION("a limit past the history returns all of it") {
-        CHECK(conversation->messages_around(20, at(5), await).size() == 10);
+        CHECK(conversation->messages({.limit = 20, .around = at(5)}, await).size() == 10);
     }
 
     SECTION("deleted messages are skipped, and the window is still full") {
         REQUIRE(c->delete_message(all[10 - 4].id, await));
         REQUIRE(c->delete_message(all[10 - 6].id, await));
-        CHECK(bodies(conversation->messages_around(5, at(5), await)) ==
+        CHECK(bodies(conversation->messages({.limit = 5, .around = at(5)}, await)) ==
               std::vector<std::string>{"msg8", "msg7", "msg5", "msg3", "msg2"});
-        CHECK(conversation->messages_around(5, at(5), true, await).size() == 5);
+        CHECK(conversation->messages({.limit = 5, .around = at(5), .include_deleted = true}, await)
+                      .size() == 5);
     }
 
-    SECTION("it carries on with before and messages_after") {
-        auto window = conversation->messages_around(3, at(5), await);
+    SECTION("it carries on with before and after") {
+        auto window = conversation->messages({.limit = 3, .around = at(5)}, await);
         REQUIRE(bodies(window) == std::vector<std::string>{"msg6", "msg5", "msg4"});
-        CHECK(bodies(conversation->messages({.limit = 2, .before = window.back().cursor()}, await)) ==
+        CHECK(bodies(conversation->messages(
+                      {.limit = 2, .before = window.back().cursor()}, await)) ==
               std::vector<std::string>{"msg3", "msg2"});
-        CHECK(bodies(conversation->messages_after(2, window.front().cursor(), await)) ==
+        CHECK(bodies(conversation->messages(
+                      {.limit = 2, .after = window.front().cursor()}, await)) ==
               std::vector<std::string>{"msg8", "msg7"});
+    }
+
+    SECTION("one position at a time") {
+        CHECK_THROWS_AS(
+                conversation->messages({.before = at(5), .after = at(5)}, await),
+                std::invalid_argument);
+        CHECK_THROWS_AS(
+                conversation->messages({.after = at(5), .around = at(5)}, await),
+                std::invalid_argument);
+        auto ignore = [](Expected<std::vector<Message>>) {};
+        CHECK_THROWS_AS(
+                conversation->messages({.before = at(5), .around = at(5)}, ignore),
+                std::invalid_argument);
     }
 }
 

@@ -40,60 +40,6 @@ std::vector<Message> Conversation::messages(MessagePage page, await_t) const {
     return _client->call_get([this, page] { return _client->_messages(id, page); });
 }
 
-void Conversation::messages_after(
-        int limit, MessageCursor after, result_function<std::vector<Message>> cb) const {
-    messages_after(limit, after, false, std::move(cb));
-}
-void Conversation::messages_after(
-        int limit,
-        MessageCursor after,
-        bool include_deleted,
-        result_function<std::vector<Message>> cb) const {
-    _client->_require_page("messages_after", {.limit = limit});
-    _client->_async(
-            [c = _client, id = id, limit, after, include_deleted] {
-                return c->_messages_after(id, limit, after, include_deleted);
-            },
-            std::move(cb));
-}
-std::vector<Message> Conversation::messages_after(int limit, MessageCursor after, await_t) const {
-    return messages_after(limit, after, false, await);
-}
-std::vector<Message> Conversation::messages_after(
-        int limit, MessageCursor after, bool include_deleted, await_t) const {
-    _client->_require_page("messages_after", {.limit = limit});
-    return _client->call_get([this, limit, after, include_deleted] {
-        return _client->_messages_after(id, limit, after, include_deleted);
-    });
-}
-
-void Conversation::messages_around(
-        int limit, MessageCursor at, result_function<std::vector<Message>> cb) const {
-    messages_around(limit, at, false, std::move(cb));
-}
-void Conversation::messages_around(
-        int limit,
-        MessageCursor at,
-        bool include_deleted,
-        result_function<std::vector<Message>> cb) const {
-    _client->_require_page("messages_around", {.limit = limit});
-    _client->_async(
-            [c = _client, id = id, limit, at, include_deleted] {
-                return c->_messages_around(id, limit, at, include_deleted);
-            },
-            std::move(cb));
-}
-std::vector<Message> Conversation::messages_around(int limit, MessageCursor at, await_t) const {
-    return messages_around(limit, at, false, await);
-}
-std::vector<Message> Conversation::messages_around(
-        int limit, MessageCursor at, bool include_deleted, await_t) const {
-    _client->_require_page("messages_around", {.limit = limit});
-    return _client->call_get([this, limit, at, include_deleted] {
-        return _client->_messages_around(id, limit, at, include_deleted);
-    });
-}
-
 void Conversation::first_unread(result_function<std::optional<MessageCursor>> cb) const {
     _client->_async([c = _client, id = id] { return c->_first_unread(id); }, std::move(cb));
 }
