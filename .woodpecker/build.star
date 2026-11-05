@@ -123,7 +123,10 @@ def workflow(name, platform, steps, when = None, clone = None):
         wf["clone"] = clone
     return wf
 
-build_tools = ["cmake", "make", "git", "ccache", "ca-certificates"]
+# nasm is for libjpeg-turbo's and dav1d's x86 assembly, without which session-deps refuses to build
+# them; it is installed everywhere because it is tiny, and cheaper than working out which builds
+# target x86.
+build_tools = ["cmake", "make", "git", "ccache", "ca-certificates", "nasm"]
 
 # Where a build gets meson, which the libvips stack (libvips, glib) builds with, at 1.4 or later:
 # from the image's own apt by default, from a Debian backports suite when that is the only place an
