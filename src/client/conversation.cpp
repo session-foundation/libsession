@@ -25,46 +25,19 @@ namespace session::client {
 // -- Reading ------------------------------------------------------------------------------------
 
 void Conversation::messages(result_function<std::vector<Message>> cb) const {
-    messages(50, std::nullopt, std::move(cb));
+    messages(MessagePage{}, std::move(cb));
 }
-void Conversation::messages(int limit, result_function<std::vector<Message>> cb) const {
-    messages(limit, std::nullopt, std::move(cb));
-}
-void Conversation::messages(
-        int limit,
-        std::optional<MessageCursor> before,
-        result_function<std::vector<Message>> cb) const {
-    messages(limit, before, false, std::move(cb));
-}
-void Conversation::messages(
-        int limit,
-        std::optional<MessageCursor> before,
-        bool include_deleted,
-        result_function<std::vector<Message>> cb) const {
-    _client->_require_page("messages", limit);
-    _client->_async(
-            [c = _client, id = id, limit, before, include_deleted] {
-                return c->_messages(id, limit, before, include_deleted);
-            },
-            std::move(cb));
+void Conversation::messages(MessagePage page, result_function<std::vector<Message>> cb) const {
+    _client->_require_page("messages", page);
+    _client->_async([c = _client, id = id, page] { return c->_messages(id, page); }, std::move(cb));
 }
 
 std::vector<Message> Conversation::messages(await_t) const {
-    return messages(50, std::nullopt, await);
+    return messages(MessagePage{}, await);
 }
-std::vector<Message> Conversation::messages(int limit, await_t) const {
-    return messages(limit, std::nullopt, await);
-}
-std::vector<Message> Conversation::messages(
-        int limit, std::optional<MessageCursor> before, await_t) const {
-    return messages(limit, before, false, await);
-}
-std::vector<Message> Conversation::messages(
-        int limit, std::optional<MessageCursor> before, bool include_deleted, await_t) const {
-    _client->_require_page("messages", limit);
-    return _client->call_get([this, limit, before, include_deleted] {
-        return _client->_messages(id, limit, before, include_deleted);
-    });
+std::vector<Message> Conversation::messages(MessagePage page, await_t) const {
+    _client->_require_page("messages", page);
+    return _client->call_get([this, page] { return _client->_messages(id, page); });
 }
 
 void Conversation::purge_deleted(result_function<size_t> cb) {

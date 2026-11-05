@@ -48,13 +48,33 @@ enum class SendState : int {
     uploading = 5,
 };
 
-/// A position in a conversation's message history, used to page backwards.  Ordering is by
+/// A position in a conversation's message history, used to page through it.  Ordering is by
 /// timestamp then message id, so this is a stable cursor even when several messages share a
 /// timestamp.
 struct MessageCursor {
     sys_ms timestamp;
     int64_t id;
     std::strong_ordering operator<=>(const MessageCursor&) const = default;
+};
+
+/// Which page of history `Conversation::messages` reads.  Designated initialisers make a call say
+/// which parts it is using:
+///
+///     convo->messages({.limit = 20, .before = page.back().cursor()}, await);
+struct MessagePage {
+    /// At most this many messages.  Must be positive: there is no value meaning "all of it", since
+    /// history grows without bound.
+    int limit = 50;
+
+    /// The page older than this cursor, as read from the `cursor()` of the last message of the
+    /// previous page; the message at the cursor is not repeated.  Unset reads the newest page.
+    std::optional<MessageCursor> before;
+
+    /// Deleted messages are left out unless this is set.  Out by default because a deleted
+    /// message carries no body, so a caller that has not thought about `Message::deleted` would
+    /// draw an empty row that looks like a bug.  A client that wants to show "message deleted"
+    /// asks for them, and gets them in place, in order.
+    bool include_deleted = false;
 };
 
 /// How far a deletion went, for a message whose content has been removed.
