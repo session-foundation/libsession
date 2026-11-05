@@ -193,6 +193,18 @@ if(STATIC_BUNDLE)
         "${CMAKE_CURRENT_BINARY_DIR}/libsession-util.a" ${bundle_system_libs})
     add_dependencies(static-bundle-test session-util)
 
+    # On Apple, a dependency that calls a function newer than the deployment target links without
+    # complaint and crashes only on the older OS.  Building static-bundle-test is the bundle's test
+    # (utils/static-bundle.sh, and so the iOS and macOS packages, build it), so it includes this.
+    if(APPLE)
+        add_custom_target(check-weak-imports
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/utils/check-weak-imports.sh
+                ${CMAKE_CURRENT_BINARY_DIR}/libsession-util.a
+            VERBATIM)
+        add_dependencies(check-weak-imports session-util)
+        add_dependencies(static-bundle-test check-weak-imports)
+    endif()
+
     set(lib_folder lib)
     if(IOS)
         set(lib_folder "${lib_folder}-${ARCH}")
