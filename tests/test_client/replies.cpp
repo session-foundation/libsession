@@ -319,6 +319,40 @@ TEST_CASE("Client: a reply carries the message it answers", "[client][replies]")
     CHECK(target.timestamp == first);
 }
 
+TEST_CASE("Client: a window and a newer page carry what replies answer", "[client][replies]") {
+    TempClient c;
+    SenderKeys peer;
+    auto convo = ConversationId::dm(peer.session_id);
+
+    auto first = from_epoch_ms(1000);
+    deliver(*c, peer, "what was said", first, "h1", "", std::nullopt, nullptr, 7777);
+    deliver(*c,
+            peer,
+            "the answer",
+            from_epoch_ms(2000),
+            "h2",
+            "",
+            std::nullopt,
+            quoting(peer.session_id, first, 7777));
+    sync(*c);
+
+    auto original = c->conversation(convo, await)->messages(await).at(1);
+    REQUIRE(original.body == "what was said");
+
+    auto window = c->conversation(convo, await)->messages_around(original.id, 1, 1, await);
+    REQUIRE(window.size() == 2);
+    REQUIRE(window[0].reply);
+    REQUIRE(window[0].reply->message);
+    CHECK(window[0].reply->message->body == "what was said");
+
+    auto newer = c->conversation(convo, await)
+                         ->messages({.limit = 1, .after = original.cursor()}, await);
+    REQUIRE(newer.size() == 1);
+    REQUIRE(newer[0].reply);
+    REQUIRE(newer[0].reply->message);
+    CHECK(newer[0].reply->message->id == original.id);
+}
+
 TEST_CASE("Client: a quoted attachment-only message arrives whole", "[client][replies]") {
     TempClient c;
     SenderKeys peer;

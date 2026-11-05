@@ -40,6 +40,35 @@ std::vector<Message> Conversation::messages(MessagePage page, await_t) const {
     return _client->call_get([this, page] { return _client->_messages(id, page); });
 }
 
+void Conversation::messages_around(
+        int64_t message_id, int before, int after, result_function<std::vector<Message>> cb) const {
+    messages_around(message_id, before, after, false, std::move(cb));
+}
+void Conversation::messages_around(
+        int64_t message_id,
+        int before,
+        int after,
+        bool include_deleted,
+        result_function<std::vector<Message>> cb) const {
+    _client->_require_span("messages_around", before, after);
+    _client->_async(
+            [c = _client, id = id, message_id, before, after, include_deleted] {
+                return c->_messages_around(id, message_id, before, after, include_deleted);
+            },
+            std::move(cb));
+}
+std::vector<Message> Conversation::messages_around(
+        int64_t message_id, int before, int after, await_t) const {
+    return messages_around(message_id, before, after, false, await);
+}
+std::vector<Message> Conversation::messages_around(
+        int64_t message_id, int before, int after, bool include_deleted, await_t) const {
+    _client->_require_span("messages_around", before, after);
+    return _client->call_get([this, message_id, before, after, include_deleted] {
+        return _client->_messages_around(id, message_id, before, after, include_deleted);
+    });
+}
+
 void Conversation::purge_deleted(result_function<size_t> cb) {
     _client->_require_dm("purge_deleted", id);
     _client->_async([c = _client, id = id] { return c->_purge_deleted(id); }, std::move(cb));

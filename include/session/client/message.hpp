@@ -67,8 +67,15 @@ struct MessagePage {
     int limit = 50;
 
     /// The page older than this cursor, as read from the `cursor()` of the last message of the
-    /// previous page; the message at the cursor is not repeated.  Unset reads the newest page.
+    /// previous page; the message at the cursor is not repeated.  With neither this nor `after`,
+    /// the newest page.
     std::optional<MessageCursor> before;
+
+    /// The page newer than this cursor, for a window that does not reach the newest message (see
+    /// `Conversation::messages_around`): the `limit` messages immediately after it, still newest
+    /// first, so the next one is from the `cursor()` of the *first* message.  A page shorter than
+    /// `limit` has reached the newest message.  Not together with `before`.
+    std::optional<MessageCursor> after;
 
     /// Deleted messages are left out unless this is set.  Out by default because a deleted
     /// message carries no body, so a caller that has not thought about `Message::deleted` would

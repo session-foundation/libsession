@@ -196,13 +196,43 @@ class Conversation {
     /// alternative breaks paging: a page of 50 that is mostly deleted would hand back a handful of
     /// rows with nothing to say that another page is warranted.
     ///
-    /// @throws std::invalid_argument if `limit` is not positive.  SQLite reads `LIMIT -1` as "all
+    /// @throws std::invalid_argument if `limit` is not positive, or if both `before` and `after`
+    /// are set.  SQLite reads `LIMIT -1` as "all
     /// of it"; this does not.  Reading all of history means paging with `before` until a page
     /// comes back short.
     void messages(result_function<std::vector<Message>> cb) const;
     void messages(MessagePage page, result_function<std::vector<Message>> cb) const;
     std::vector<Message> messages(await_t) const;
     std::vector<Message> messages(MessagePage page, await_t) const;
+
+    /// The message `message_id` with up to `before` older and `after` newer messages around it,
+    /// newest first like `messages()`: what a client reads to show a message that is not in its
+    /// current window, such as the original of a reply.  Pages on from either end with
+    /// `messages()`, `before` the last message's `cursor()` and `after` the first's.
+    ///
+    /// Deleted messages follow the same rule as in `messages()`, the target included.
+    ///
+    /// Empty when there is nothing to show at `message_id`: no such message, a message in another
+    /// conversation, or a deleted one without `include_deleted`.  Otherwise the target is always
+    /// in the result.  Fewer than `after` messages newer than it means the window reaches the
+    /// newest message, and fewer than `before` older means it reaches the oldest.
+    ///
+    /// @throws std::invalid_argument if `before` or `after` is negative.  Zero is allowed, for a
+    /// window that only extends one way.
+    void messages_around(
+            int64_t message_id,
+            int before,
+            int after,
+            result_function<std::vector<Message>> cb) const;
+    void messages_around(
+            int64_t message_id,
+            int before,
+            int after,
+            bool include_deleted,
+            result_function<std::vector<Message>> cb) const;
+    std::vector<Message> messages_around(int64_t message_id, int before, int after, await_t) const;
+    std::vector<Message> messages_around(
+            int64_t message_id, int before, int after, bool include_deleted, await_t) const;
 
     /// Removes every deleted message's leftover row from this conversation, and says how many went.
     ///
@@ -564,6 +594,7 @@ class AnyConversation {
         return base().name(std::forward<A>(a)...); \
     }
 
+    SESSION_CONVO_FORWARD(messages_around)
     SESSION_CONVO_FORWARD(mark_read)
     SESSION_CONVO_FORWARD(set_marked_unread)
     SESSION_CONVO_FORWARD(set_priority)

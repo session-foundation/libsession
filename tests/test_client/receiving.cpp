@@ -497,6 +497,183 @@ TEST_CASE("Client: paging is stable across equal timestamps", "[client][messages
     CHECK(seen == std::vector<std::string>{"same3", "same2", "same1"});
 }
 
+namespace {
+
+std::vector<std::string> bodies(const std::vector<Message>& page) {
+    std::vector<std::string> out;
+    for (const auto& m : page)
+        out.push_back(m.body);
+    return out;
+}
+
+using strings = std::vector<std::string>;
+
+}  // namespace
+
+TEST_CASE("Client: message history pages forwards with after", "[client][messages]") {
+    TempClient c;
+    SenderKeys sender;
+    auto convo = ConversationId::dm(sender.session_id);
+
+    for (int i = 1; i <= 10; i++)
+        deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
+
+    auto oldest = c->conversation(convo, await)->messages({.limit = 10}, await).back();
+    REQUIRE(oldest.body == "msg1");
+
+    // Newest first like every other read, so the next page goes on from the first message.
+    auto page1 =
+            c->conversation(convo, await)->messages({.limit = 4, .after = oldest.cursor()}, await);
+    CHECK(bodies(page1) == strings{"msg5", "msg4", "msg3", "msg2"});
+
+    auto page2 = c->conversation(convo, await)
+                         ->messages({.limit = 4, .after = page1.front().cursor()}, await);
+    CHECK(bodies(page2) == strings{"msg9", "msg8", "msg7", "msg6"});
+
+    auto page3 = c->conversation(convo, await)
+                         ->messages({.limit = 4, .after = page2.front().cursor()}, await);
+    CHECK(bodies(page3) == strings{"msg10"});
+
+    CHECK(c->conversation(convo, await)
+                  ->messages({.limit = 4, .after = page3.front().cursor()}, await)
+                  .empty());
+
+    CHECK_THROWS_AS(
+            c->conversation(convo, await)->messages({.limit = 0, .after = oldest.cursor()}, await),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            c->conversation(convo, await)
+                    ->messages({.before = oldest.cursor(), .after = oldest.cursor()}, await),
+            std::invalid_argument);
+}
+
+TEST_CASE("Client: paging forwards is stable across equal timestamps", "[client][messages]") {
+    TempClient c;
+    SenderKeys sender;
+    auto convo = ConversationId::dm(sender.session_id);
+
+    deliver(*c, sender, "before", from_epoch_ms(500), "h0");
+    for (int i = 1; i <= 3; i++)
+        deliver(*c, sender, "same{}"_format(i), from_epoch_ms(1000), "same_h{}"_format(i));
+
+    std::vector<std::string> seen;
+    auto cursor = c->conversation(convo, await)->messages({.limit = 4}, await).back().cursor();
+    while (true) {
+        auto page = c->conversation(convo, await)->messages({.limit = 1, .after = cursor}, await);
+        if (page.empty())
+            break;
+        seen.push_back(page[0].body);
+        cursor = page[0].cursor();
+    }
+
+    CHECK(seen == strings{"same1", "same2", "same3"});
+}
+
+TEST_CASE("Client: a window around a message", "[client][messages]") {
+    TempClient c;
+    SenderKeys sender;
+    auto convo = ConversationId::dm(sender.session_id);
+
+    for (int i = 1; i <= 10; i++)
+        deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
+
+    std::map<std::string, int64_t> ids;
+    for (const auto& m : c->conversation(convo, await)->messages({.limit = 10}, await))
+        ids[m.body] = m.id;
+
+    auto around = [&](const std::string& body, int before, int after) {
+        return bodies(
+                c->conversation(convo, await)->messages_around(ids[body], before, after, await));
+    };
+
+    SECTION("in the middle") {
+        CHECK(around("msg5", 2, 3) == strings{"msg8", "msg7", "msg6", "msg5", "msg4", "msg3"});
+    }
+    SECTION("at the newest message") {
+        CHECK(around("msg10", 2, 2) == strings{"msg10", "msg9", "msg8"});
+    }
+    SECTION("at the oldest message") {
+        CHECK(around("msg1", 2, 2) == strings{"msg3", "msg2", "msg1"});
+    }
+    SECTION("with fewer neighbours than asked for") {
+        CHECK(around("msg2", 5, 20) == strings{"msg10",
+                                               "msg9",
+                                               "msg8",
+                                               "msg7",
+                                               "msg6",
+                                               "msg5",
+                                               "msg4",
+                                               "msg3",
+                                               "msg2",
+                                               "msg1"});
+    }
+    SECTION("one way only") {
+        CHECK(around("msg5", 0, 2) == strings{"msg7", "msg6", "msg5"});
+        CHECK(around("msg5", 2, 0) == strings{"msg5", "msg4", "msg3"});
+        CHECK(around("msg5", 0, 0) == strings{"msg5"});
+    }
+    SECTION("pages on from either end") {
+        auto window = c->conversation(convo, await)->messages_around(ids["msg5"], 1, 1, await);
+        REQUIRE(bodies(window) == strings{"msg6", "msg5", "msg4"});
+        CHECK(bodies(c->conversation(convo, await)
+                             ->messages({.limit = 2, .before = window.back().cursor()}, await)) ==
+              strings{"msg3", "msg2"});
+        CHECK(bodies(c->conversation(convo, await)
+                             ->messages({.limit = 2, .after = window.front().cursor()}, await)) ==
+              strings{"msg8", "msg7"});
+    }
+    SECTION("refuses a negative extent") {
+        CHECK_THROWS_AS(
+                c->conversation(convo, await)->messages_around(ids["msg5"], -1, 2, await),
+                std::invalid_argument);
+        auto ignore = [](Expected<std::vector<Message>>) {};
+        CHECK_THROWS_AS(
+                c->conversation(convo, await)->messages_around(ids["msg5"], 2, -1, ignore),
+                std::invalid_argument);
+    }
+}
+
+TEST_CASE("Client: a window is empty when its message is not there", "[client][messages]") {
+    TempClient c;
+    SenderKeys sender, other;
+    auto convo = ConversationId::dm(sender.session_id);
+
+    deliver(*c, sender, "one", from_epoch_ms(1000), "h1");
+    deliver(*c, sender, "two", from_epoch_ms(2000), "h2");
+    deliver(*c, sender, "three", from_epoch_ms(3000), "h3");
+    deliver(*c, other, "elsewhere", from_epoch_ms(2500), "o1");
+
+    auto msgs = c->conversation(convo, await)->messages(await);
+    REQUIRE(bodies(msgs) == strings{"three", "two", "one"});
+    auto elsewhere =
+            c->conversation(ConversationId::dm(other.session_id), await)->messages(await).at(0).id;
+
+    SECTION("an unknown id") {
+        CHECK(c->conversation(convo, await)
+                      ->messages_around(msgs[0].id + 1000, 5, 5, await)
+                      .empty());
+    }
+
+    SECTION("a message in another conversation") {
+        CHECK(c->conversation(convo, await)->messages_around(elsewhere, 5, 5, await).empty());
+    }
+
+    SECTION("a deleted message") {
+        REQUIRE(c->delete_message(msgs[1].id, await));
+
+        // Hidden like in messages(), the target included...
+        CHECK(c->conversation(convo, await)->messages_around(msgs[1].id, 5, 5, await).empty());
+        CHECK(bodies(c->conversation(convo, await)->messages_around(msgs[0].id, 5, 5, await)) ==
+              strings{"three", "one"});
+
+        // ...and in place when asked for.
+        auto all = c->conversation(convo, await)->messages_around(msgs[1].id, 5, 5, true, await);
+        REQUIRE(all.size() == 3);
+        CHECK(all[1].id == msgs[1].id);
+        CHECK(all[1].deleted == Deletion::here);
+    }
+}
+
 TEST_CASE("Client: a message can be shown as it was on the wire", "[client][messages][debug]") {
     TempClient c;
     SenderKeys sender;

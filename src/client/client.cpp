@@ -677,6 +677,16 @@ void Client::_require_page(std::string_view op, const MessagePage& page) {
     if (page.limit <= 0)
         throw std::invalid_argument{
                 "{}: limit must be a positive page size (got {})"_format(op, page.limit)};
+    if (page.before && page.after)
+        throw std::invalid_argument{
+                "{}: a page is before a cursor or after one, not both"_format(op)};
+}
+
+void Client::_require_span(std::string_view op, int before, int after) {
+    // Reaches SQLite as `LIMIT ?` too, where a negative would read every message on that side.
+    if (before < 0 || after < 0)
+        throw std::invalid_argument{
+                "{}: before and after must not be negative (got {}, {})"_format(op, before, after)};
 }
 
 void Client::log_operation_failure(const std::exception& e) {
@@ -3990,18 +4000,29 @@ void Client::_load_reply_targets(
                 m.reply->message = found->second;
 }
 
+// Rows strictly past the cursor bound at `?{ts}` and `?{id}`, in the direction `op` ("<" for older,
+// ">" for newer), on (timestamp, id).  Spelled out rather than as an SQL row value so this does not
+// depend on the SQLite version's row-value support.
+static std::string past_cursor(std::string_view op, int ts, int id) {
+    return "(m.timestamp {0} ?{1} OR (m.timestamp = ?{1} AND m.id {0} ?{2}))"_format(op, ts, id);
+}
+
+// In the query rather than dropped from the result, so that a limit counts rows the caller will
+// actually see: filtering afterwards would return short pages with nothing to say that another page
+// is warranted.
+static std::string_view visible_rows(bool include_deleted) {
+    return include_deleted ? ""sv : "AND m.deleted IS NULL"sv;
+}
+
 std::vector<Message> Client::_messages(const ConversationId& id, const MessagePage& page) {
     auto c = core.database().conn();
     auto convo = find_conversation(c, id);
     if (!convo)
         return {};
 
-    // In the query rather than dropped from the result, so that `limit` counts rows the caller will
-    // actually see: filtering afterwards would return short pages with nothing to say that another
-    // page is warranted.
-    auto visible = page.include_deleted ? ""sv : "AND m.deleted IS NULL"sv;
+    auto visible = visible_rows(page.include_deleted);
 
-    if (!page.before)
+    if (!page.before && !page.after)
         return _query_messages(
                 c,
                 id,
@@ -4012,21 +4033,69 @@ std::vector<Message> Client::_messages(const ConversationId& id, const MessagePa
                 *convo,
                 page.limit);
 
-    // Strictly-older-than comparison on (timestamp, id), spelled out rather than as an SQL row
-    // value so this does not depend on the SQLite version's row-value support.
+    // Ordered away from the cursor, so the limit keeps the rows nearest it; a newer page is then
+    // reversed to the newest-first order every read returns.
+    auto cursor = page.before ? *page.before : *page.after;
+    auto result = _query_messages(
+            c,
+            id,
+            ReplyDepth::with_target,
+            R"(
+        {0} WHERE m.conversation = ?1 {1} AND {2}
+           ORDER BY m.timestamp {3}, m.id {3} LIMIT ?4
+    )"_format(MESSAGE_COLUMNS,
+              visible,
+              past_cursor(page.before ? "<" : ">", 2, 3),
+              page.before ? "DESC" : "ASC"),
+            *convo,
+            epoch_ms(cursor.timestamp),
+            cursor.id,
+            page.limit);
+    if (page.after)
+        std::ranges::reverse(result);
+    return result;
+}
+
+std::vector<Message> Client::_messages_around(
+        const ConversationId& id, int64_t message_id, int before, int after, bool include_deleted) {
+    auto c = core.database().conn();
+    auto convo = find_conversation(c, id);
+    if (!convo)
+        return {};
+
+    auto visible = visible_rows(include_deleted);
+
+    auto target = c.prepared_maybe_get<int64_t>(
+            "SELECT m.timestamp FROM messages m WHERE m.id = ? AND m.conversation = ? {}"_format(
+                    visible),
+            message_id,
+            *convo);
+    if (!target)
+        return {};
+
+    // One read for the whole window, so that attachments and reply targets are loaded once for it
+    // rather than once per side.  Each side is its own subquery so that its limit keeps the rows
+    // nearest the target.
     return _query_messages(
             c,
             id,
             ReplyDepth::with_target,
             R"(
-        {} WHERE m.conversation = ?1 {}
-             AND (m.timestamp < ?2 OR (m.timestamp = ?2 AND m.id < ?3))
-           ORDER BY m.timestamp DESC, m.id DESC LIMIT ?4
-    )"_format(MESSAGE_COLUMNS, visible),
+        {0} WHERE m.id IN (
+            SELECT id FROM (
+                SELECT m.id FROM messages m WHERE m.conversation = ?1 {1} AND {2}
+                 ORDER BY m.timestamp DESC, m.id DESC LIMIT ?4)
+            UNION ALL SELECT ?3
+            UNION ALL SELECT id FROM (
+                SELECT m.id FROM messages m WHERE m.conversation = ?1 {1} AND {3}
+                 ORDER BY m.timestamp ASC, m.id ASC LIMIT ?5))
+        ORDER BY m.timestamp DESC, m.id DESC
+    )"_format(MESSAGE_COLUMNS, visible, past_cursor("<", 2, 3), past_cursor(">", 2, 3)),
             *convo,
-            epoch_ms(page.before->timestamp),
-            page.before->id,
-            page.limit);
+            *target,
+            message_id,
+            before,
+            after);
 }
 
 void Client::_emit_attachment_availability(std::string_view url) {
