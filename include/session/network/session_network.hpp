@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <limits>
 #include <optional>
-#include <oxen/quic.hpp>
+#include <oxen/quic/loop.hpp>
 
 #include "session/network/backends/session_file_server.hpp"
 #include "session/network/network_config.hpp"

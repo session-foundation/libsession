@@ -10,7 +10,10 @@ namespace {
 std::shared_ptr<QuicTransport> make_transport(std::shared_ptr<oxen::quic::Loop> loop) {
     return std::make_shared<QuicTransport>(
             config::QuicTransport{
-                    .handshake_timeout = 1s, .keep_alive = 10s, .max_udp_payload = std::nullopt},
+                    .handshake_timeout = 1s,
+                    .keep_alive = 10s,
+                    .max_udp_payload = std::nullopt,
+                    .congestion_control = std::nullopt},
             std::move(loop));
 }
 

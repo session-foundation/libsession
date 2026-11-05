@@ -5,6 +5,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include "session/network/key_types.hpp"

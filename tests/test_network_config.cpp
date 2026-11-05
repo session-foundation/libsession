@@ -30,3 +30,19 @@ TEST_CASE("Network config: QUIC UDP payload cap", "[network][config][quic]") {
         CHECK_FALSE(c.quic_disable_mtu_discovery);
     }
 }
+
+TEST_CASE("Network config: QUIC congestion control", "[network][config][quic]") {
+    SECTION("unset by default") {
+        config::Config cfg{opt::quic_keep_alive{std::chrono::seconds{10}}};
+        CHECK_FALSE(cfg.quic_congestion_control.has_value());
+    }
+    SECTION("explicit algorithm") {
+        config::Config cfg{opt::quic_congestion_control::bbr};
+        REQUIRE(cfg.quic_congestion_control.has_value());
+        CHECK(*cfg.quic_congestion_control == opt::quic_congestion_control::bbr);
+    }
+    SECTION("C defaults leave libquic's default") {
+        auto c = session_network_config_default();
+        CHECK(c.quic_congestion_control == SESSION_NETWORK_QUIC_CONGESTION_CONTROL_DEFAULT);
+    }
+}

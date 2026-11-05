@@ -11,9 +11,11 @@
 #include <limits>
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
-#include <oxen/quic.hpp>
+#include <oxen/quic/ip.hpp>
+#include <oxen/quic/loop.hpp>
 #include <oxen/quic/utils.hpp>
 #include <type_traits>
+#include <unordered_set>
 
 #include "session/file.hpp"
 #include "session/hash.hpp"

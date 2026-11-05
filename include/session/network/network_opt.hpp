@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <oxen/quic/opt.hpp>
 #include <type_traits>
 #include <variant>
 
@@ -387,6 +388,12 @@ namespace opt {
     /// probe.
     struct quic_disable_mtu_discovery {};
 
+    /// Can be used to choose the congestion control algorithm Quic connections use for what they
+    /// send; without it libquic's default is used.  BBR keeps its sending rate through loss that
+    /// isn't caused by congestion, which suits jittery mobile networks, while cubic and reno back
+    /// off on any loss.
+    using quic_congestion_control = oxen::quic::opt::congestion_control;
+
     // MARK: Onion Request Router Options
 
     /// Can be used to override the default (3) number of times a path can receive an error before
@@ -477,6 +484,7 @@ namespace opt {
             quic_keep_alive,
             quic_max_udp_payload,
             quic_disable_mtu_discovery,
+            quic_congestion_control,
 
             // Onion request router options
             onionreq_path_strike_threshold,

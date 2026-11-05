@@ -3,6 +3,10 @@
 #include <atomic>
 #include <functional>
 #include <optional>
+#include <oxen/quic/address.hpp>
+#include <oxen/quic/connection_ids.hpp>
+#include <oxen/quic/endpoint.hpp>
+#include <oxen/quic/loop.hpp>
 #include <set>
 #include <string>
 #include <vector>
@@ -25,6 +29,7 @@ namespace config {
         std::chrono::seconds keep_alive;
 
         std::optional<size_t> max_udp_payload;
+        std::optional<opt::quic_congestion_control> congestion_control;
     };
 }  // namespace config
 
