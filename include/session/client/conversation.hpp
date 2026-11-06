@@ -189,38 +189,29 @@ class Conversation {
 
     // -- Reading ------------------------------------------------------------------------------
 
-    /// A window of history, newest first.  Pass the `cursor()` of the last message of a page as
-    /// `before` to fetch the next (older) page; the message at the cursor is not repeated.
+    /// A page of history, newest first: the newest `MessagePage::limit` messages, the page older
+    /// or newer than a cursor, or a window around one, with whether more history lies beyond it
+    /// in each direction (see `MessagePageResult`).  Reading all of history means paging with
+    /// `before` until `has_older` is false.
     ///
-    /// Deleted messages are left out unless `include_deleted` is passed.  Out by default because a
-    /// deleted message carries no body, so a caller that has not thought about `Message::deleted`
-    /// would draw an empty row that looks like a bug.  A client that wants to show "message
-    /// deleted" asks for them, and gets them in place, in order.
+    /// The forms without a page read the newest page at the default size, as `MessagePage{}` does.
     ///
-    /// Filtered in the query rather than left to the caller, because the alternative breaks paging:
-    /// a page of 50 that is mostly deleted would hand back a handful of rows with nothing to say
-    /// that another page is warranted.
+    /// Deleted messages are filtered in the query rather than left to the caller, because the
+    /// alternative breaks paging: a page of 50 that is mostly deleted would hand back a handful of
+    /// rows, and the flags would count messages the page can never show.
     ///
-    /// @throws std::invalid_argument if `limit` is not positive.  In particular there is no value
-    /// meaning "all of it" -- SQLite reads `LIMIT -1` that way, this does not.  History grows
-    /// without bound, so reading all of it means paging with `before` until a page comes back
-    /// short.
-    void messages(result_function<std::vector<Message>> cb) const;
-    void messages(int limit, result_function<std::vector<Message>> cb) const;
-    void messages(
-            int limit,
-            std::optional<MessageCursor> before,
-            result_function<std::vector<Message>> cb) const;
-    void messages(
-            int limit,
-            std::optional<MessageCursor> before,
-            bool include_deleted,
-            result_function<std::vector<Message>> cb) const;
-    std::vector<Message> messages(await_t) const;
-    std::vector<Message> messages(int limit, await_t) const;
-    std::vector<Message> messages(int limit, std::optional<MessageCursor> before, await_t) const;
-    std::vector<Message> messages(
-            int limit, std::optional<MessageCursor> before, bool include_deleted, await_t) const;
+    /// @throws std::invalid_argument if `limit` is not positive, or if more than one of `before`,
+    /// `after` and `around` is set.  SQLite reads `LIMIT -1` as "all of it"; this does not.
+    void messages(result_function<MessagePageResult> cb) const;
+    void messages(MessagePage page, result_function<MessagePageResult> cb) const;
+    MessagePageResult messages(await_t) const;
+    MessagePageResult messages(MessagePage page, await_t) const;
+
+    /// Where the unread messages start: the cursor of the oldest message `unread` counts --
+    /// incoming, not deleted, and newer than the read watermark -- or nullopt with nothing unread.
+    /// Counted the same way as `unread`, so the two always agree on what is unread.
+    void first_unread(result_function<std::optional<MessageCursor>> cb) const;
+    std::optional<MessageCursor> first_unread(await_t) const;
 
     /// Removes every deleted message's leftover row from this conversation, and says how many went.
     ///
@@ -558,6 +549,16 @@ class AnyConversation {
     const Group* group() const { return std::get_if<Group>(&kind); }
     const Community* community() const { return std::get_if<Community>(&kind); }
 
+    // Spelled out rather than forwarded: a template cannot deduce a braced `{.limit = 20}`.
+    void messages(result_function<MessagePageResult> cb) const { base().messages(std::move(cb)); }
+    void messages(MessagePage page, result_function<MessagePageResult> cb) const {
+        base().messages(page, std::move(cb));
+    }
+    MessagePageResult messages(await_t) const { return base().messages(await); }
+    MessagePageResult messages(MessagePage page, await_t) const {
+        return base().messages(page, await);
+    }
+
 // Forwarded rather than reimplemented, so that an overload added to Conversation is reachable here
 // without anything being added below.
 #define SESSION_CONVO_FORWARD(name)                \
@@ -570,7 +571,7 @@ class AnyConversation {
         return base().name(std::forward<A>(a)...); \
     }
 
-    SESSION_CONVO_FORWARD(messages)
+    SESSION_CONVO_FORWARD(first_unread)
     SESSION_CONVO_FORWARD(mark_read)
     SESSION_CONVO_FORWARD(set_marked_unread)
     SESSION_CONVO_FORWARD(set_priority)

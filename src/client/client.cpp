@@ -671,12 +671,15 @@ void Client::_require_contact(std::string_view op, const ConversationId& id) {
         throw std::invalid_argument{"{}: not applicable to your own account"_format(op)};
 }
 
-void Client::_require_page(std::string_view op, int limit) {
+void Client::_require_page(std::string_view op, const MessagePage& page) {
     // The value reaches SQLite as `LIMIT ?`, where a negative is no limit at all and zero is the
     // end of the history -- so an unchecked one loads the whole conversation instead of failing.
-    if (limit <= 0)
+    if (page.limit <= 0)
         throw std::invalid_argument{
-                "{}: limit must be a positive page size (got {})"_format(op, limit)};
+                "{}: limit must be a positive page size (got {})"_format(op, page.limit)};
+    if (page.before.has_value() + page.after.has_value() + page.around.has_value() > 1)
+        throw std::invalid_argument{
+                "{}: a page is before, after or around one cursor, not several"_format(op)};
 }
 
 void Client::log_operation_failure(const std::exception& e) {
@@ -3852,9 +3855,20 @@ std::vector<Message> Client::_build_messages(
         sqlite::Connection& c,
         const ConversationId& convo,
         ReplyDepth depth,
-        SQLite::Statement& st) {
+        SQLite::Statement& st,
+        size_t max,
+        bool* more) {
     std::vector<Message> out;
+    if (more)
+        *more = false;
     while (st.executeStep()) {
+        if (out.size() == max) {
+            if (more)
+                *more = true;
+            // Reset now rather than left part-way through across the reads below.
+            st.reset();
+            break;
+        }
         auto [id,
               swarm_hash,
               sender,
@@ -3990,47 +4004,211 @@ void Client::_load_reply_targets(
                 m.reply->message = found->second;
 }
 
-std::vector<Message> Client::_messages(
-        const ConversationId& id,
-        int limit,
-        std::optional<MessageCursor> before,
+// The history's ordering, (timestamp, id), against a cursor bound as ?2 and ?3.  Spelled out rather
+// than as SQL row values so this does not depend on the SQLite version's row-value support.
+static constexpr auto NEWER_THAN_CURSOR =
+        "(m.timestamp > ?2 OR (m.timestamp = ?2 AND m.id > ?3))"sv;
+static constexpr auto OLDER_THAN_CURSOR =
+        "(m.timestamp < ?2 OR (m.timestamp = ?2 AND m.id < ?3))"sv;
+static constexpr auto AT_OR_NEWER_THAN_CURSOR =
+        "(m.timestamp > ?2 OR (m.timestamp = ?2 AND m.id >= ?3))"sv;
+
+// In the query rather than dropped from the result, so that `limit` counts rows the caller will
+// actually see: filtering afterwards would return short pages.  Every read that says whether a page
+// has more applies it too, so that a run of messages the page can never show does not count.
+static std::string_view visible_filter(bool include_deleted) {
+    return include_deleted ? ""sv : "AND m.deleted IS NULL"sv;
+}
+
+// Whether the conversation has a message the page would show on `side` of `cursor`.  Stops at the
+// first one the history index finds; without deleted messages each row is also looked up in the
+// table to check it, so a run of deleted ones next to the cursor is read through.
+static bool any_beyond(
+        sqlite::Connection& c,
+        int64_t convo,
+        std::string_view side,
+        MessageCursor cursor,
         bool include_deleted) {
+    auto query =
+            "SELECT EXISTS(SELECT 1 FROM messages m WHERE m.conversation = ?1 {} AND {})"_format(
+                    visible_filter(include_deleted), side);
+    return c.prepared_get<int64_t>(query, convo, epoch_ms(cursor.timestamp), cursor.id) != 0;
+}
+
+template <typename... Bind>
+std::vector<Message> Client::_query_page(
+        sqlite::Connection& c,
+        const ConversationId& convo,
+        int limit,
+        bool& more,
+        const std::string& query,
+        const Bind&... bind) {
+    auto st = c.prepared_st(query);
+    bind_oneshot(st, bind..., int64_t{limit} + 1);
+    return _build_messages(
+            c, convo, ReplyDepth::with_target, *st, static_cast<size_t>(limit), &more);
+}
+
+// Each page's flags come from the same read as its messages, on the loop that every insert also
+// runs on: asking afterwards would be a second job, and a message could land between the two.
+MessagePageResult Client::_messages(const ConversationId& id, const MessagePage& page) {
     auto c = core.database().conn();
     auto convo = find_conversation(c, id);
     if (!convo)
         return {};
+    if (page.after)
+        return _messages_after(c, id, *convo, page);
+    if (page.around)
+        return _messages_around(c, id, *convo, page);
+    return _messages_older(c, id, *convo, page);
+}
 
-    // In the query rather than dropped from the result, so that `limit` counts rows the caller will
-    // actually see: filtering afterwards would return short pages with nothing to say that another
-    // page is warranted.
-    auto visible = include_deleted ? ""sv : "AND m.deleted IS NULL"sv;
+MessagePageResult Client::_messages_older(
+        sqlite::Connection& c, const ConversationId& id, int64_t convo, const MessagePage& page) {
+    auto visible = visible_filter(page.include_deleted);
+    MessagePageResult out;
 
-    if (!before)
-        return _query_messages(
+    if (!page.before) {
+        out.messages = _query_page(
                 c,
                 id,
-                ReplyDepth::with_target,
+                page.limit,
+                out.has_older,
                 R"(
-            {} WHERE m.conversation = ? {} ORDER BY m.timestamp DESC, m.id DESC LIMIT ?
+            {} WHERE m.conversation = ?1 {} ORDER BY m.timestamp DESC, m.id DESC LIMIT ?2
         )"_format(MESSAGE_COLUMNS, visible),
-                *convo,
-                limit);
+                convo);
+        return out;  // and nothing is newer than the newest page
+    }
 
-    // Strictly-older-than comparison on (timestamp, id), spelled out rather than as an SQL row
-    // value so this does not depend on the SQLite version's row-value support.
-    return _query_messages(
+    out.messages = _query_page(
+            c,
+            id,
+            page.limit,
+            out.has_older,
+            R"(
+        {} WHERE m.conversation = ?1 {} AND {}
+           ORDER BY m.timestamp DESC, m.id DESC LIMIT ?4
+    )"_format(MESSAGE_COLUMNS, visible, OLDER_THAN_CURSOR),
+            convo,
+            epoch_ms(page.before->timestamp),
+            page.before->id);
+    out.has_newer = any_beyond(c, convo, NEWER_THAN_CURSOR, *page.before, page.include_deleted);
+    return out;
+}
+
+MessagePageResult Client::_messages_after(
+        sqlite::Connection& c, const ConversationId& id, int64_t convo, const MessagePage& page) {
+    MessagePageResult out;
+
+    // Ascending, so that `limit` takes the messages nearest the cursor rather than the newest in
+    // the conversation; turned round afterwards to the newest-first order every page comes in.
+    out.messages = _query_page(
+            c,
+            id,
+            page.limit,
+            out.has_newer,
+            R"(
+        {} WHERE m.conversation = ?1 {} AND {}
+           ORDER BY m.timestamp ASC, m.id ASC LIMIT ?4
+    )"_format(MESSAGE_COLUMNS, visible_filter(page.include_deleted), NEWER_THAN_CURSOR),
+            convo,
+            epoch_ms(page.after->timestamp),
+            page.after->id);
+    std::ranges::reverse(out.messages);
+    out.has_older = any_beyond(c, convo, OLDER_THAN_CURSOR, *page.after, page.include_deleted);
+    return out;
+}
+
+MessagePageResult Client::_messages_around(
+        sqlite::Connection& c, const ConversationId& id, int64_t convo, const MessagePage& page) {
+    auto visible = visible_filter(page.include_deleted);
+    auto at = *page.around;
+    auto limit = static_cast<size_t>(page.limit);
+
+    // Keys first, up to one more than `limit` each side, so that one which runs short can be made
+    // up from the other, and so that whatever share of the window a side ends up with, there is a
+    // key past it if that side continues: the message at the cursor and newer, oldest first, and
+    // everything older, newest first.  These walk the history index in order and read two columns,
+    // which is what makes asking for a whole `limit` on each side cheap; building a message costs
+    // far more, and only the window is built.  The index has no `deleted`, so unless deleted
+    // messages are included each row is also looked up in the table to check it.
+    using Key = std::pair<int64_t, int64_t>;
+    auto keys = [&](std::string_view side, std::string_view order) {
+        std::vector<Key> out;
+        for (auto [t, i] : c.prepared_results<int64_t, int64_t>(
+                     R"(
+                SELECT m.timestamp, m.id FROM messages m
+                WHERE m.conversation = ?1 {} AND {}
+                ORDER BY m.timestamp {}, m.id {} LIMIT ?4
+            )"_format(visible, side, order, order),
+                     convo,
+                     epoch_ms(at.timestamp),
+                     at.id,
+                     int64_t{page.limit} + 1))
+            out.emplace_back(t, i);
+        return out;
+    };
+    auto newer = keys(AT_OR_NEWER_THAN_CURSOR, "ASC");
+    auto older = keys(OLDER_THAN_CURSOR, "DESC");
+
+    // Of the rest, half older and half newer; an even limit's spare row goes to the newer side,
+    // which is the one the cursor's own message is counted on.
+    size_t want_older = (limit - 1) / 2;
+    size_t want_newer = limit - want_older;
+    if (newer.size() < want_newer)
+        want_older = limit - newer.size();
+    else if (older.size() < want_older)
+        want_newer = limit - older.size();
+    want_older = std::min(want_older, older.size());
+    want_newer = std::min(want_newer, newer.size());
+
+    MessagePageResult out{
+            .has_newer = newer.size() > want_newer, .has_older = older.size() > want_older};
+    if (want_older + want_newer == 0)
+        return out;
+
+    // Then the window itself, in one range between its two ends, which also comes out newest
+    // first.  A range rather than a list of ids: an `IN` list is a different statement for every
+    // length, and each would be kept in the prepared-statement cache.
+    auto oldest = want_older > 0 ? older[want_older - 1] : newer.front();
+    auto newest = want_newer > 0 ? newer[want_newer - 1] : older.front();
+    out.messages = _query_messages(
             c,
             id,
             ReplyDepth::with_target,
             R"(
         {} WHERE m.conversation = ?1 {}
-             AND (m.timestamp < ?2 OR (m.timestamp = ?2 AND m.id < ?3))
-           ORDER BY m.timestamp DESC, m.id DESC LIMIT ?4
+             AND (m.timestamp > ?2 OR (m.timestamp = ?2 AND m.id >= ?3))
+             AND (m.timestamp < ?4 OR (m.timestamp = ?4 AND m.id <= ?5))
+           ORDER BY m.timestamp DESC, m.id DESC
     )"_format(MESSAGE_COLUMNS, visible),
-            *convo,
-            epoch_ms(before->timestamp),
-            before->id,
-            limit);
+            convo,
+            oldest.first,
+            oldest.second,
+            newest.first,
+            newest.second);
+    return out;
+}
+
+std::optional<MessageCursor> Client::_first_unread(const ConversationId& id) {
+    auto c = core.database().conn();
+    auto convo = find_conversation(c, id);
+    if (!convo)
+        return std::nullopt;
+    // The same predicate `unread_count` is kept by, so this is always the oldest of what it counts.
+    auto found = c.prepared_maybe_get<int64_t, int64_t>(
+            R"(
+        SELECT timestamp, id FROM messages
+        WHERE conversation = ?1 AND {}
+          AND timestamp > (SELECT last_read FROM conversations WHERE id = ?1)
+        ORDER BY timestamp ASC, id ASC LIMIT 1
+    )"_format(UNREAD),
+            *convo);
+    if (!found)
+        return std::nullopt;
+    auto [timestamp, message] = *found;
+    return MessageCursor{from_epoch_ms(timestamp), message};
 }
 
 void Client::_emit_attachment_availability(std::string_view url) {

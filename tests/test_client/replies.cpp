@@ -32,7 +32,7 @@ TEST_CASE("Client: a reply names what it answers", "[client][replies]") {
             quoting(peer.session_id, first, 7777));
     sync(*c);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 2);
     // Newest first.
     const auto& answer = msgs[0];
@@ -65,7 +65,8 @@ TEST_CASE(
             quoting(peer.session_id, missing, 4242));
     sync(*c);
 
-    auto msgs = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await);
+    auto msgs =
+            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await).messages;
     REQUIRE(msgs.size() == 1);
     REQUIRE(msgs[0].reply);
     // Unresolved, but the author and timestamp came off the wire, so a client can still say who
@@ -93,7 +94,7 @@ TEST_CASE("Client: a reply resolves once its target arrives", "[client][replies]
             quoting(peer.session_id, first, 7777));
     sync(*c);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 1);
     REQUIRE(msgs[0].reply);
     REQUIRE_FALSE(msgs[0].reply->message_id.has_value());
@@ -101,7 +102,7 @@ TEST_CASE("Client: a reply resolves once its target arrives", "[client][replies]
     deliver(*c, peer, "the original", first, "h1", "", std::nullopt, nullptr, 7777);
     sync(*c);
 
-    msgs = c->conversation(convo, await)->messages(await);
+    msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 2);
     REQUIRE(msgs[0].reply);
     REQUIRE(msgs[0].reply->message_id.has_value());
@@ -127,7 +128,7 @@ TEST_CASE("Client: msgid disambiguates a same-millisecond target", "[client][rep
             quoting(peer.session_id, same, 222));
     sync(*c);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 3);
 
     int64_t second_id = 0;
@@ -161,13 +162,13 @@ TEST_CASE("Client: an ambiguous target resolves stably", "[client][replies]") {
             quoting(peer.session_id, same));
     sync(*c);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 3);
     REQUIRE(msgs[0].reply);
     REQUIRE(msgs[0].reply->message_id.has_value());
     auto picked = *msgs[0].reply->message_id;
 
-    auto again = c->conversation(convo, await)->messages(await);
+    auto again = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(again[0].reply->message_id == picked);
 
     // And it is one of the two candidates, not something else.
@@ -204,7 +205,8 @@ TEST_CASE("Client: a quote with an unusable author is dropped", "[client][replie
             quoting(peer.session_id, target, 999));
     sync(*c);
 
-    auto msgs = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await);
+    auto msgs =
+            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await).messages;
     REQUIRE(msgs.size() == 3);
 
     auto by_body = [&](std::string_view b) -> const Message& {
@@ -272,7 +274,7 @@ TEST_CASE("Client: deleting a target re-reports the replies to it", "[client][re
             quoting(peer.session_id, target_ts, 7777));
     sync(*c);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 2);
     auto reply_id = msgs[0].id;
     auto target_id = msgs[1].id;
@@ -305,7 +307,7 @@ TEST_CASE("Client: a reply carries the message it answers", "[client][replies]")
             quoting(peer.session_id, first, 7777));
     sync(*c);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 2);
     REQUIRE(msgs[0].reply);
     REQUIRE(msgs[0].reply->message);
@@ -317,6 +319,48 @@ TEST_CASE("Client: a reply carries the message it answers", "[client][replies]")
     CHECK(target.body == "what was said");
     CHECK(target.sender == peer.session_id);
     CHECK(target.timestamp == first);
+}
+
+TEST_CASE(
+        "Client: a window at a reply's original carries what replies answer", "[client][replies]") {
+    TempClient c;
+    SenderKeys peer;
+    auto convo = ConversationId::dm(peer.session_id);
+
+    auto first = from_epoch_ms(1000);
+    deliver(*c, peer, "what was said", first, "h1", "", std::nullopt, nullptr, 7777);
+    deliver(*c,
+            peer,
+            "the answer",
+            from_epoch_ms(2000),
+            "h2",
+            "",
+            std::nullopt,
+            quoting(peer.session_id, first, 7777));
+    sync(*c);
+
+    // What a client jumping to a quoted message has in hand: the reply, carrying its target.
+    auto reply = c->conversation(convo, await)->messages(await).messages.at(0);
+    REQUIRE(reply.reply);
+    REQUIRE(reply.reply->message);
+    auto original = reply.reply->message->cursor();
+
+    auto window = c->conversation(convo, await)
+                          ->messages({.limit = 3, .around = original}, await)
+                          .messages;
+    REQUIRE(window.size() == 2);
+    CHECK(window[1].body == "what was said");
+    REQUIRE(window[0].reply);
+    REQUIRE(window[0].reply->message);
+    CHECK(window[0].reply->message->body == "what was said");
+
+    auto newer = c->conversation(convo, await)
+                         ->messages({.limit = 1, .after = original}, await)
+                         .messages;
+    REQUIRE(newer.size() == 1);
+    REQUIRE(newer[0].reply);
+    REQUIRE(newer[0].reply->message);
+    CHECK(newer[0].reply->message->id == window[1].id);
 }
 
 TEST_CASE("Client: a quoted attachment-only message arrives whole", "[client][replies]") {
@@ -353,7 +397,7 @@ TEST_CASE("Client: a quoted attachment-only message arrives whole", "[client][re
             quoting(peer.session_id, first, 7777));
     sync(*c);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 2);
     REQUIRE(msgs[0].reply);
     REQUIRE(msgs[0].reply->message);
@@ -386,7 +430,7 @@ TEST_CASE("Client: reply loading stops one level down", "[client][replies]") {
             quoting(peer.session_id, b_ts, 222));
     sync(*c);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 3);
     const auto& cmsg = msgs[0];
 
@@ -429,7 +473,7 @@ TEST_CASE("Client: several replies to one message share one copy", "[client][rep
             quoting(peer.session_id, first, 7777));
     sync(*c);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 3);
     REQUIRE(msgs[0].reply);
     REQUIRE(msgs[1].reply);
@@ -472,7 +516,7 @@ TEST_CASE("Client: many distinct reply targets load correctly", "[client][replie
                 quoting(peer.session_id, stamps[i], 100 + i));
     sync(*c);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 2 * n);
 
     // Every answer resolved, and each to its *own* target rather than all to one of them -- which
