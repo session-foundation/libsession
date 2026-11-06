@@ -4658,9 +4658,14 @@ void Client::_upload_one(
         // squelch one another.  Only progress passes through it: starting and finishing are things
         // a caller must always hear, and they are reported from elsewhere.
         auto throttle = std::make_shared<update_throttle>(_high_freq_dispatch_interval);
-        req.on_progress = [index, on_upload, throttle](int64_t sent, int64_t total) {
+        // Progress arrives on the network's loop, and `on_upload` is promised Core's.  Queued with
+        // `call`, as `on_complete` queues the outcome, so a file's last progress still comes before
+        // its outcome.  Throttled here, so a squelched report is never queued at all.
+        req.on_progress = [this, index, on_upload, throttle](int64_t sent, int64_t total) {
             if (throttle->allow())
-                on_upload(index, sent, total, std::nullopt);
+                call([on_upload, index, sent, total] {
+                    on_upload(index, sent, total, std::nullopt);
+                });
         };
     }
 
