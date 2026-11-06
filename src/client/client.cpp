@@ -4932,11 +4932,13 @@ Client::upload_handler Client::_dispatch_upload(Conversation::upload_progress cb
 Client::transfer_progress Client::_dispatch_progress(transfer_progress cb) {
     if (!cb)
         return {};
-    return [this, cb = std::move(cb)](
+    // Held once and shared by every report's hop, as an upload's handler is: this fires once per
+    // chunk, and copying the callable into each hop would cost a copy a chunk and give each report
+    // a fresh copy of whatever state the callable keeps.
+    auto target = std::make_shared<const transfer_progress>(std::move(cb));
+    return [this, target = std::move(target)](
                    int64_t done, int64_t total, std::optional<Expected<void>> r) {
-        // Copied rather than moved into the hop: this fires once per chunk, and moving would leave
-        // the next report with nothing to reach.
-        _dispatch_out([cb, done, total, r] { cb(done, total, r); });
+        _dispatch_out([target, done, total, r = std::move(r)] { (*target)(done, total, r); });
     };
 }
 

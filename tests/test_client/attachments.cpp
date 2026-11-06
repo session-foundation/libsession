@@ -422,14 +422,20 @@ TEST_CASE(
     std::filesystem::create_directories(dir);
     auto dest = dir / "saved.bin";
 
+    // `calls` is counted in the handler itself, so it runs 0, 1, 2... only if every report reached
+    // the same object rather than a copy made for it.
     std::vector<AttachmentProgress> reports;
+    std::vector<int> calls;
     std::promise<std::optional<Error>> done;
     auto waiter = done.get_future();
     c->Client::save_attachment(
             msg_id,
             0,
             dest,
-            [&](const AttachmentProgress& p) { reports.push_back(p); },
+            [&reports, &calls, count = 0](const AttachmentProgress& p) mutable {
+                reports.push_back(p);
+                calls.push_back(count++);
+            },
             [&](auto r) {
                 done.set_value(r ? std::nullopt : std::optional{std::move(r).error()});
             });
@@ -463,6 +469,8 @@ TEST_CASE(
     CHECK(reports.front().done == 0);
     CHECK(reports.front().total == 0);
     CHECK(succeeded(reports.back().result));
+    for (size_t i = 0; i < calls.size(); i++)
+        CHECK(calls[i] == static_cast<int>(i));
     for (const auto& r : reports) {
         CHECK(r.message_id == msg_id);
         CHECK(r.index == 0);
