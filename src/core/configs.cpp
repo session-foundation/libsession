@@ -355,7 +355,8 @@ void Configs::push_now() {
     // _load(), so this is the one path that could otherwise skip the check entirely.
     assert(on_loop());
 
-    if (_push_in_flight)
+    // Resuming pushes whatever changed meanwhile; see `Core::resume_storage`.
+    if (_push_in_flight || core.storage_suspended())
         return;
     _send_push();
 }
