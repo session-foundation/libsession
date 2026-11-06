@@ -7,6 +7,7 @@
 #include <session/types.hpp>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "component.hpp"
@@ -62,6 +63,16 @@ class Configs : public detail::CoreComponent {
     std::unique_ptr<config::Local> _local;
 
     bool _loaded = false;
+
+    // Each config's dump as this process last loaded or wrote it, by type.  Another process can
+    // share the database -- an app and its notification extension -- and each holds its configs in
+    // memory, so a stored dump that no longer matches this is one the other process wrote.
+    std::unordered_map<std::string, std::vector<std::byte>> _known_dumps;
+
+    // Hashes that `_store` serialising a config made obsolete, held by type for that config's next
+    // push to delete.  In memory only: lost if this process exits first, which leaves an obsolete
+    // message on the swarm until it expires.
+    std::unordered_map<std::string, std::vector<std::string>> _obsolete;
 
     // Depth of nested Batch guards.
     int _batch_depth = 0;
@@ -120,8 +131,14 @@ class Configs : public detail::CoreComponent {
     // account; throws globals::no_account if there is not one yet.
     void _load();
 
-    // Writes `conf`'s dump if it has changed since the last one was written.
+    // Writes `conf`'s dump if it has changed since the last one was written.  If another process
+    // wrote that dump meanwhile, its changes are merged in first, so writing ours cannot erase
+    // them. Must run inside the write transaction `store_dumps` holds.
     void _store(config::ConfigBase& conf);
+
+    // Calls `f` with the member holding the config whose dump is stored as `type`, if any.
+    template <typename F>
+    void _slot(std::string_view type, F&& f);
 
     // The configs that have somewhere to be pushed to, which is every one except Local.
     //
@@ -156,6 +173,13 @@ class Configs : public detail::CoreComponent {
     /// UserProfile's namespace as a stand-in for the one it does not have, so a search would find
     /// two configs for namespace 2 and the answer would depend on the order it looked.
     config::ConfigBase* for_namespace(config::Namespace ns);
+
+    /// Rebuilds every config whose stored dump differs from the one this process last loaded or
+    /// wrote: another process sharing the database wrote it while this one was suspended.  Safe
+    /// because this process wrote its own dumps before suspending (`Core::suspend_storage`), so the
+    /// other built on them and its dump holds everything ours did.  The application is told as for
+    /// a merge.  Returns the namespaces rebuilt.
+    std::vector<config::Namespace> reload_if_changed();
 
     /// Merges config messages retrieved from `ns` into the config kept there, and dumps the result
     /// if the merge changed it.
@@ -193,6 +217,12 @@ class Configs : public detail::CoreComponent {
 
     /// Writes the dump of every config that has changed since it was last written.  Immediate: a
     /// held Batch does not defer this, since asking for it explicitly is the point.
+    ///
+    /// Another live process on the same database may have written a dump since this one loaded or
+    /// wrote it, so each stored dump is compared and, if it changed, merged into ours before ours
+    /// is written -- in one IMMEDIATE transaction, so that no write lands between the comparison
+    /// and ours.  A process that never writes a config keeps its own copy until it next writes that
+    /// config or resumes.
     void store_dumps();
 
     /// Whether any config holds changes that have not reached the swarm.

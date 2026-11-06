@@ -31,6 +31,10 @@ enum class SendState : int {
     /// The application exited while this send was in flight, so its outcome is unknown — it may or
     /// may not have reached the swarm.  Set at startup for anything left in pending or sending,
     /// because Core's in-flight send queue does not survive a restart.
+    ///
+    /// That includes a send that did reach the swarm, when the app was suspended after sending it
+    /// and before the answer was recorded (see `Client::suspend_storage`), and then killed while
+    /// suspended: the answer waits for storage to resume, and is lost with the process.
     interrupted = 4,
 
     /// Terminal, and unlike `failed` not worth trying again: something the message needs is gone

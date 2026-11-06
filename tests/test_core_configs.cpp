@@ -346,29 +346,13 @@ TEST_CASE("Configs: a conflicting merge at our own seqno is reported", "[core][c
     ChangeWatcher w;
     TempCore c{w.callbacks()};
 
-    // A local change of our own, at some seqno.
-    //
-    // Wrapped in pieces rather than all at once: GENERATE and SECTION below have to stay at test
-    // scope, since Catch2 re-runs the case for each of them.
-    auto our_seqno = TestHelper::on_loop(*c, [&] {
-        c->configs.contacts().set(
-                c->configs.contacts().get_or_construct("05" + std::string(64, 'a')));
-        return c->configs.contacts().seqno();
-    });
-
-    // Our config can be in either of two states here, and _merge takes a different path for each:
-    // Dirty means the change has not been serialised into a message at all, so nothing else can
-    // have built on it; Waiting means a message exists and has gone to the swarm, so another device
-    // may well have seen it.  A generator rather than sections, so that this composes with the
-    // sections below into all four combinations rather than replacing them.
+    // Our config can be in either of two states when theirs arrives, and _merge takes a different
+    // path for each: Dirty means the change has not been serialised into a message at all, so
+    // nothing else can have built on it; Waiting means a message exists and has gone to the swarm,
+    // so another device may well have seen it.  A generator rather than sections, so that this
+    // composes with the sections below into all four combinations rather than replacing them.
     const bool already_a_message = GENERATE(false, true);
     CAPTURE(already_a_message);
-    TestHelper::on_loop(*c, [&] {
-        if (already_a_message)
-            c->configs.contacts().push();
-        REQUIRE(c->configs.contacts().is_dirty() == !already_a_message);
-        REQUIRE(c->configs.contacts().seqno() == our_seqno);
-    });
 
     // Another device changed things from the same starting point, so its push carries the *same*
     // seqno as ours with different contents.  Both shapes of disagreement are worth covering: one
@@ -387,7 +371,19 @@ TEST_CASE("Configs: a conflicting merge at our own seqno is reported", "[core][c
         expected_contacts = 2;
     }
 
+    // All in one job on the loop: a settle runs on a later turn and writes the dump, which
+    // serialises a dirty config into a message (see `Configs::_store`), so Dirty lasts only until
+    // then.
     TestHelper::on_loop(*c, [&] {
+        // A local change of our own, at some seqno.
+        c->configs.contacts().set(
+                c->configs.contacts().get_or_construct("05" + std::string(64, 'a')));
+        auto our_seqno = c->configs.contacts().seqno();
+        if (already_a_message)
+            c->configs.contacts().push();
+        REQUIRE(c->configs.contacts().is_dirty() == !already_a_message);
+        REQUIRE(c->configs.contacts().seqno() == our_seqno);
+
         std::vector<std::vector<std::byte>> pushed;
         {
             auto seed = c->globals.account_seed();
