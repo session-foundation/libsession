@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <future>
+#include <mutex>
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
 #include <oxen/log/level.hpp>
@@ -162,8 +163,10 @@ namespace {
 
 }  // namespace
 
-Network::Network(config::Config _conf) :
-        config{std::move(_conf)}, file_server_config{std::move(build_file_server_config(config))} {
+Network::Network(config::Config _conf, NetworkHooks hooks) :
+        config{std::move(_conf)},
+        _hooks{std::move(hooks)},
+        file_server_config{std::move(build_file_server_config(config))} {
     // When testing (particularly on Apple platforms) we can run into the NOFILE limit, so try to
     // increase it if the config option is set
     if (config.increase_no_file_limit) {
@@ -285,22 +288,20 @@ Network::Network(config::Config _conf) :
     _router->on_status_changed = [this] { _recalculate_status(); };
     _transport->on_status_changed = [this] { _recalculate_status(); };
 
-    // Pass the transport's inbound signals through to whoever owns us.  Read each hook once into
-    // a local: our owner may replace it, and these fire on the loop rather than from the thread
-    // that would be doing the replacing.
+    // Pass the transport's inbound signals through to whoever owns us.
     _transport->on_server_push = [this](const ed25519_pubkey& node,
                                         std::string_view endpoint,
                                         std::span<const std::byte> body) {
-        if (auto cb = on_server_push)
-            cb(node, endpoint, body);
+        if (_hooks.server_push)
+            _hooks.server_push(node, endpoint, body);
     };
     _transport->on_connection_established = [this](const ed25519_pubkey& node) {
-        if (auto cb = on_connection_established)
-            cb(node);
+        if (_hooks.connection_established)
+            _hooks.connection_established(node);
     };
     _transport->on_connection_lost = [this](const ed25519_pubkey& node) {
-        if (auto cb = on_connection_lost)
-            cb(node);
+        if (_hooks.connection_lost)
+            _hooks.connection_lost(node);
     };
 
     // Perform a clock resync
@@ -329,7 +330,16 @@ Network::~Network() {
         if (_transport)
             _transport->on_status_changed = nullptr;
 
+        // The owner is told the network has gone, and nothing after that: tearing the transport
+        // down below closes every connection, and an owner told each one was lost would set
+        // about re-establishing what it had on them, against a Network that is going.  Here
+        // because this runs on the loop, where the hooks are read, so none can be mid-call.
+        _hooks.network_info_changed = nullptr;
+        _hooks.server_push = nullptr;
+        _hooks.connection_established = nullptr;
+        _hooks.connection_lost = nullptr;
         _update_status(ConnectionStatus::disconnected);
+        _hooks.status_changed = nullptr;
     });
 
     // Explicitly destroy in dependency order while _loop is still alive. Their destructors post
@@ -734,8 +744,8 @@ void Network::_update_status(ConnectionStatus new_status) {
 
     _status = new_status;
 
-    if (on_status_changed)
-        on_status_changed(new_status);
+    if (_hooks.status_changed)
+        _hooks.status_changed(new_status);
 }
 
 Request Network::_preprocess_request(Request request) {
@@ -856,11 +866,11 @@ void Network::_update_network_state(const std::string& body) {
         }
 
         // If the network info changed then call the callback
-        if (on_network_info_changed) {
+        if (_hooks.network_info_changed) {
             auto new_versions = _fork_versions.load();
 
             if (new_versions != old_versions)
-                on_network_info_changed(
+                _hooks.network_info_changed(
                         std::chrono::duration_cast<std::chrono::milliseconds>(
                                 AdjustedClock::get_offset()),
                         new_versions.hardfork,
@@ -1128,10 +1138,10 @@ void Network::_on_clock_resync_complete(const uint8_t /*total_requests*/) {
         log::info(cat, "[Request {}] Network offset set to: {}ms", refresh_id, offset->count());
 
         // Trigger the network info changed callback to update the client
-        if (on_network_info_changed) {
+        if (_hooks.network_info_changed) {
             auto versions = _fork_versions.load();
 
-            on_network_info_changed(*offset, versions.hardfork, versions.softfork);
+            _hooks.network_info_changed(*offset, versions.hardfork, versions.softfork);
         }
     }
 
@@ -1179,9 +1189,46 @@ struct session_response_handle_cpp_t {
 
 namespace {
 
-inline session::network::Network* unbox(network_object* network_) {
+/// A C callback and its context, which a C client may replace from any thread while the Network
+/// runs.  Called under its lock, so that once a setter returns the old context is never used again,
+/// and the lock is recursive so that a callback can replace itself.
+template <typename Fn>
+struct c_callback {
+    std::recursive_mutex lock;
+    Fn* fn = nullptr;
+    void* ctx = nullptr;
+
+    void set(Fn* new_fn, void* new_ctx) {
+        std::lock_guard l{lock};
+        fn = new_fn;
+        ctx = new_ctx;
+    }
+
+    template <typename... Args>
+    void operator()(Args... args) {
+        std::lock_guard l{lock};
+        if (fn)
+            fn(args..., ctx);
+    }
+};
+
+/// What a C client's `network_object` points at.  A Network's hooks are fixed when it is built,
+/// while the C API sets its callbacks afterwards, so the hooks forward to these.
+struct c_network {
+    c_callback<void(CONNECTION_STATUS, void*)> status_changed;
+    c_callback<void(int64_t, uint16_t, uint16_t, void*)> network_info_changed;
+
+    // Last, so that it is destroyed first: its destructor reports a final status through the above.
+    std::unique_ptr<session::network::Network> network;
+};
+
+inline c_network* unbox_c(network_object* network_) {
     assert(network_ && network_->internals);
-    return static_cast<session::network::Network*>(network_->internals);
+    return static_cast<c_network*>(network_->internals);
+}
+
+inline session::network::Network* unbox(network_object* network_) {
+    return unbox_c(network_)->network.get();
 }
 
 }  // namespace
@@ -1475,9 +1522,26 @@ LIBSESSION_C_API bool session_network_init(
 
         // Construct the Network instance
         Config final_config(cpp_opts);
-        auto n = std::make_unique<Network>(std::move(final_config));
+        auto c = std::make_unique<c_network>();
+        c->network = std::make_unique<Network>(
+                std::move(final_config),
+                NetworkHooks{
+                        .status_changed =
+                                [c = c.get()](ConnectionStatus status) {
+                                    c->status_changed(static_cast<CONNECTION_STATUS>(status));
+                                },
+                        .network_info_changed =
+                                [c = c.get()](
+                                        std::chrono::milliseconds network_time_offset,
+                                        int hardfork,
+                                        int softfork) {
+                                    c->network_info_changed(
+                                            static_cast<int64_t>(network_time_offset.count()),
+                                            static_cast<uint16_t>(hardfork),
+                                            static_cast<uint16_t>(softfork));
+                                }});
         auto n_object = std::make_unique<network_object>();
-        n_object->internals = n.release();
+        n_object->internals = c.release();
         *network = n_object.release();
         return true;
     } catch (const std::exception& e) {
@@ -1487,7 +1551,7 @@ LIBSESSION_C_API bool session_network_init(
 }
 
 LIBSESSION_C_API void session_network_free(network_object* network) {
-    delete static_cast<session::network::Network*>(network->internals);
+    delete unbox_c(network);
     delete network;
 }
 
@@ -1531,13 +1595,7 @@ LIBSESSION_C_API uint16_t session_network_softfork(network_object* network) {
 
 LIBSESSION_C_API void session_network_set_status_changed_callback(
         network_object* network, void (*callback)(CONNECTION_STATUS status, void* ctx), void* ctx) {
-    if (!callback)
-        unbox(network)->on_status_changed = nullptr;
-    else
-        unbox(network)->on_status_changed = [cb = std::move(callback),
-                                             ctx](ConnectionStatus status) {
-            cb(static_cast<CONNECTION_STATUS>(status), ctx);
-        };
+    unbox_c(network)->status_changed.set(callback, ctx);
 }
 
 LIBSESSION_C_API void session_network_set_network_info_changed_callback(
@@ -1545,16 +1603,7 @@ LIBSESSION_C_API void session_network_set_network_info_changed_callback(
         void (*callback)(
                 int64_t network_time_offset, uint16_t hardfork, uint16_t softfork, void* ctx),
         void* ctx) {
-    if (!callback)
-        unbox(network)->on_network_info_changed = nullptr;
-    else
-        unbox(network)->on_network_info_changed =
-                [cb = std::move(callback), ctx](
-                        std::chrono::milliseconds network_time_offset,
-                        uint16_t hardfork,
-                        uint16_t softfork) {
-                    cb(network_time_offset.count(), hardfork, softfork, ctx);
-                };
+    unbox_c(network)->network_info_changed.set(callback, ctx);
 }
 
 LIBSESSION_C_API void session_network_callbacks_respond(

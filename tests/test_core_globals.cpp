@@ -77,7 +77,12 @@ TEST_CASE("Globals: defer_account leaves the account unresolved", "[core][global
         CHECK_THROWS_AS(core.globals.seed_mnemonic(), no_account);
 
         // Refused here rather than failing later inside a background poll.
-        CHECK_THROWS_AS(core.set_network(std::make_unique<MockNetwork>()), no_account);
+        CHECK_THROWS_AS(
+                core.set_network([](network::NetworkHooks hooks) {
+                    return std::make_unique<MockNetwork>(
+                            network::config::Config{}, std::move(hooks));
+                }),
+                no_account);
 
         // Everything not needing an identity still works, which is what makes the state useful:
         // the application can open the database and ask, before deciding.

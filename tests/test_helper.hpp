@@ -35,8 +35,8 @@ inline nlohmann::json parse_json(std::span<const std::byte> body) {
 /// `sent_requests` to observe outgoing requests and fire their callbacks.
 class MockNetwork : public network::Network {
   public:
-    explicit MockNetwork(network::config::Config config = {}) :
-            network::Network(std::move(config)) {}
+    explicit MockNetwork(network::config::Config config = {}, network::NetworkHooks hooks = {}) :
+            network::Network(std::move(config), std::move(hooks)) {}
 
     struct SentRequest {
         network::Request request;
@@ -155,10 +155,13 @@ class MockNetwork : public network::Network {
 ///
 /// `config` for a test that depends on how the network is configured -- which router it uses, say.
 inline MockNetwork* attach_mock_network(core::Core& core, network::config::Config config = {}) {
-    auto net = std::make_unique<MockNetwork>(std::move(config));
-    auto* raw = net.get();
-    raw->core = &core;
-    core.set_network(std::move(net));
+    MockNetwork* raw = nullptr;
+    core.set_network([&](network::NetworkHooks hooks) {
+        auto net = std::make_unique<MockNetwork>(std::move(config), std::move(hooks));
+        raw = net.get();
+        raw->core = &core;
+        return net;
+    });
     return raw;
 }
 
@@ -457,6 +460,16 @@ class TestHelper {
     /// swarm-addressed to resolve.
     static void set_router(network::Network& net, std::shared_ptr<network::IRouter> router) {
         net._router = std::move(router);
+    }
+    /// Reports `status` as the Network's own, on its loop, as a transport or router changing would.
+    static void network_status(network::Network& net, network::ConnectionStatus status) {
+        net._jq->call_get([&] { net._update_status(status); });
+    }
+    /// Whether `net` still holds any of its owner's hooks besides `status_changed`.  Only to be
+    /// asked on its loop.
+    static bool has_hooks_besides_status(network::Network& net) {
+        return net._hooks.network_info_changed || net._hooks.server_push ||
+               net._hooks.connection_established || net._hooks.connection_lost;
     }
     static network::SnodePool& snode_pool(network::Network& net) { return *net._snode_pool; }
     static oxen::quic::Loop& disk_loop(network::Network& net) { return *net._disk_loop; }

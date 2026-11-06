@@ -60,6 +60,10 @@ class Network {
             std::function<void(std::variant<file_metadata, int16_t>, bool)>>>>
             _clock_resync_download_queue;
 
+    /// The owner's, fixed at construction; see NetworkHooks.  Only ever read on the loop.  The
+    /// destructor empties them, on the loop, before tearing anything down.
+    NetworkHooks _hooks;
+
     /// Our own jobs, rather than the loop's shared queue, so that ~Network can take them away from
     /// the loop: `stop()` waits out whatever is running and cancels the rest.  Together with the
     /// components below being destroyed before it is stopped, that is what lets every job and
@@ -73,39 +77,12 @@ class Network {
   public:
     const config::FileServer file_server_config;
 
-    // Hook to be notified whenever the network connection status changes.
-    std::function<void(ConnectionStatus status)> on_status_changed;
-    std::function<void(std::chrono::milliseconds network_time_offset, int hardfork, int softfork)>
-            on_network_info_changed;
-
-    /// Hook to be notified when a storage server sends us something we did not ask for, on a
-    /// connection we already hold -- which is how a swarm subscription delivers messages.  `node`
-    /// names the swarm member; `endpoint` and `body` are the pushed request's, unparsed.
-    ///
-    /// Only reachable with a routing mode that gives the storage server a connection to us, which
-    /// means `session_router` or `direct`.  Under `onion_requests` the server has nothing to push
-    /// down: the connection it can see belongs to the last relay rather than to us, so it would
-    /// key the subscription to that relay.  This is not a property of onion routing in general --
-    /// `session_router` is onion-routed too, and is the mode this exists for.
-    std::function<void(
-            const ed25519_pubkey& node, std::string_view endpoint, std::span<const std::byte> body)>
-            on_server_push;
-
-    /// Hook to be notified once a connection to `node` is usable, including when it comes back
-    /// after having been lost.  Per-connection state the far end holds for us -- a subscription --
-    /// does not survive that, so this is where it has to be established again.
-    std::function<void(const ed25519_pubkey& node)> on_connection_established;
-
-    /// Hook to be notified when a connection to `node` is gone, for any reason.  A subscription
-    /// held on it is gone too, and the far end will not say so: it simply stops pushing.
-    std::function<void(const ed25519_pubkey& node)> on_connection_lost;
-
     template <typename... Opt>
         requires(!std::is_same_v<
                  std::decay_t<std::tuple_element_t<0, std::tuple<Opt...>>>,
                  config::Config>)
     Network(Opt&&... opts) : Network{config::Config{std::forward<Opt>(opts)...}} {};
-    explicit Network(config::Config config);
+    explicit Network(config::Config config, NetworkHooks hooks = {});
     virtual ~Network();
 
     bool has_retrieved_time_offset() const {
@@ -118,8 +95,8 @@ class Network {
     uint16_t hardfork() const { return _fork_versions.load().hardfork; };
     uint16_t softfork() const { return _fork_versions.load().softfork; };
 
-    /// Whether a storage server can push to us on this network, i.e. whether `on_server_push` can
-    /// ever fire and a subscription is worth making.
+    /// Whether a storage server can push to us on this network, i.e. whether the `server_push` hook
+    /// can ever fire and a subscription is worth making.
     ///
     /// False for onion requests, and not as a matter of it being unimplemented: the storage server
     /// keys a subscription to the connection the request arrived on, which for an onion request is

@@ -58,12 +58,13 @@ TEST_CASE("Network clock: the default minimum offset is five seconds", "[network
 
 TEST_CASE("Network clock: a resync sets the offset and reports it to the client", "[network]") {
     ScopedClockOffset restore{0ms};
-    network::Network net{network::config::Config{}};
-
     std::optional<std::chrono::milliseconds> reported;
-    net.on_network_info_changed = [&](std::chrono::milliseconds offset, int, int) {
-        reported = offset;
-    };
+    network::Network net{
+            network::config::Config{},
+            network::NetworkHooks{
+                    .network_info_changed = [&](std::chrono::milliseconds offset, int, int) {
+                        reported = offset;
+                    }}};
 
     // Not retrieved until a resync has succeeded, and a resync whose requests all failed has not.
     CHECK_FALSE(net.has_retrieved_time_offset());

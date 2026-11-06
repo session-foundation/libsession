@@ -1,6 +1,7 @@
 #pragma once
 
 #include <concepts>
+#include <functional>
 #include <memory>
 #include <oxen/quic/loop.hpp>
 #include <session/clock.hpp>
@@ -477,6 +478,11 @@ class Core {
     quic::TimerID _sub_timer;
     quic::TimerID _probe_timer;
 
+    // Set on the loop as Core is destroyed, by the job that removes the timers.  The Network's
+    // hooks fire until ~Network drops them, which comes later, and a job one of them queues here
+    // must not re-arm a timer that has already been removed.
+    bool _closing = false;
+
     // Subscribes to `node` if a subscription is possible and we do not already have one.  Called
     // when a poll of `node` drains, which is what makes it the node we subscribe with: it has an
     // established connection and its cursors are current.
@@ -616,14 +622,19 @@ class Core {
         init();
     }
 
-    /// Detaches from the Network before letting anything be destroyed; see the definition.
+    /// Drops the Network before letting anything be destroyed; see the definition.
     ~Core();
 
-    /// Set an optional network interface that can be used to make network requests to swarm
-    /// members.  Ownership is taken: nothing else may hold on to the Network.
+    /// Builds the Network that will make requests to swarm members, and attaches it.  `make` is
+    /// called at once, with the hooks Core needs -- `server_push`, `connection_established` and
+    /// `connection_lost` -- and has to build the Network with them: a Network's hooks are fixed
+    /// when it is built.  It may fill in the other two.  Ownership is taken: nothing else may hold
+    /// on to the Network.  `make_network` is the usual way in; this is for a Network built some
+    /// other way, a test's mock say.
     ///
     /// May only be called once, and only from a thread that is not Core's loop; replacing an
-    /// already-attached Network (including with nullptr) throws `network_already_attached`.
+    /// already-attached Network throws `network_already_attached`.  Throws `no_account`, without
+    /// calling `make`, before the account has an identity.
     ///
     /// TODO: allow the Network to be replaced.  A client that lets the user choose a routing mode
     /// needs it, and so does anything that has to re-establish swarm state across the swap.  Two
@@ -639,7 +650,8 @@ class Core {
     ///
     /// So a fix is not a `_loop.call` around this body: polling has to be stopped and in-flight
     /// swarm work quiesced before the old Network is dropped.
-    void set_network(std::unique_ptr<network::Network> network);
+    void set_network(
+            const std::function<std::unique_ptr<network::Network>(network::NetworkHooks)>& make);
 
     /// Constructs a Network from `args` and attaches it, returning a reference to it that is valid
     /// for as long as this Core is.  The usual way to attach one:
@@ -649,7 +661,12 @@ class Core {
     /// Takes what `network::Network`'s constructor takes -- its options, or a `Config` -- and adds
     /// this Core's disk loop, so that the Network's file work and this Core's run on one thread.  A
     /// Network built some other way and handed to `set_network` keeps a disk loop of its own.
-    network::Network& make_network(network::config::Config config);
+    ///
+    /// With a `Config`, `hooks` may also carry the owner's `status_changed` and
+    /// `network_info_changed`.  The other three are Core's own, and setting one throws
+    /// `std::invalid_argument`.
+    network::Network& make_network(
+            network::config::Config config, network::NetworkHooks hooks = {});
 
     // `C` rather than `Config` by name: this header only declares it, and naming it here would need
     // it complete where the template is defined rather than where it is used.
