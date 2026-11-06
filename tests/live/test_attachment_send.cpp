@@ -101,8 +101,10 @@ TEST_CASE(
         seen_off_loop = off_loop;
     }
 
-    // Progress as well as the outcome: the handler is documented to run on Core's loop.
-    CHECK(seen.size() > 1);
+    // Progress as well as the outcome: the handler is documented to run on Core's loop.  Onion
+    // requests carry an upload as one HTTP request and report no progress, only the outcome.
+    if (live_router_mode.type != session::network::opt::router::Type::onion_requests)
+        CHECK(seen.size() > 1);
     CHECK(seen_off_loop == 0);
 
     // The upload reported itself finished, and did so as a result rather than by reaching the
