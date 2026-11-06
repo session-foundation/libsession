@@ -13,7 +13,9 @@
 namespace session::random {
 
 void fill(std::span<std::byte> buf) {
-    randombytes_buf(buf.data(), buf.size());
+    // An empty span's data() may be null, which libsodium declares it never is.
+    if (!buf.empty())
+        randombytes_buf(buf.data(), buf.size());
 }
 void fill(std::span<char> buf) {
     fill(std::span{reinterpret_cast<std::byte*>(buf.data()), buf.size()});
