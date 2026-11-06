@@ -93,7 +93,7 @@ TEST_CASE("Client: a contact removed elsewhere takes its history", "[client][con
             R"(INSERT INTO messages (conversation, sender, outgoing, timestamp, body)
                VALUES ((SELECT id FROM conversations WHERE dm = ?1), ?1, 0, 1000, 'hi'))",
             account);
-    REQUIRE(c->conversation(id, await)->messages(await).size() == 1);
+    REQUIRE(c->conversation(id, await)->messages(await).messages.size() == 1);
 
     // Now the other device removes them entirely.  An absent entry can only mean the stronger
     // thing, since hiding arrives as a negative priority instead.
@@ -340,12 +340,12 @@ TEST_CASE("Client: clearing a conversation says when it was cleared", "[client][
     auto id = dm_from_hex(them);
     c->open_dm(id, await);
     insert_message(*c.client, id, 1000, "hi");
-    REQUIRE(c->conversation(id, await)->messages(await).size() == 1);
+    REQUIRE(c->conversation(id, await)->messages(await).messages.size() == 1);
 
     auto before = std::chrono::floor<std::chrono::seconds>(clock_now_ms());
     c->conversation(id, await)->clear_messages(await);
 
-    CHECK(c->conversation(id, await)->messages(await).empty());
+    CHECK(c->conversation(id, await)->messages(await).messages.empty());
     CHECK(c->conversation(id, await));  // The conversation stays; only its history went.
     CHECK(std::ranges::find(reloaded, id) != reloaded.end());
 
@@ -368,7 +368,7 @@ TEST_CASE("Client: deleting a conversation keeps the contact", "[client][configs
     c->conversation(id, await)->delete_conversation(await);
 
     CHECK_FALSE(listed(*c.client, id));
-    CHECK(c->conversation(id, await)->messages(await).empty());
+    CHECK(c->conversation(id, await)->messages(await).messages.empty());
 
     auto entry = in_configs(*c, [&](auto& cfg) { return cfg.contacts().get(them); });
     REQUIRE(entry);  // Still a contact, so a message from them brings the conversation back.
@@ -387,7 +387,7 @@ TEST_CASE("Client: hiding note to self keeps what is in it", "[client][configs]"
     c->conversation(me, await)->delete_conversation(/*keep_messages=*/true, await);
 
     CHECK_FALSE(listed(*c.client, me));
-    CHECK(c->conversation(me, await)->messages(await).size() == 1);
+    CHECK(c->conversation(me, await)->messages(await).messages.size() == 1);
     CHECK(in_configs(*c, [](auto& cfg) { return cfg.user_profile().get_nts_priority(); }) == -1);
 
     // No instruction to destroy anything, which is the whole difference between hiding a
@@ -435,7 +435,7 @@ TEST_CASE("Client: a delete-before from another device destroys history", "[clie
 
     insert_message(*c.client, id, 1'000'000, "old");
     insert_message(*c.client, id, 3'000'000, "new");
-    REQUIRE(c->conversation(id, await)->messages(await).size() == 2);
+    REQUIRE(c->conversation(id, await)->messages(await).messages.size() == 2);
 
     // Retroactive: what the instruction is about is the history that was there when someone chose
     // to destroy it, not merely what arrives after it.
@@ -446,7 +446,7 @@ TEST_CASE("Client: a delete-before from another device destroys history", "[clie
     });
     merge_contacts(*c.client, cleared);
 
-    auto left = c->conversation(id, await)->messages(await);
+    auto left = c->conversation(id, await)->messages(await).messages;
     REQUIRE(left.size() == 1);
     CHECK(left[0].body == "new");
 }

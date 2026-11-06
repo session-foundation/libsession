@@ -24,18 +24,16 @@ namespace session::client {
 
 // -- Reading ------------------------------------------------------------------------------------
 
-void Conversation::messages(result_function<std::vector<Message>> cb) const {
-    _client->_async(
-            [c = _client, id = id] { return c->_messages(id, MessagePage{}).messages; },
-            std::move(cb));
+void Conversation::messages(result_function<MessagePageResult> cb) const {
+    messages(MessagePage{}, std::move(cb));
 }
 void Conversation::messages(MessagePage page, result_function<MessagePageResult> cb) const {
     _client->_require_page("messages", page);
     _client->_async([c = _client, id = id, page] { return c->_messages(id, page); }, std::move(cb));
 }
 
-std::vector<Message> Conversation::messages(await_t) const {
-    return messages(MessagePage{}, await).messages;
+MessagePageResult Conversation::messages(await_t) const {
+    return messages(MessagePage{}, await);
 }
 MessagePageResult Conversation::messages(MessagePage page, await_t) const {
     _client->_require_page("messages", page);

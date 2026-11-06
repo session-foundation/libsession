@@ -59,7 +59,8 @@ TEST_CASE("Client: an arriving message records the files it names", "[client][at
             });
     sync(*c);
 
-    auto msgs = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await);
+    auto msgs =
+            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await).messages;
     REQUIRE(msgs.size() == 1);
     const auto& m = msgs[0];
     CHECK(m.body.empty());
@@ -154,7 +155,7 @@ TEST_CASE("Client: a message reports the attachments it carries", "[client][send
     }
 
     // The same list reaches a paged read, not only the single-message one.
-    auto page = c->conversation(ConversationId::dm(me), await)->messages(await);
+    auto page = c->conversation(ConversationId::dm(me), await)->messages(await).messages;
     REQUIRE(page.size() == 1);
     CHECK(page[0].attachments.size() == 3);
     CHECK(page[0].attachments[0].content_type == "image/png");
@@ -190,7 +191,8 @@ TEST_CASE("Client: an attachment carries a thumbhash in both directions", "[clie
             });
     sync(*c);
 
-    auto msgs = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await);
+    auto msgs =
+            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await).messages;
     REQUIRE(msgs.size() == 1);
     REQUIRE(msgs[0].attachments.size() == 1);
     CHECK(msgs[0].attachments[0].thumbhash == incoming_hash);
@@ -249,7 +251,8 @@ TEST_CASE("Client: an over-long thumbhash is refused", "[client][attachments]") 
 
     // Dropped, not rejected: the placeholder is decoration a remote peer supplied, and losing it
     // must not cost the attachment it describes.
-    auto msgs = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await);
+    auto msgs =
+            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await).messages;
     REQUIRE(msgs.size() == 1);
     REQUIRE(msgs[0].attachments.size() == 1);
     CHECK_FALSE(msgs[0].attachments[0].thumbhash.has_value());
@@ -321,7 +324,8 @@ TEST_CASE(
             42);
     sync(*c);
 
-    auto msgs = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await);
+    auto msgs =
+            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await).messages;
     REQUIRE(msgs.size() == 1);
     auto msg_id = msgs[0].id;
 
@@ -411,8 +415,10 @@ TEST_CASE(
     };
     deliver(*c, peer, "", from_epoch_ms(2000), "h2", "", std::nullopt, add, 43);
     sync(*c);
-    auto msg_id =
-            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto msg_id = c->conversation(ConversationId::dm(peer.session_id), await)
+                          ->messages(await)
+                          .messages[0]
+                          .id;
 
     auto dir = std::filesystem::temp_directory_path() / random::unique_id("test_save", 7);
     std::filesystem::create_directories(dir);
@@ -873,7 +879,8 @@ TEST_CASE("Client: a legacy attachment is saved", "[client][attachments][legacy]
             44);
     sync(*c);
 
-    auto msgs = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await);
+    auto msgs =
+            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await).messages;
     REQUIRE(msgs.size() == 1);
     REQUIRE(msgs[0].attachments.size() == 1);
 
@@ -1084,8 +1091,10 @@ TEST_CASE(
             42);
     sync(*c);
 
-    auto msg_id =
-            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto msg_id = c->conversation(ConversationId::dm(peer.session_id), await)
+                          ->messages(await)
+                          .messages[0]
+                          .id;
 
     auto dir = std::filesystem::temp_directory_path() / random::unique_id("test_size", 7);
     std::filesystem::create_directories(dir);
@@ -1148,8 +1157,10 @@ TEST_CASE(
             },
             42);
     sync(*c);
-    auto msg_id =
-            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto msg_id = c->conversation(ConversationId::dm(peer.session_id), await)
+                          ->messages(await)
+                          .messages[0]
+                          .id;
 
     std::vector<std::optional<std::vector<std::byte>>> got(2);
     std::vector<std::vector<AttachmentProgress>> seen(2);
@@ -1232,8 +1243,10 @@ TEST_CASE("Client: saving joins a fetch already under way", "[client][attachment
             },
             42);
     sync(*c);
-    auto msg_id =
-            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto msg_id = c->conversation(ConversationId::dm(peer.session_id), await)
+                          ->messages(await)
+                          .messages[0]
+                          .id;
 
     // A display asks first, so the file is being accumulated.
     std::optional<std::vector<std::byte>> shown;
@@ -1319,7 +1332,10 @@ TEST_CASE("Client: a save is a fetch like any other", "[client][attachments][joi
             },
             7);
     sync(*c);
-    auto id = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto id = c->conversation(ConversationId::dm(peer.session_id), await)
+                      ->messages(await)
+                      .messages[0]
+                      .id;
     auto availability = [&] { return c->message(id, await)->attachments[0].availability; };
     auto contents = [](const std::filesystem::path& p) {
         std::ifstream in{p, std::ios::binary};
@@ -1409,7 +1425,10 @@ TEST_CASE("Client: a save that cannot be written fails alone", "[client][attachm
             },
             7);
     sync(*c);
-    auto id = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto id = c->conversation(ConversationId::dm(peer.session_id), await)
+                      ->messages(await)
+                      .messages[0]
+                      .id;
 
     auto gone = out.path / "gone";
     std::filesystem::create_directories(gone);
@@ -1479,7 +1498,7 @@ TEST_CASE(
                 7);
         sync(*c);
         for (const auto& m :
-             c->conversation(ConversationId::dm(peer.session_id), await)->messages(await))
+             c->conversation(ConversationId::dm(peer.session_id), await)->messages(await).messages)
             if (m.attachments[0].size.has_value() == sized)
                 return m.id;
         FAIL("no message for " << file);
@@ -1608,7 +1627,7 @@ TEST_CASE("Client: a conversation set to auto-download fetches on arrival", "[cl
         arrive("h1", false);
         CHECK(net->downloads.empty());
         CHECK(progress.empty());
-        CHECK_FALSE(c->conversation(convo, await)->messages(await)[0].gallery);
+        CHECK_FALSE(c->conversation(convo, await)->messages(await).messages[0].gallery);
     }
 
     SECTION("images only fetches the image and leaves the document") {
@@ -1618,7 +1637,7 @@ TEST_CASE("Client: a conversation set to auto-download fetches on arrival", "[cl
         CHECK(net->downloads[0].download_url.find("img") != std::string::npos);
 
         // Not a gallery: one of its attachments is not an image, so it cannot be shown as one.
-        auto m = c->conversation(convo, await)->messages(await)[0];
+        auto m = c->conversation(convo, await)->messages(await).messages[0];
         CHECK_FALSE(m.gallery_viewable);
         CHECK_FALSE(m.gallery);
     }
@@ -1635,10 +1654,10 @@ TEST_CASE("Client: a conversation set to auto-download fetches on arrival", "[cl
         // Two attachments, one of them a pdf: still not gallery viewable even though both were
         // fetched.  What is downloaded and what can be displayed as a gallery are different
         // questions.
-        CHECK_FALSE(c->conversation(convo, await)->messages(await)[0].gallery);
+        CHECK_FALSE(c->conversation(convo, await)->messages(await).messages[0].gallery);
 
         arrive("h4", false);
-        auto m = c->conversation(convo, await)->messages(await)[0];
+        auto m = c->conversation(convo, await)->messages(await).messages[0];
         CHECK(m.gallery_viewable);
         CHECK(m.gallery);
     }
@@ -1662,8 +1681,11 @@ TEST_CASE("Client: a conversation set to auto-download fetches on arrival", "[cl
         arrive("h8", false);
         REQUIRE(serve_downloads(*net, image_ct) == 1);
         sync(*c);
-        CHECK(c->conversation(convo, await)->messages(await)[0].attachments[0].availability ==
-              AttachmentAvailability::cached);
+        CHECK(c->conversation(convo, await)
+                      ->messages(await)
+                      .messages[0]
+                      .attachments[0]
+                      .availability == AttachmentAvailability::cached);
     }
 
     SECTION("the fetch is reported, cached, and never told to the sender") {
@@ -1739,7 +1761,7 @@ TEST_CASE("Client: the cache evicts least recently used", "[client][auto][evict]
         sync(*c);
         REQUIRE(serve_downloads(*net, ct) == 1);
         sync(*c);
-        ids.push_back(c->conversation(convo, await)->messages(await)[0].id);
+        ids.push_back(c->conversation(convo, await)->messages(await).messages[0].id);
     }
 
     auto cached = [&](const std::string& url) {
@@ -2200,8 +2222,10 @@ TEST_CASE(
             7);
     sync(*c);
 
-    auto theirs =
-            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto theirs = c->conversation(ConversationId::dm(peer.session_id), await)
+                          ->messages(await)
+                          .messages[0]
+                          .id;
     CHECK(c->message(theirs, await)->attachments[0].availability == AttachmentAvailability::absent);
 
     r.msg_updated.clear();
@@ -2263,8 +2287,10 @@ TEST_CASE(
     sync(*c);
 
     auto convo = ConversationId::dm(peer.session_id);
-    auto att = [&] { return c->conversation(convo, await)->messages(await)[0].attachments[0]; };
-    auto msg_id = c->conversation(convo, await)->messages(await)[0].id;
+    auto att = [&] {
+        return c->conversation(convo, await)->messages(await).messages[0].attachments[0];
+    };
+    auto msg_id = c->conversation(convo, await)->messages(await).messages[0].id;
 
     // Nobody has asked for it, so the decision is the user's.
     CHECK(att().availability == AttachmentAvailability::absent);
@@ -2325,13 +2351,13 @@ TEST_CASE(
             },
             43);
     sync(*c);
-    auto newer = c->conversation(convo, await)->messages(await)[0].id;
+    auto newer = c->conversation(convo, await)->messages(await).messages[0].id;
     c->attachment_data(newer, 0, nullptr, [](auto) {});
     sync(*c);
     REQUIRE(serve_downloads(*net) == 1);
     sync(*c);
 
-    CHECK(c->conversation(convo, await)->messages(await)[1].attachments[0].availability ==
+    CHECK(c->conversation(convo, await)->messages(await).messages[1].attachments[0].availability ==
           AttachmentAvailability::absent);
 }
 
@@ -2380,7 +2406,7 @@ TEST_CASE(
         // By timestamp rather than by position: `messages()` pages newest first, so the one just
         // delivered is not the one at the front once a conversation has more than one.
         for (const auto& m :
-             c->conversation(ConversationId::dm(from.session_id), await)->messages(await))
+             c->conversation(ConversationId::dm(from.session_id), await)->messages(await).messages)
             if (m.timestamp == from_epoch_ms(ts))
                 return m.id;
         FAIL("delivered message not found");
@@ -2464,7 +2490,7 @@ TEST_CASE(
     arrive("h2", 2000, "watched");
     auto ids = [&] {
         std::vector<int64_t> found;
-        for (const auto& m : c->conversation(convo, await)->messages(await))
+        for (const auto& m : c->conversation(convo, await)->messages(await).messages)
             found.push_back(m.id);
         return found;
     }();
@@ -2517,7 +2543,7 @@ TEST_CASE(
     c->set_attachment_cache_limit(1, await);
     arrive("h3", 3000, "other");
     net->served["other"] = ciphertext;
-    auto third = c->conversation(convo, await)->messages(await)[0].id;
+    auto third = c->conversation(convo, await)->messages(await).messages[0].id;
     c->attachment_data(third, 0, nullptr, [](auto) {});
     sync(*c);
     REQUIRE(serve_downloads(*net) == 1);
@@ -2596,7 +2622,7 @@ TEST_CASE(
     };
 
     auto convo = ConversationId::dm(peer.session_id);
-    auto newest = [&] { return c->conversation(convo, await)->messages(await)[0].id; };
+    auto newest = [&] { return c->conversation(convo, await)->messages(await).messages[0].id; };
     auto availability = [&](int64_t id) {
         return c->message(id, await)->attachments[0].availability;
     };
@@ -2690,7 +2716,7 @@ TEST_CASE(
     auto convo = ConversationId::dm(peer.session_id);
     auto verdicts = [&] {
         std::vector<AttachmentAvailability> found;
-        for (const auto& m : c->conversation(convo, await)->messages(await)) {
+        for (const auto& m : c->conversation(convo, await)->messages(await).messages) {
             REQUIRE(m.attachments.size() == 1);
             found.push_back(m.attachments[0].availability);
         }
@@ -2708,7 +2734,7 @@ TEST_CASE(
         std::optional<Error> error;
         std::optional<Expected<void>> last;
         c->attachment_data(
-                c->conversation(convo, await)->messages(await).back().id,
+                c->conversation(convo, await)->messages(await).messages.back().id,
                 0,
                 [&](const AttachmentProgress& p) { last = p.result; },
                 [&](auto r) {
@@ -2728,7 +2754,10 @@ TEST_CASE(
     auto ask_again = [&] {
         std::optional<Error> error;
         c->attachment_data(
-                c->conversation(convo, await)->messages(await).back().id, 0, nullptr, [&](auto r) {
+                c->conversation(convo, await)->messages(await).messages.back().id,
+                0,
+                nullptr,
+                [&](auto r) {
                     if (!r)
                         error = std::move(r).error();
                 });
@@ -2806,7 +2835,10 @@ TEST_CASE(
             },
             7);
     sync(*c);
-    auto id = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto id = c->conversation(ConversationId::dm(peer.session_id), await)
+                      ->messages(await)
+                      .messages[0]
+                      .id;
 
     std::optional<Expected<std::vector<std::byte>>> answer;
     c->attachment_data(id, 0, nullptr, [&](auto r) { answer = std::move(r); });
@@ -2876,7 +2908,10 @@ TEST_CASE("Client: a download fills the cache as it arrives", "[client][attachme
             },
             7);
     sync(*c);
-    auto id = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto id = c->conversation(ConversationId::dm(peer.session_id), await)
+                      ->messages(await)
+                      .messages[0]
+                      .id;
 
     std::optional<std::vector<std::byte>> got;
     c->attachment_data(id, 0, nullptr, [&](auto r) {
@@ -2945,7 +2980,10 @@ TEST_CASE(
             },
             7);
     sync(*c);
-    auto id = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto id = c->conversation(ConversationId::dm(peer.session_id), await)
+                      ->messages(await)
+                      .messages[0]
+                      .id;
 
     // Something in the way of the attachment cache, so nothing can be written into it.
     auto attachments = dir.path / cache::ATTACHMENT_DIR;
@@ -3049,7 +3087,10 @@ TEST_CASE(
                 a->set_contenttype("image/png");
             });
     sync(*c);
-    auto id = c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto id = c->conversation(ConversationId::dm(peer.session_id), await)
+                      ->messages(await)
+                      .messages[0]
+                      .id;
 
     auto code_of = [&](int64_t message_id, size_t index) {
         std::optional<Error> error;
@@ -3123,7 +3164,10 @@ TEST_CASE(
                 },
                 7);
         sync(*c);
-        return c->conversation(ConversationId::dm(from.session_id), await)->messages(await)[0].id;
+        return c->conversation(ConversationId::dm(from.session_id), await)
+                ->messages(await)
+                .messages[0]
+                .id;
     };
     auto alices = send(alice, key, "h1");
     auto mallorys = send(mallory, garbage, "h2");
@@ -3224,8 +3268,10 @@ TEST_CASE(
             },
             42);
     sync(*c);
-    auto msg_id =
-            c->conversation(ConversationId::dm(peer.session_id), await)->messages(await)[0].id;
+    auto msg_id = c->conversation(ConversationId::dm(peer.session_id), await)
+                          ->messages(await)
+                          .messages[0]
+                          .id;
 
     // Corrupted in the second chunk, so the first one authenticates and the failure happens partway
     // rather than at the very start.
@@ -3299,7 +3345,7 @@ TEST_CASE("Client: a request for an attachment can be withdrawn", "[client][atta
                 },
                 7);
         sync(*c);
-        return c->conversation(convo, await)->messages(await)[0].id;
+        return c->conversation(convo, await)->messages(await).messages[0].id;
     };
     auto availability = [&](int64_t id) {
         return c->message(id, await)->attachments[0].availability;
@@ -3679,7 +3725,7 @@ TEST_CASE("Client: auto-downloads take turns, newest first", "[client][auto][que
         c->set_auto_download_concurrency(1, await);
         arrive("a");
         arrive("b");
-        auto messages = c->conversation(convo, await)->messages(await);
+        auto messages = c->conversation(convo, await)->messages(await).messages;
         auto waiting = std::ranges::find_if(
                 messages, [&](const Message& m) { return m.timestamp == from_epoch_ms(1001); });
         REQUIRE(waiting != messages.end());
@@ -3733,7 +3779,7 @@ TEST_CASE(
             },
             7);
     sync(*c);
-    auto messages = c->conversation(convo, await)->messages(await);
+    auto messages = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(messages.size() == 1);
     auto id = messages[0].id;
 

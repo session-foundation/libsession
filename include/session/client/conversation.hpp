@@ -191,8 +191,7 @@ class Conversation {
     /// in each direction (see `MessagePageResult`).  Reading all of history means paging with
     /// `before` until `has_older` is false.
     ///
-    /// The forms without a page read the newest 50 and return only the messages, for a caller
-    /// that wants a glance at a conversation rather than a window to page from.
+    /// The forms without a page read the newest page at the default size, as `MessagePage{}` does.
     ///
     /// Deleted messages are filtered in the query rather than left to the caller, because the
     /// alternative breaks paging: a page of 50 that is mostly deleted would hand back a handful of
@@ -200,9 +199,9 @@ class Conversation {
     ///
     /// @throws std::invalid_argument if `limit` is not positive, or if more than one of `before`,
     /// `after` and `around` is set.  SQLite reads `LIMIT -1` as "all of it"; this does not.
-    void messages(result_function<std::vector<Message>> cb) const;
+    void messages(result_function<MessagePageResult> cb) const;
     void messages(MessagePage page, result_function<MessagePageResult> cb) const;
-    std::vector<Message> messages(await_t) const;
+    MessagePageResult messages(await_t) const;
     MessagePageResult messages(MessagePage page, await_t) const;
 
     /// Where the unread messages start: the cursor of the oldest message `unread` counts --
@@ -548,13 +547,11 @@ class AnyConversation {
     const Community* community() const { return std::get_if<Community>(&kind); }
 
     // Spelled out rather than forwarded: a template cannot deduce a braced `{.limit = 20}`.
-    void messages(result_function<std::vector<Message>> cb) const {
-        base().messages(std::move(cb));
-    }
+    void messages(result_function<MessagePageResult> cb) const { base().messages(std::move(cb)); }
     void messages(MessagePage page, result_function<MessagePageResult> cb) const {
         base().messages(page, std::move(cb));
     }
-    std::vector<Message> messages(await_t) const { return base().messages(await); }
+    MessagePageResult messages(await_t) const { return base().messages(await); }
     MessagePageResult messages(MessagePage page, await_t) const {
         return base().messages(page, await);
     }

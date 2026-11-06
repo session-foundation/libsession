@@ -17,7 +17,7 @@ TEST_CASE("Client: a received DM creates a conversation and a message", "[client
     CHECK(convos[0].last_activity() == from_epoch_ms(5000));
     CHECK(convos[0].unread() == 1);
 
-    auto msgs = c->conversation(convos[0].id(), await)->messages(await);
+    auto msgs = c->conversation(convos[0].id(), await)->messages(await).messages;
     REQUIRE(msgs.size() == 1);
     CHECK(msgs[0].body == "hello there");
     CHECK_FALSE(msgs[0].outgoing);
@@ -50,7 +50,7 @@ TEST_CASE(
     CHECK(convos[0].id() == ConversationId::dm(peer.session_id));
     CHECK(convos[0].unread() == 0);
 
-    auto msgs = c->conversation(convos[0].id(), await)->messages(await);
+    auto msgs = c->conversation(convos[0].id(), await)->messages(await).messages;
     REQUIRE(msgs.size() == 1);
     CHECK(msgs[0].body == "sent from my phone");
     CHECK(msgs[0].outgoing);
@@ -74,7 +74,7 @@ TEST_CASE("Client: a message to ourselves is a conversation with ourselves", "[c
     CHECK(convos[0].dm()->note_to_self);
     CHECK(c->is_note_to_self(convos[0].id()));
 
-    auto msgs = c->conversation(convos[0].id(), await)->messages(await);
+    auto msgs = c->conversation(convos[0].id(), await)->messages(await).messages;
     REQUIRE(msgs.size() == 2);
     CHECK(msgs[0].outgoing);
     CHECK(msgs[1].outgoing);
@@ -139,7 +139,7 @@ TEST_CASE("Client: syncTarget from another sender is ignored", "[client][receive
     REQUIRE(convos.size() == 1);
     CHECK(convos[0].id() == ConversationId::dm(peer.session_id));
 
-    auto msgs = c->conversation(convos[0].id(), await)->messages(await);
+    auto msgs = c->conversation(convos[0].id(), await)->messages(await).messages;
     REQUIRE(msgs.size() == 1);
     CHECK_FALSE(msgs[0].outgoing);
 }
@@ -152,12 +152,12 @@ TEST_CASE("Client: redelivery of the same swarm hash is ignored", "[client][rece
     deliver(*c, sender, "only once", from_epoch_ms(5000), "dup");
 
     auto convo = ConversationId::dm(sender.session_id);
-    CHECK(c->conversation(convo, await)->messages(await).size() == 1);
+    CHECK(c->conversation(convo, await)->messages(await).messages.size() == 1);
     CHECK(c->conversation(convo, await)->unread() == 1);
 
     // A genuinely different message from the same sender still lands.
     deliver(*c, sender, "and again", from_epoch_ms(6000), "notdup");
-    CHECK(c->conversation(convo, await)->messages(await).size() == 2);
+    CHECK(c->conversation(convo, await)->messages(await).messages.size() == 2);
 }
 
 TEST_CASE("Client: the same message under a different swarm hash is deduped", "[client][receive]") {
@@ -187,7 +187,7 @@ TEST_CASE("Client: the same message under a different swarm hash is deduped", "[
             nullptr,
             7);
 
-    CHECK(c->conversation(convo, await)->messages(await).size() == 1);
+    CHECK(c->conversation(convo, await)->messages(await).messages.size() == 1);
     CHECK(c->conversation(convo, await)->unread() == 1);
 
     // Same millisecond, different message: the case the timestamp alone cannot tell apart, and the
@@ -201,14 +201,14 @@ TEST_CASE("Client: the same message under a different swarm hash is deduped", "[
             std::nullopt,
             nullptr,
             8);
-    CHECK(c->conversation(convo, await)->messages(await).size() == 2);
+    CHECK(c->conversation(convo, await)->messages(await).messages.size() == 2);
 
     // A sender too old to set one has no identity beyond its timestamp, so two arrivals under
     // different swarm hashes cannot be told from one message stored twice.  Both land: a visible
     // duplicate is the failure we chose over silently dropping a real message.
     deliver(*c, sender, "from an old client", from_epoch_ms(6000), "old_a");
     deliver(*c, sender, "from an old client", from_epoch_ms(6000), "old_b");
-    CHECK(c->conversation(convo, await)->messages(await).size() == 4);
+    CHECK(c->conversation(convo, await)->messages(await).messages.size() == 4);
 }
 
 TEST_CASE("Client: display name is unset rather than empty until known", "[client][convos]") {
@@ -387,7 +387,7 @@ TEST_CASE("Client: cached counts stay in step with the messages table", "[client
     }
 
     SECTION("count tracks deletes made behind the application's back") {
-        auto id = c->conversation(convo, await)->messages(await).front().id;
+        auto id = c->conversation(convo, await)->messages(await).messages.front().id;
         conn.prepared_exec("DELETE FROM messages WHERE id = ?", id);
 
         auto [n, unread, actual_n, actual_unread] = counts(alice.session_id);
@@ -409,7 +409,7 @@ TEST_CASE("Client: cached counts stay in step with the messages table", "[client
                 "SELECT c.id FROM conversations c JOIN accounts a ON a.id = c.dm"
                 " WHERE a.session_id = ?",
                 bob.session_id);
-        auto id = c->conversation(convo, await)->messages(await).front().id;
+        auto id = c->conversation(convo, await)->messages(await).messages.front().id;
         conn.prepared_exec("UPDATE messages SET conversation = ? WHERE id = ?", convo_row, id);
 
         auto [n, unread, actual_n, actual_unread] = counts(alice.session_id);
@@ -747,7 +747,7 @@ TEST_CASE("Client: a message can be shown as it was on the wire", "[client][mess
             },
             77);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 1);
 
     auto dump = c->message_debug(msgs[0].id, await);
@@ -789,7 +789,7 @@ TEST_CASE(
     deliver(*c, sender, "three", from_epoch_ms(3000), "h3");
     REQUIRE(c->conversation(convo, await)->unread() == 3);
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(msgs.size() == 3);
     auto middle = msgs[1];  // "two"
     REQUIRE(middle.body == "two");
@@ -798,7 +798,7 @@ TEST_CASE(
     CHECK(c->delete_message(middle.id, await));
 
     // Hidden by default...
-    auto visible = c->conversation(convo, await)->messages(await);
+    auto visible = c->conversation(convo, await)->messages(await).messages;
     REQUIRE(visible.size() == 2);
     CHECK(visible[0].body == "three");
     CHECK(visible[1].body == "one");
@@ -839,7 +839,7 @@ TEST_CASE("Client: the list preview skips a deleted last message", "[client][con
     deliver(*c, sender, "older", from_epoch_ms(1000), "h1");
     deliver(*c, sender, "newest", from_epoch_ms(2000), "h2");
 
-    auto newest = c->conversation(convo, await)->messages(await).front();
+    auto newest = c->conversation(convo, await)->messages(await).messages.front();
     REQUIRE(newest.body == "newest");
     REQUIRE(preview_body(*c->conversation(convo, await)) == "newest");
 
@@ -858,7 +858,7 @@ TEST_CASE("Client: purging removes what a deletion left", "[client][messages][de
     deliver(*c, sender, "two", from_epoch_ms(2000), "h2");
     deliver(*c, sender, "three", from_epoch_ms(3000), "h3");
 
-    auto msgs = c->conversation(convo, await)->messages(await);
+    auto msgs = c->conversation(convo, await)->messages(await).messages;
     auto live = msgs[0].id;  // "three"
     c->delete_message(msgs[1].id, await);
     c->delete_message(msgs[2].id, await);
@@ -866,7 +866,7 @@ TEST_CASE("Client: purging removes what a deletion left", "[client][messages][de
     SECTION("one at a time, and only what was deleted") {
         // A live message is refused: this is the one call that destroys history outright.
         CHECK_FALSE(c->purge_deleted_message(live, await));
-        CHECK(c->conversation(convo, await)->messages(await).size() == 1);
+        CHECK(c->conversation(convo, await)->messages(await).messages.size() == 1);
 
         CHECK(c->purge_deleted_message(msgs[1].id, await));
         CHECK(c->conversation(convo, await)
@@ -891,7 +891,7 @@ TEST_CASE("Client: purging removes what a deletion left", "[client][messages][de
         // And having forgotten it, a redelivery is a new message again -- the cost the header warns
         // about, asserted here so it is a decision rather than a surprise.
         deliver(*c, sender, "two", from_epoch_ms(2000), "h2");
-        CHECK(c->conversation(convo, await)->messages(await).size() == 2);
+        CHECK(c->conversation(convo, await)->messages(await).messages.size() == 2);
     }
 }
 
@@ -901,7 +901,7 @@ TEST_CASE("Client: deleting for everyone is only for what we sent", "[client][me
     auto convo = ConversationId::dm(sender.session_id);
 
     deliver(*c, sender, "theirs", from_epoch_ms(1000), "h1");
-    auto theirs = c->conversation(convo, await)->messages(await).front();
+    auto theirs = c->conversation(convo, await)->messages(await).messages.front();
 
     // Their message, in their swarm as well as ours: an unsend request from us would be ignored at
     // the other end, so we do not pretend to offer it.
@@ -949,7 +949,7 @@ TEST_CASE("Client: an unsend request from the author deletes the message", "[cli
     };
 
     deliver(*c, sender, "regrettable", from_epoch_ms(1000), "h1", "", std::nullopt, nullptr, 42);
-    auto msg = c->conversation(convo, await)->messages(await).front();
+    auto msg = c->conversation(convo, await)->messages(await).messages.front();
     REQUIRE(msg.body == "regrettable");
 
     SECTION("naming someone else's message, ignored") {
@@ -983,11 +983,11 @@ TEST_CASE("Client: an unsend request from the author deletes the message", "[cli
         // case the id exists for, and the case a sender most often unsends.
         deliver(*c, sender, "one", from_epoch_ms(7000), "amb1");
         deliver(*c, sender, "two", from_epoch_ms(7000), "amb2");
-        REQUIRE(c->conversation(convo, await)->messages(await).size() == 3);
+        REQUIRE(c->conversation(convo, await)->messages(await).messages.size() == 3);
 
         unsend(sender, sender.session_id, 7000, std::nullopt, "u5");
 
-        auto left = c->conversation(convo, await)->messages(await);
+        auto left = c->conversation(convo, await)->messages(await).messages;
         CHECK(left.size() == 3);
         for (const auto& m : left)
             CHECK_FALSE(m.deleted.has_value());
