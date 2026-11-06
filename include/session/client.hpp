@@ -1221,6 +1221,12 @@ class Client {
     // not what the numbers are about.
     transfer_progress _dispatch_progress(transfer_progress cb);
 
+    // The same for a send's or a retry's upload handler, wrapped once where the send begins so that
+    // every report -- started, progress, failed, done -- leaves through the dispatcher as a
+    // download's do.  Called only on Core's loop, which is where `_dispatch_out` reads the
+    // dispatcher.
+    Conversation::upload_progress _dispatch_upload(Conversation::upload_progress cb);
+
     // The same for a caller following one attachment, with its identity filled in before the hop:
     // the download reports only numbers, and which attachment they are about is this layer's to
     // say.

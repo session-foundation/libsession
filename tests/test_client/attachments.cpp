@@ -162,6 +162,59 @@ TEST_CASE("Client: a message reports the attachments it carries", "[client][send
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE(
+        "Client: an upload reports its start, progress and outcome through the dispatcher",
+        "[client][send][attachments][callbacks]") {
+    TempClient c;
+    attach_mock_network(c->core);
+
+    // Stands in for an application's loop, as the dispatcher test does: a report run on Core's
+    // loop instead of being handed over shows up as one that arrived before the jobs were run.
+    std::vector<std::function<void()>> queued;
+    c->set_dispatcher([&](std::function<void()> job) { queued.push_back(std::move(job)); });
+
+    auto dir = std::filesystem::temp_directory_path() / random::unique_id("test_upload", 7);
+    std::filesystem::create_directories(dir);
+    auto photo = dir / "photo.png";
+    std::ofstream{photo, std::ios::binary} << "not really a picture";
+
+    auto me = own_sid(*c);
+    TestHelper::seed_pfs_nak(c->core, me);
+
+    std::vector<std::tuple<size_t, int64_t, int64_t, std::optional<Expected<void>>>> reports;
+    c->send_message(
+            ConversationId::dm(me),
+            {.attachments = {OutgoingAttachment{.path = photo}}},
+            [&](size_t index, int64_t sent, int64_t total, std::optional<Expected<void>> result) {
+                reports.emplace_back(index, sent, total, std::move(result));
+            },
+            await);
+    sync(*c);
+
+    CHECK(reports.empty());
+    for (auto& job : queued)
+        job();
+
+    // Started, as a download starts, then the bytes, then done: in that order and nothing else.
+    REQUIRE(reports.size() == 3);
+    auto& [start_index, start_sent, start_total, start_result] = reports[0];
+    CHECK(start_index == 0);
+    CHECK(start_sent == 0);
+    CHECK(start_total == 0);
+    CHECK_FALSE(start_result.has_value());
+    auto& [progress_index, progress_sent, progress_total, progress_result] = reports[1];
+    CHECK(progress_index == 0);
+    CHECK(progress_total > 0);
+    CHECK(progress_sent == progress_total);
+    CHECK_FALSE(progress_result.has_value());
+    auto& [done_index, done_sent, done_total, done_result] = reports[2];
+    CHECK(done_index == 0);
+    REQUIRE(done_result.has_value());
+    CHECK(done_result->has_value());
+
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("Client: an attachment carries a thumbhash in both directions", "[client][attachments]") {
     TempClient c;
     SenderKeys peer;

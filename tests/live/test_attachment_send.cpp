@@ -101,10 +101,15 @@ TEST_CASE(
         seen_off_loop = off_loop;
     }
 
-    // Progress as well as the outcome: the handler is documented to run on Core's loop.  Onion
-    // requests carry an upload as one HTTP request and report no progress, only the outcome.
+    // Started first, as a download starts.  Then progress, except over onion requests, which carry
+    // an upload as one HTTP request and report only its outcome.  With no dispatcher, every report
+    // runs on Core's loop.
+    REQUIRE(!seen.empty());
+    CHECK(std::get<1>(seen.front()) == 0);
+    CHECK(std::get<2>(seen.front()) == 0);
+    CHECK_FALSE(std::get<3>(seen.front()).has_value());
     if (live_router_mode.type != session::network::opt::router::Type::onion_requests)
-        CHECK(seen.size() > 1);
+        CHECK(seen.size() > 2);
     CHECK(seen_off_loop == 0);
 
     // The upload reported itself finished, and did so as a result rather than by reaching the

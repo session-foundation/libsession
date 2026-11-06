@@ -4458,6 +4458,7 @@ int64_t Client::_send_message(
     const auto& attachments = msg.attachments;
     if (attachments.empty())
         return _send_message(id, msg);
+    on_upload = _dispatch_upload(std::move(on_upload));
 
     auto body = msg.body;
     auto now = clock_now_ms();
@@ -4644,6 +4645,10 @@ void Client::_upload_one(
         return _fail_attachment_send(client_id);
     }
 
+    // As a download does: the 0/0 that says this file has started, before its size is known.
+    if (on_upload)
+        on_upload(index, 0, 0, std::nullopt);
+
     network::FileUploadRequest req;
     req.file = path;
     req.domain = attachment::Domain::ATTACHMENT;
@@ -4658,9 +4663,10 @@ void Client::_upload_one(
         // squelch one another.  Only progress passes through it: starting and finishing are things
         // a caller must always hear, and they are reported from elsewhere.
         auto throttle = std::make_shared<update_throttle>(_high_freq_dispatch_interval);
-        // Progress arrives on the network's loop, and `on_upload` is promised Core's.  Queued with
-        // `call`, as `on_complete` queues the outcome, so a file's last progress still comes before
-        // its outcome.  Throttled here, so a squelched report is never queued at all.
+        // Progress arrives on the network's loop, and `on_upload` leaves from Core's, through the
+        // dispatcher.  Queued with `call`, as `on_complete` queues the outcome, so a file's last
+        // progress still comes before its outcome.  Throttled here, so a squelched report is never
+        // queued at all.
         req.on_progress = [this, index, on_upload, throttle](int64_t sent, int64_t total) {
             if (throttle->allow())
                 call([on_upload, index, sent, total] {
@@ -4759,6 +4765,7 @@ void Client::_upload_one(
 }
 
 bool Client::_retry_send(int64_t client_id, Conversation::upload_progress on_upload) {
+    on_upload = _dispatch_upload(std::move(on_upload));
     std::optional<ConversationId> convo_id;
     bool has_uploads_left;
     {
@@ -4907,6 +4914,15 @@ Client::transfer_progress Client::_attachment_progress(
                                       std::optional<Expected<void>> r) {
         on_progress(AttachmentProgress{message_id, index, token, done, total, std::move(r)});
     });
+}
+
+Conversation::upload_progress Client::_dispatch_upload(Conversation::upload_progress cb) {
+    if (!cb)
+        return {};
+    return [this, cb = std::move(cb)](
+                   size_t index, int64_t sent, int64_t total, std::optional<Expected<void>> r) {
+        _dispatch_out([cb, index, sent, total, r] { cb(index, sent, total, r); });
+    };
 }
 
 Client::transfer_progress Client::_dispatch_progress(transfer_progress cb) {
