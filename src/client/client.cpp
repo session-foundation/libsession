@@ -4458,7 +4458,7 @@ int64_t Client::_send_message(
     const auto& attachments = msg.attachments;
     if (attachments.empty())
         return _send_message(id, msg);
-    on_upload = _dispatch_upload(std::move(on_upload));
+    auto handler = _dispatch_upload(std::move(on_upload));
 
     auto body = msg.body;
     auto now = clock_now_ms();
@@ -4558,11 +4558,11 @@ int64_t Client::_send_message(
             id.to_string(),
             attachments.size());
 
-    _upload_next(client_id, std::move(on_upload));
+    _upload_next(client_id, std::move(handler));
     return client_id;
 }
 
-void Client::_upload_next(int64_t client_id, Conversation::upload_progress on_upload) {
+void Client::_upload_next(int64_t client_id, upload_handler on_upload) {
     std::optional<std::tuple<int64_t, std::string>> next;
     {
         auto c = core.database().conn();
@@ -4611,7 +4611,7 @@ void Client::_upload_one(
         size_t index,
         std::string path,
         std::optional<int64_t> file_size,
-        Conversation::upload_progress on_upload) {
+        upload_handler on_upload) {
     if (!file_size) {
         log::warning(
                 cat,
@@ -4620,7 +4620,7 @@ void Client::_upload_one(
                 client_id,
                 path);
         if (on_upload)
-            on_upload(
+            (*on_upload)(
                     index,
                     0,
                     0,
@@ -4637,7 +4637,7 @@ void Client::_upload_one(
                 index,
                 client_id);
         if (on_upload)
-            on_upload(
+            (*on_upload)(
                     index,
                     0,
                     0,
@@ -4647,7 +4647,7 @@ void Client::_upload_one(
 
     // As a download does: the 0/0 that says this file has started, before its size is known.
     if (on_upload)
-        on_upload(index, 0, 0, std::nullopt);
+        (*on_upload)(index, 0, 0, std::nullopt);
 
     network::FileUploadRequest req;
     req.file = path;
@@ -4670,7 +4670,7 @@ void Client::_upload_one(
         req.on_progress = [this, index, on_upload, throttle](int64_t sent, int64_t total) {
             if (throttle->allow())
                 call([on_upload, index, sent, total] {
-                    on_upload(index, sent, total, std::nullopt);
+                    (*on_upload)(index, sent, total, std::nullopt);
                 });
         };
     }
@@ -4693,7 +4693,7 @@ void Client::_upload_one(
                             client_id,
                             *err);
                     if (on_upload)
-                        on_upload(
+                        (*on_upload)(
                                 index,
                                 0,
                                 0,
@@ -4743,7 +4743,7 @@ void Client::_upload_one(
                         url);
 
                 if (on_upload)
-                    on_upload(index, meta.size, meta.size, Expected<void>{});
+                    (*on_upload)(index, meta.size, meta.size, Expected<void>{});
 
                 _upload_next(client_id, on_upload);
             } catch (const std::exception& e) {
@@ -4765,7 +4765,7 @@ void Client::_upload_one(
 }
 
 bool Client::_retry_send(int64_t client_id, Conversation::upload_progress on_upload) {
-    on_upload = _dispatch_upload(std::move(on_upload));
+    auto handler = _dispatch_upload(std::move(on_upload));
     std::optional<ConversationId> convo_id;
     bool has_uploads_left;
     {
@@ -4825,7 +4825,7 @@ bool Client::_retry_send(int64_t client_id, Conversation::upload_progress on_upl
     // Resumes wherever it was left: _upload_next takes the first attachment with no url, so the
     // ones that already got up are not sent again, and a message needing none goes straight to
     // being dispatched.
-    _upload_next(client_id, std::move(on_upload));
+    _upload_next(client_id, std::move(handler));
     return true;
 }
 
@@ -4916,13 +4916,17 @@ Client::transfer_progress Client::_attachment_progress(
     });
 }
 
-Conversation::upload_progress Client::_dispatch_upload(Conversation::upload_progress cb) {
+Client::upload_handler Client::_dispatch_upload(Conversation::upload_progress cb) {
     if (!cb)
-        return {};
-    return [this, cb = std::move(cb)](
-                   size_t index, int64_t sent, int64_t total, std::optional<Expected<void>> r) {
-        _dispatch_out([cb, index, sent, total, r] { cb(index, sent, total, r); });
-    };
+        return nullptr;
+    auto target = std::make_shared<const Conversation::upload_progress>(std::move(cb));
+    return std::make_shared<const Conversation::upload_progress>(
+            [this, target = std::move(target)](
+                    size_t index, int64_t sent, int64_t total, std::optional<Expected<void>> r) {
+                _dispatch_out([target, index, sent, total, r = std::move(r)] {
+                    (*target)(index, sent, total, r);
+                });
+            });
 }
 
 Client::transfer_progress Client::_dispatch_progress(transfer_progress cb) {

@@ -215,6 +215,46 @@ TEST_CASE(
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE(
+        "Client: a message's upload reports all reach the one handler it was given",
+        "[client][send][attachments][callbacks]") {
+    TempClient c;
+    attach_mock_network(c->core);
+
+    auto dir = std::filesystem::temp_directory_path() / random::unique_id("test_upload", 7);
+    std::filesystem::create_directories(dir);
+    auto first = dir / "first.png";
+    auto second = dir / "second.pdf";
+    std::ofstream{first, std::ios::binary} << "not really a picture";
+    std::ofstream{second, std::ios::binary} << "not really a document";
+
+    auto me = own_sid(*c);
+    TestHelper::seed_pfs_nak(c->core, me);
+
+    // State kept in the handler itself: a copy per role or per attachment would start counting
+    // again, so the counts come out 0, 1, 2... only if every report reached the same object.
+    std::vector<std::pair<size_t, int>> calls;
+    c->send_message(
+            ConversationId::dm(me),
+            {.attachments =
+                     {OutgoingAttachment{.path = first}, OutgoingAttachment{.path = second}}},
+            [&calls, count = 0](
+                    size_t index, int64_t, int64_t, std::optional<Expected<void>>) mutable {
+                calls.emplace_back(index, count++);
+            },
+            await);
+    sync(*c);
+
+    // Started, progress and done for each file, the first file's before the second's.
+    REQUIRE(calls.size() == 6);
+    for (size_t i = 0; i < calls.size(); i++) {
+        CHECK(calls[i].first == (i < 3 ? 0 : 1));
+        CHECK(calls[i].second == static_cast<int>(i));
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("Client: an attachment carries a thumbhash in both directions", "[client][attachments]") {
     TempClient c;
     SenderKeys peer;
