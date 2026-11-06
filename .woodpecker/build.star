@@ -355,7 +355,53 @@ pro_backend_check = {
     ],
 }
 
+# One workflow per runner, pinned by the agent's hostname label, timing connections to candidate
+# ccache servers.  Region and country only: CI logs are public, and some runners are home machines.
+probe_runners = {
+    "angus": "linux/amd64",
+    "betwixt": "linux/amd64",
+    "chianina": "linux/amd64",
+    "rumour": "linux/amd64",
+    "ali": "linux/arm64",
+    "skylark": "linux/arm64",
+    "midnight": "linux/arm64",
+    "eclipse": "linux/arm64",
+    "elly": "linux/arm64",
+    "elektra": "linux/arm64",
+    "om2g": "darwin/arm64",
+    "macintel": "darwin/amd64",
+}
+
+probe_targets = [
+    ("NJ builds.session.codes", "https://builds.session.codes/"),
+    ("Helsinki bigSESH1", "http://95.217.37.13:8080/status"),
+]
+
+def probe(hostname, platform):
+    local = platform.startswith("darwin/")
+    commands = [] if local else ["apk add -q curl"]
+    commands.append(
+        'echo "runner $${CI_MACHINE}: $$(nproc 2>/dev/null || sysctl -n hw.ncpu) cpus, ' +
+        '$$(curl -s -m 5 https://ipinfo.io/region), $$(curl -s -m 5 https://ipinfo.io/country)"',
+    )
+    for label, url in probe_targets:
+        commands.append(
+            "for i in 1 2 3 4 5; do curl -s -o /dev/null -m 5 " +
+            "-w '%s: connect %%{time_connect}s\\n' %s || true; done" % (label, url),
+        )
+    wf = workflow("probe " + hostname, platform, [{
+        "name": "probe",
+        "image": "sh" if local else "alpine:3.20",
+        "commands": commands,
+    }])
+    wf["labels"]["hostname"] = hostname
+    wf["skip_clone"] = True
+    return wf
+
 def main(ctx):
+    return [probe(h, p) for h, p in probe_runners.items()]
+
+def all_workflows():
     return [
         workflow("lint check", "linux/amd64", [{
             "name": "formatting",
