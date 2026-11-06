@@ -374,6 +374,8 @@ probe_runners = {
 
 probe_targets = [
     ("NJ builds.session.codes", "https://builds.session.codes/"),
+    ("NJ builds.session.codes -4", "-4 https://builds.session.codes/"),
+    ("NJ builds.session.codes -6", "-6 https://builds.session.codes/"),
     ("Helsinki bigSESH1", "http://95.217.37.13:8080/status"),
 ]
 
