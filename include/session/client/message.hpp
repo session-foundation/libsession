@@ -60,7 +60,7 @@ struct MessageCursor {
 /// Which page of history `Conversation::messages` reads.  Designated initialisers make a call say
 /// which parts it is using:
 ///
-///     convo->messages({.limit = 20, .before = page.back().cursor()}, await);
+///     convo->messages({.limit = 20, .before = page.messages.back().cursor()}, await);
 struct MessagePage {
     /// At most this many messages.  Must be positive: there is no value meaning "all of it", since
     /// history grows without bound.
@@ -74,7 +74,7 @@ struct MessagePage {
     /// The page newer than this cursor, for paging forwards from a window that does not reach the
     /// newest message: the `limit` messages immediately after it, still newest first, so the next
     /// one is from the `cursor()` of the *first* message.  The message at the cursor is not
-    /// repeated, and a page shorter than `limit` has reached the newest message.
+    /// repeated.
     std::optional<MessageCursor> after;
 
     /// A window with the message at this cursor as near the middle as the history allows, for
@@ -251,6 +251,34 @@ struct Message {
     std::optional<Deletion> deleted;
 
     MessageCursor cursor() const { return {timestamp, id}; }
+};
+
+/// A page of history read through a `MessagePage`, and whether it reaches either end of the
+/// conversation.
+///
+/// The two flags are worked out in the same read as the messages, so they describe the history
+/// those messages were taken from: a message stored between two separate reads cannot make the
+/// page and its flags disagree.  They are as of this read, and go stale as messages arrive.  A
+/// window whose `has_newer` is false stays current by applying `messages_added`, which for any
+/// message stored after the read is announced after this page is delivered, through the same
+/// dispatcher.  A message stored just before the read can be both in the page and announced
+/// afterwards, and history is ordered by the message's own timestamp rather than by arrival, so
+/// a client merges announced messages by id and inserts them by `cursor()` rather than appending.
+///
+/// Both count only the messages the page would show: with `include_deleted` unset, a conversation
+/// whose only older messages are deleted has `has_older` false.
+struct MessagePageResult {
+    /// The messages, newest first.
+    std::vector<Message> messages;
+
+    /// Whether there are newer messages than this page, as of this read: newer than its newest
+    /// message, or for a page read `before` a cursor, newer than the cursor, the message at the
+    /// cursor being one the caller already has.  Always false for the newest page.
+    bool has_newer = false;
+
+    /// Whether there are older messages than this page, as of this read: older than its oldest
+    /// message, or for a page read `after` a cursor, older than the cursor.
+    bool has_older = false;
 };
 
 }  // namespace session::client

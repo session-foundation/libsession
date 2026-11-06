@@ -187,20 +187,23 @@ class Conversation {
     // -- Reading ------------------------------------------------------------------------------
 
     /// A page of history, newest first: the newest `MessagePage::limit` messages, the page older
-    /// or newer than a cursor, or a window around one.  The forms without a page read the newest
-    /// 50.
+    /// or newer than a cursor, or a window around one, with whether more history lies beyond it
+    /// in each direction (see `MessagePageResult`).  Reading all of history means paging with
+    /// `before` until `has_older` is false.
+    ///
+    /// The forms without a page read the newest 50 and return only the messages, for a caller
+    /// that wants a glance at a conversation rather than a window to page from.
     ///
     /// Deleted messages are filtered in the query rather than left to the caller, because the
     /// alternative breaks paging: a page of 50 that is mostly deleted would hand back a handful of
-    /// rows with nothing to say that another page is warranted.
+    /// rows, and the flags would count messages the page can never show.
     ///
     /// @throws std::invalid_argument if `limit` is not positive, or if more than one of `before`,
     /// `after` and `around` is set.  SQLite reads `LIMIT -1` as "all of it"; this does not.
-    /// Reading all of history means paging with `before` until a page comes back short.
     void messages(result_function<std::vector<Message>> cb) const;
-    void messages(MessagePage page, result_function<std::vector<Message>> cb) const;
+    void messages(MessagePage page, result_function<MessagePageResult> cb) const;
     std::vector<Message> messages(await_t) const;
-    std::vector<Message> messages(MessagePage page, await_t) const;
+    MessagePageResult messages(MessagePage page, await_t) const;
 
     /// Where the unread messages start: the cursor of the oldest message `unread` counts --
     /// incoming, not deleted, and newer than the read watermark -- or nullopt with nothing unread.
@@ -548,11 +551,11 @@ class AnyConversation {
     void messages(result_function<std::vector<Message>> cb) const {
         base().messages(std::move(cb));
     }
-    void messages(MessagePage page, result_function<std::vector<Message>> cb) const {
+    void messages(MessagePage page, result_function<MessagePageResult> cb) const {
         base().messages(page, std::move(cb));
     }
     std::vector<Message> messages(await_t) const { return base().messages(await); }
-    std::vector<Message> messages(MessagePage page, await_t) const {
+    MessagePageResult messages(MessagePage page, await_t) const {
         return base().messages(page, await);
     }
 

@@ -444,36 +444,6 @@ TEST_CASE("Client: explicit conversation creation", "[client][convos]") {
 
 // ── Paging ──────────────────────────────────────────────────────────────────────────────────────
 
-TEST_CASE("Client: message history pages backwards by cursor", "[client][messages]") {
-    TempClient c;
-    SenderKeys sender;
-    auto convo = ConversationId::dm(sender.session_id);
-
-    for (int i = 1; i <= 10; i++)
-        deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
-
-    auto page1 = c->conversation(convo, await)->messages({.limit = 4}, await);
-    REQUIRE(page1.size() == 4);
-    CHECK(page1[0].body == "msg10");
-    CHECK(page1[3].body == "msg7");
-
-    auto page2 = c->conversation(convo, await)
-                         ->messages({.limit = 4, .before = page1.back().cursor()}, await);
-    REQUIRE(page2.size() == 4);
-    CHECK(page2[0].body == "msg6");
-    CHECK(page2[3].body == "msg3");
-
-    auto page3 = c->conversation(convo, await)
-                         ->messages({.limit = 4, .before = page2.back().cursor()}, await);
-    REQUIRE(page3.size() == 2);
-    CHECK(page3[0].body == "msg2");
-    CHECK(page3[1].body == "msg1");
-
-    CHECK(c->conversation(convo, await)
-                  ->messages({.limit = 4, .before = page3.back().cursor()}, await)
-                  .empty());
-}
-
 namespace {
 std::vector<std::string> bodies(const std::vector<Message>& page) {
     std::vector<std::string> out;
@@ -481,105 +451,250 @@ std::vector<std::string> bodies(const std::vector<Message>& page) {
         out.push_back(m.body);
     return out;
 }
-}  // namespace
+std::vector<std::string> bodies(const MessagePageResult& page) {
+    return bodies(page.messages);
+}
 
-TEST_CASE("Client: message history pages forwards by cursor", "[client][messages]") {
+// Ten messages, msg1 to msg10, one second apart; `at(n)` is msgN's cursor.
+struct TenMessages {
     TempClient c;
     SenderKeys sender;
-    auto convo = ConversationId::dm(sender.session_id);
-    for (int i = 1; i <= 10; i++)
-        deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
-    auto conversation = c->conversation(convo, await);
-    auto all = conversation->messages({.limit = 10}, await);
-    auto third = all[7];
-    REQUIRE(third.body == "msg3");
+    ConversationId convo = ConversationId::dm(sender.session_id);
+    std::vector<Message> all;
+
+    TenMessages() {
+        for (int i = 1; i <= 10; i++)
+            deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
+        all = page({.limit = 10}).messages;
+        REQUIRE(all.size() == 10);
+    }
+    MessagePageResult page(MessagePage p) {
+        return c->conversation(convo, await)->messages(p, await);
+    }
+    MessageCursor at(int n) const { return all[10 - n].cursor(); }
+    int64_t id(int n) const { return all[10 - n].id; }
+};
+}  // namespace
+
+TEST_CASE("Client: message history pages backwards by cursor", "[client][messages]") {
+    TenMessages h;
+
+    auto page1 = h.page({.limit = 4});
+    CHECK(bodies(page1) == std::vector<std::string>{"msg10", "msg9", "msg8", "msg7"});
+    CHECK_FALSE(page1.has_newer);
+    CHECK(page1.has_older);
+
+    auto page2 = h.page({.limit = 4, .before = page1.messages.back().cursor()});
+    CHECK(bodies(page2) == std::vector<std::string>{"msg6", "msg5", "msg4", "msg3"});
+    CHECK(page2.has_newer);
+    CHECK(page2.has_older);
+
+    auto page3 = h.page({.limit = 4, .before = page2.messages.back().cursor()});
+    CHECK(bodies(page3) == std::vector<std::string>{"msg2", "msg1"});
+    CHECK(page3.has_newer);
+    CHECK_FALSE(page3.has_older);
+
+    auto past = h.page({.limit = 4, .before = page3.messages.back().cursor()});
+    CHECK(past.messages.empty());
+    CHECK(past.has_newer);
+    CHECK_FALSE(past.has_older);
+}
+
+TEST_CASE("Client: a page that ends at either end of history says so", "[client][messages]") {
+    TenMessages h;
+
+    SECTION("the newest page, when it is all of history") {
+        auto page = h.page({.limit = 10});
+        CHECK(page.messages.size() == 10);
+        CHECK_FALSE(page.has_newer);
+        CHECK_FALSE(page.has_older);
+        CHECK(h.page({.limit = 9}).has_older);
+    }
+
+    SECTION("before, reaching the oldest message with a full page") {
+        auto page = h.page({.limit = 4, .before = h.at(5)});
+        CHECK(bodies(page) == std::vector<std::string>{"msg4", "msg3", "msg2", "msg1"});
+        CHECK(page.has_newer);
+        CHECK_FALSE(page.has_older);
+    }
+
+    SECTION("after, reaching the newest message with a full page") {
+        auto page = h.page({.limit = 4, .after = h.at(6)});
+        CHECK(bodies(page) == std::vector<std::string>{"msg10", "msg9", "msg8", "msg7"});
+        CHECK_FALSE(page.has_newer);
+        CHECK(page.has_older);
+    }
+
+    SECTION("the message at the cursor is not counted on either side") {
+        auto newest = h.page({.limit = 4, .before = h.at(10)});
+        CHECK(newest.messages.size() == 4);
+        CHECK_FALSE(newest.has_newer);
+        auto oldest = h.page({.limit = 4, .after = h.at(1)});
+        CHECK(oldest.messages.size() == 4);
+        CHECK_FALSE(oldest.has_older);
+    }
+}
+
+TEST_CASE("Client: message history pages forwards by cursor", "[client][messages]") {
+    TenMessages h;
 
     // The four just newer than the cursor, newest first, the cursor's own message left out.
-    CHECK(bodies(conversation->messages({.limit = 4, .after = third.cursor()}, await)) ==
-          std::vector<std::string>{"msg7", "msg6", "msg5", "msg4"});
+    auto page = h.page({.limit = 4, .after = h.at(3)});
+    CHECK(bodies(page) == std::vector<std::string>{"msg7", "msg6", "msg5", "msg4"});
+    CHECK(page.has_newer);
+    CHECK(page.has_older);
+
     // Short at the newest end, and empty past it.
-    CHECK(bodies(conversation->messages({.limit = 4, .after = all[1].cursor()}, await)) ==
-          std::vector<std::string>{"msg10"});
-    CHECK(conversation->messages({.limit = 4, .after = all[0].cursor()}, await).empty());
+    auto short_page = h.page({.limit = 4, .after = h.at(9)});
+    CHECK(bodies(short_page) == std::vector<std::string>{"msg10"});
+    CHECK_FALSE(short_page.has_newer);
+    CHECK(short_page.has_older);
+    auto past = h.page({.limit = 4, .after = h.at(10)});
+    CHECK(past.messages.empty());
+    CHECK_FALSE(past.has_newer);
+    CHECK(past.has_older);
 }
 
 TEST_CASE("Client: a window around a message puts it in the middle", "[client][messages]") {
-    TempClient c;
-    SenderKeys sender;
-    auto convo = ConversationId::dm(sender.session_id);
-    for (int i = 1; i <= 10; i++)
-        deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
-    auto conversation = c->conversation(convo, await);
-    auto all = conversation->messages({.limit = 10}, await);
-    auto at = [&](int n) { return all[10 - n].cursor(); };
+    TenMessages h;
 
-    CHECK(bodies(conversation->messages({.limit = 5, .around = at(5)}, await)) ==
-          std::vector<std::string>{"msg7", "msg6", "msg5", "msg4", "msg3"});
+    auto middle = h.page({.limit = 5, .around = h.at(5)});
+    CHECK(bodies(middle) == std::vector<std::string>{"msg7", "msg6", "msg5", "msg4", "msg3"});
+    CHECK(middle.has_newer);
+    CHECK(middle.has_older);
     // An even limit's spare row goes newer.
-    CHECK(bodies(conversation->messages({.limit = 4, .around = at(5)}, await)) ==
+    CHECK(bodies(h.page({.limit = 4, .around = h.at(5)})) ==
           std::vector<std::string>{"msg7", "msg6", "msg5", "msg4"});
 
     SECTION("a side that runs out gives its share to the other") {
-        CHECK(bodies(conversation->messages({.limit = 5, .around = at(9)}, await)) ==
-              std::vector<std::string>{"msg10", "msg9", "msg8", "msg7", "msg6"});
-        CHECK(bodies(conversation->messages({.limit = 5, .around = at(2)}, await)) ==
-              std::vector<std::string>{"msg5", "msg4", "msg3", "msg2", "msg1"});
+        auto top = h.page({.limit = 5, .around = h.at(9)});
+        CHECK(bodies(top) == std::vector<std::string>{"msg10", "msg9", "msg8", "msg7", "msg6"});
+        CHECK_FALSE(top.has_newer);
+        CHECK(top.has_older);
+
+        auto bottom = h.page({.limit = 5, .around = h.at(2)});
+        CHECK(bodies(bottom) == std::vector<std::string>{"msg5", "msg4", "msg3", "msg2", "msg1"});
+        CHECK(bottom.has_newer);
+        CHECK_FALSE(bottom.has_older);
     }
 
-    SECTION("a limit past the history returns all of it") {
-        CHECK(conversation->messages({.limit = 20, .around = at(5)}, await).size() == 10);
+    SECTION("a side that fills the whole window still says whether it goes on") {
+        // Nothing older than msg1, so all three come from the newer side, which has more.
+        auto page = h.page({.limit = 3, .around = h.at(1)});
+        CHECK(bodies(page) == std::vector<std::string>{"msg3", "msg2", "msg1"});
+        CHECK(page.has_newer);
+        CHECK_FALSE(page.has_older);
+    }
+
+    SECTION("a limit of all of history, or past it, returns all of it") {
+        for (int limit : {10, 20}) {
+            auto page = h.page({.limit = limit, .around = h.at(5)});
+            CHECK(page.messages.size() == 10);
+            CHECK_FALSE(page.has_newer);
+            CHECK_FALSE(page.has_older);
+        }
     }
 
     SECTION("deleted messages are skipped, and the window is still full") {
-        REQUIRE(c->delete_message(all[10 - 4].id, await));
-        REQUIRE(c->delete_message(all[10 - 6].id, await));
-        CHECK(bodies(conversation->messages({.limit = 5, .around = at(5)}, await)) ==
+        REQUIRE(h.c->delete_message(h.id(4), await));
+        REQUIRE(h.c->delete_message(h.id(6), await));
+        CHECK(bodies(h.page({.limit = 5, .around = h.at(5)})) ==
               std::vector<std::string>{"msg8", "msg7", "msg5", "msg3", "msg2"});
-        CHECK(conversation->messages({.limit = 5, .around = at(5), .include_deleted = true}, await)
-                      .size() == 5);
+        CHECK(h.page({.limit = 5, .around = h.at(5), .include_deleted = true}).messages.size() ==
+              5);
     }
 
     SECTION("it carries on with before and after") {
-        auto window = conversation->messages({.limit = 3, .around = at(5)}, await);
+        auto window = h.page({.limit = 3, .around = h.at(5)}).messages;
         REQUIRE(bodies(window) == std::vector<std::string>{"msg6", "msg5", "msg4"});
-        CHECK(bodies(conversation->messages(
-                      {.limit = 2, .before = window.back().cursor()}, await)) ==
+        CHECK(bodies(h.page({.limit = 2, .before = window.back().cursor()})) ==
               std::vector<std::string>{"msg3", "msg2"});
-        CHECK(bodies(conversation->messages(
-                      {.limit = 2, .after = window.front().cursor()}, await)) ==
+        CHECK(bodies(h.page({.limit = 2, .after = window.front().cursor()})) ==
               std::vector<std::string>{"msg8", "msg7"});
     }
 
     SECTION("one position at a time") {
+        auto conversation = h.c->conversation(h.convo, await);
         CHECK_THROWS_AS(
-                conversation->messages({.before = at(5), .after = at(5)}, await),
+                conversation->messages({.before = h.at(5), .after = h.at(5)}, await),
                 std::invalid_argument);
         CHECK_THROWS_AS(
-                conversation->messages({.after = at(5), .around = at(5)}, await),
+                conversation->messages({.after = h.at(5), .around = h.at(5)}, await),
                 std::invalid_argument);
-        auto ignore = [](Expected<std::vector<Message>>) {};
+        auto ignore = [](Expected<MessagePageResult>) {};
         CHECK_THROWS_AS(
-                conversation->messages({.before = at(5), .around = at(5)}, ignore),
+                conversation->messages({.before = h.at(5), .around = h.at(5)}, ignore),
                 std::invalid_argument);
     }
 }
 
-TEST_CASE("Client: first_unread is the oldest of what unread counts", "[client][messages]") {
+TEST_CASE("Client: deleted messages beyond a page do not count as more", "[client][messages]") {
+    TenMessages h;
+    for (int n : {1, 2, 9, 10})
+        REQUIRE(h.c->delete_message(h.id(n), await));
+
+    // Each side's only further messages are deleted, so there is nothing more to show -- unless
+    // deleted messages are asked for, when they are what is further.
+    auto newest = h.page({.limit = 6});
+    CHECK(bodies(newest) ==
+          std::vector<std::string>{"msg8", "msg7", "msg6", "msg5", "msg4", "msg3"});
+    CHECK_FALSE(newest.has_older);
+    CHECK(h.page({.limit = 6, .include_deleted = true}).has_older);
+
+    auto before = h.page({.limit = 2, .before = h.at(5)});
+    CHECK(bodies(before) == std::vector<std::string>{"msg4", "msg3"});
+    CHECK_FALSE(before.has_older);
+    CHECK(h.page({.limit = 2, .before = h.at(5), .include_deleted = true}).has_older);
+    // The other side is an existence check rather than a row beyond the page, and filters alike.
+    CHECK_FALSE(h.page({.limit = 2, .before = h.at(8)}).has_newer);
+    CHECK(h.page({.limit = 2, .before = h.at(8), .include_deleted = true}).has_newer);
+
+    auto after = h.page({.limit = 2, .after = h.at(6)});
+    CHECK(bodies(after) == std::vector<std::string>{"msg8", "msg7"});
+    CHECK_FALSE(after.has_newer);
+    CHECK(h.page({.limit = 2, .after = h.at(6), .include_deleted = true}).has_newer);
+    CHECK_FALSE(h.page({.limit = 2, .after = h.at(3)}).has_older);
+    CHECK(h.page({.limit = 2, .after = h.at(3), .include_deleted = true}).has_older);
+
+    auto around = h.page({.limit = 6, .around = h.at(5)});
+    CHECK(around.messages.size() == 6);
+    CHECK_FALSE(around.has_newer);
+    CHECK_FALSE(around.has_older);
+    auto around_all = h.page({.limit = 6, .around = h.at(5), .include_deleted = true});
+    CHECK(around_all.has_newer);
+    CHECK(around_all.has_older);
+}
+
+TEST_CASE("Client: an empty conversation has nothing either side", "[client][messages]") {
     TempClient c;
-    SenderKeys sender;
-    auto convo = ConversationId::dm(sender.session_id);
-    for (int i = 1; i <= 10; i++)
-        deliver(*c, sender, "msg{}"_format(i), from_epoch_ms(i * 1000), "h{}"_format(i));
-    auto conversation = c->conversation(convo, await);
-    auto all = conversation->messages({.limit = 10}, await);
+    SenderKeys them;
+    auto id = ConversationId::dm(them.session_id);
+    c->open_dm(id, await);
+    auto conversation = c->conversation(id, await);
+    MessageCursor somewhere{from_epoch_ms(5000), 1};
+
+    for (auto page :
+         {MessagePage{},
+          MessagePage{.before = somewhere},
+          MessagePage{.after = somewhere},
+          MessagePage{.around = somewhere}}) {
+        auto result = conversation->messages(page, await);
+        CHECK(result.messages.empty());
+        CHECK_FALSE(result.has_newer);
+        CHECK_FALSE(result.has_older);
+    }
+}
+
+TEST_CASE("Client: first_unread is the oldest of what unread counts", "[client][messages]") {
+    TenMessages h;
+    auto conversation = h.c->conversation(h.convo, await);
 
     // Never read: every message is unread, so it starts at the first one.
-    CHECK(conversation->first_unread(await) == all.back().cursor());
+    CHECK(conversation->first_unread(await) == h.at(1));
 
     conversation->mark_read(from_epoch_ms(6000), await);
-    REQUIRE(c->conversation(convo, await)->unread() == 4);
-    CHECK(conversation->first_unread(await) == all[3].cursor());
-    REQUIRE(all[3].body == "msg7");
+    REQUIRE(h.c->conversation(h.convo, await)->unread() == 4);
+    CHECK(conversation->first_unread(await) == h.at(7));
 
     conversation->mark_read(await);
     CHECK_FALSE(conversation->first_unread(await).has_value());
@@ -591,18 +706,21 @@ TEST_CASE("Client: paging is stable across equal timestamps", "[client][messages
     auto convo = ConversationId::dm(sender.session_id);
 
     // Three messages sharing one timestamp: only the id tiebreak keeps paging from repeating or
-    // skipping rows.
+    // skipping rows, or from misjudging whether one is left.
     for (int i = 1; i <= 3; i++)
         deliver(*c, sender, "same{}"_format(i), from_epoch_ms(1000), "same_h{}"_format(i));
 
     std::vector<std::string> seen;
     std::optional<MessageCursor> cursor;
-    while (true) {
+    for (bool more = true; more;) {
         auto page = c->conversation(convo, await)->messages({.limit = 1, .before = cursor}, await);
-        if (page.empty())
-            break;
-        seen.push_back(page[0].body);
-        cursor = page[0].cursor();
+        REQUIRE(page.messages.size() == 1);
+        seen.push_back(page.messages[0].body);
+        cursor = page.messages[0].cursor();
+        // Newer than the cursor, whose own message the caller already has: so only the third page,
+        // read before same2, has one, same3.
+        CHECK(page.has_newer == (seen.size() > 2));
+        more = page.has_older;
     }
 
     CHECK(seen == std::vector<std::string>{"same3", "same2", "same1"});
@@ -686,7 +804,7 @@ TEST_CASE(
     CHECK(visible[1].body == "one");
 
     // ...and in its original place when asked for, saying who and when but nothing else.
-    auto all = c->conversation(convo, await)->messages({.include_deleted = true}, await);
+    auto all = c->conversation(convo, await)->messages({.include_deleted = true}, await).messages;
     REQUIRE(all.size() == 3);
     CHECK(all[1].id == middle.id);
     CHECK(all[1].deleted == Deletion::here);
@@ -704,7 +822,9 @@ TEST_CASE(
 
     // A redelivery under the same hash is still recognised as one we have seen.
     deliver(*c, sender, "two", from_epoch_ms(2000), "h2");
-    CHECK(c->conversation(convo, await)->messages({.include_deleted = true}, await).size() == 3);
+    CHECK(c->conversation(convo, await)
+                  ->messages({.include_deleted = true}, await)
+                  .messages.size() == 3);
 
     // Deleting a message that does not exist is false, not an error.
     CHECK_FALSE(c->delete_message(middle.id + 10000, await));
@@ -749,8 +869,9 @@ TEST_CASE("Client: purging removes what a deletion left", "[client][messages][de
         CHECK(c->conversation(convo, await)->messages(await).size() == 1);
 
         CHECK(c->purge_deleted_message(msgs[1].id, await));
-        CHECK(c->conversation(convo, await)->messages({.include_deleted = true}, await).size() ==
-              2);
+        CHECK(c->conversation(convo, await)
+                      ->messages({.include_deleted = true}, await)
+                      .messages.size() == 2);
 
         // Purging the same row twice is false the second time rather than an error.
         CHECK_FALSE(c->purge_deleted_message(msgs[1].id, await));
@@ -759,7 +880,8 @@ TEST_CASE("Client: purging removes what a deletion left", "[client][messages][de
     SECTION("all of them at once") {
         CHECK(c->conversation(convo, await)->purge_deleted(await) == 2);
 
-        auto left = c->conversation(convo, await)->messages({.include_deleted = true}, await);
+        auto left =
+                c->conversation(convo, await)->messages({.include_deleted = true}, await).messages;
         REQUIRE(left.size() == 1);
         CHECK(left[0].body == "three");
 

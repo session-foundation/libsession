@@ -343,14 +343,18 @@ TEST_CASE(
     REQUIRE(reply.reply->message);
     auto original = reply.reply->message->cursor();
 
-    auto window = c->conversation(convo, await)->messages({.limit = 3, .around = original}, await);
+    auto window = c->conversation(convo, await)
+                          ->messages({.limit = 3, .around = original}, await)
+                          .messages;
     REQUIRE(window.size() == 2);
     CHECK(window[1].body == "what was said");
     REQUIRE(window[0].reply);
     REQUIRE(window[0].reply->message);
     CHECK(window[0].reply->message->body == "what was said");
 
-    auto newer = c->conversation(convo, await)->messages({.limit = 1, .after = original}, await);
+    auto newer = c->conversation(convo, await)
+                         ->messages({.limit = 1, .after = original}, await)
+                         .messages;
     REQUIRE(newer.size() == 1);
     REQUIRE(newer[0].reply);
     REQUIRE(newer[0].reply->message);
