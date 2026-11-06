@@ -255,6 +255,33 @@ TEST_CASE(
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE(
+        "Client: a sending attachment's size is known before its upload starts",
+        "[client][send][attachments]") {
+    // No network attached, so nothing is uploaded: whatever size the message has came from the
+    // send itself.
+    TempClient c;
+
+    auto dir = std::filesystem::temp_directory_path() / random::unique_id("test_upload", 7);
+    std::filesystem::create_directories(dir);
+    auto doc = dir / "notes.pdf";
+    std::ofstream{doc, std::ios::binary} << std::string(1234, 'x');
+
+    auto me = own_sid(*c);
+    TestHelper::seed_pfs_nak(c->core, me);
+
+    auto id = c->send_message(
+            ConversationId::dm(me), {.attachments = {OutgoingAttachment{.path = doc}}}, await);
+
+    auto msg = c->message(id, await);
+    REQUIRE(msg.has_value());
+    REQUIRE(msg->attachments.size() == 1);
+    CHECK(msg->attachments[0].size == 1234);
+    CHECK_FALSE(msg->attachments[0].uploaded);
+
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("Client: an attachment carries a thumbhash in both directions", "[client][attachments]") {
     TempClient c;
     SenderKeys peer;

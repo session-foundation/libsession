@@ -4520,11 +4520,16 @@ int64_t Client::_send_message(
 
         for (size_t i = 0; i < attachments.size(); i++) {
             const auto& a = attachments[i];
+            // The file's size now, so a sending message's total is known before any upload starts.
+            // Its upload records the size it actually sent, should the file change in between.
+            std::error_code ec;
+            auto size = std::filesystem::file_size(a.path, ec);
             c.prepared_exec(
                     R"(
                 INSERT INTO message_attachments
-                    (message, idx, path, content_type, filename, flags, width, height, thumbhash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (message, idx, path, content_type, filename, flags, width, height, thumbhash,
+                     size)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             )",
                     client_id,
                     static_cast<int64_t>(i),
@@ -4534,7 +4539,8 @@ int64_t Client::_send_message(
                     a.voice_message ? ATTACHMENT_FLAG_VOICE_MESSAGE : 0,
                     a.width ? std::optional<int64_t>{*a.width} : std::nullopt,
                     a.height ? std::optional<int64_t>{*a.height} : std::nullopt,
-                    a.thumbhash);
+                    a.thumbhash,
+                    ec ? std::nullopt : std::optional{static_cast<int64_t>(size)});
         }
 
         approved = approve_recipient(c, id, *this);

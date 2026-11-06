@@ -399,7 +399,9 @@ CREATE TABLE message_attachments (
     -- A claim by the sender, believed by nothing: it is checked against what actually arrives, and
     -- decryption throws if it exceeds that.
     --
-    -- Set together when an upload succeeds, or read together out of an arriving pointer.
+    -- Set together when an upload succeeds, or read together out of an arriving pointer.  An
+    -- outgoing attachment's size is also set as it is sent, from the file, so its total is known
+    -- before the upload starts.
     url TEXT,
     key BLOB,
     size INTEGER,
