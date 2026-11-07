@@ -126,7 +126,7 @@ def workflow(name, platform, steps, when = None, clone = None):
 # nasm is for libjpeg-turbo's and dav1d's x86 assembly, without which session-deps refuses to build
 # them; it is installed everywhere because it is tiny, and cheaper than working out which builds
 # target x86.
-build_tools = ["cmake", "make", "git", "ccache", "ca-certificates", "nasm"]
+build_tools = ["cmake", "make", "git", "ccache", "ca-certificates", "nasm", "curl"]
 
 # Where a build gets meson, which the libvips stack (libvips, glib) builds with, at 1.4 or later:
 # from the image's own apt by default, from a Debian backports suite when that is the only place an
@@ -165,8 +165,29 @@ def apt_install(image, pkgs, session_repo = True, foreign_arch = None, apt_sourc
         "eatmydata " + apt_get + " install --no-install-recommends -y " + " ".join(pkgs),
     ]
 
+# DO NOT MERGE: a throwaway cache on angus, for measuring a shared ccache.  ccache before 4.8
+# (Ubuntu 22.04 has 4.5) only reads the older secondary_storage name.
+ccache_url = "http://ci:6166c7c640e205fbad2ef20a35cc12350dd8d66ff16d50ab@builds.session.codes:18080|layout=bazel|connect-timeout=1000"
+ccache_env = {
+    "CCACHE_REMOTE_STORAGE": ccache_url,
+    "CCACHE_SECONDARY_STORAGE": ccache_url,
+    "CCACHE_REMOTE_ONLY": "true",
+}
+ccache_before = [
+    "export CCACHE_BASEDIR=$${CI_WORKSPACE}",
+    "curl -sS -o /dev/null -w 'ccache server: connect %{time_connect}s, request %{time_total}s\\n' http://builds.session.codes:18080/status || true",
+    "ccache --version | head -1 || true",
+    "ccache -z || true",
+]
+ccache_after = ["ccache -s -v || ccache -s || true"]
+
 def build_step(image, commands):
-    step = {"name": "build", "image": image, "commands": ['echo "Building on $${CI_MACHINE}"'] + commands}
+    step = {
+        "name": "build",
+        "image": image,
+        "environment": ccache_env,
+        "commands": ['echo "Building on $${CI_MACHINE}"'] + ccache_before + commands + ccache_after,
+    }
     if image != "sh":
         step["pull"] = True
     return step
