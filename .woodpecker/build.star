@@ -105,11 +105,20 @@ schema_history = {
     "pkgs": test_deps + ["git"],
     "commands": ["tests/schema_history_check.sh build/tests/schema-upgrade-check"],
 }
-full_clone = [{
-    "name": "clone",
-    "image": "woodpeckerci/plugin-git:2",
-    "settings": {"depth": 0, "partial": False, "tags": True},
-}]
+
+# Every clone leaves the submodules to fetch_submodules, which fetches only the ones builds use.  The
+# default `partial` clone is treeless, which makes the checkout go back to the server for its trees;
+# a plain depth-1 fetch gets them in one go.
+def clone_with(settings):
+    s = {"recursive": False}
+    s.update(settings)
+    return [{"name": "clone", "image": "woodpeckerci/plugin-git:2", "settings": s}]
+
+shallow_clone = clone_with({"depth": 1, "partial": False})
+full_clone = clone_with({"depth": 0, "partial": False, "tags": True})
+
+# Needs git, so it goes after the apt install in the docker builds.
+fetch_submodules = ["./utils/ci/submodules.sh"]
 
 def workflow(name, platform, steps, when = None, clone = None):
     wf = {
@@ -118,9 +127,8 @@ def workflow(name, platform, steps, when = None, clone = None):
         # The debian/* and ubuntu/* branches build packages, with CI configs of their own.
         "when": when or [{"event": events, "branch": {"exclude": ["debian/*", "ubuntu/*"]}}],
         "steps": steps,
+        "clone": clone or shallow_clone,
     }
-    if clone:
-        wf["clone"] = clone
     return wf
 
 # nasm is for libjpeg-turbo's and dav1d's x86 assembly, without which session-deps refuses to build
@@ -210,6 +218,7 @@ def linux(
     steps = [build_step(
         image,
         apt_install(image, build_tools + m["pkgs"] + deps + system, session_repo, foreign_arch, m.get("apt_source")) +
+        fetch_submodules +
         m.get("commands", []) +
         build_commands(cmake, jobs),
     )]
@@ -265,6 +274,7 @@ def package(name, image, commands, directory, arch = "amd64", deps = gcc_deps, s
         build_step(
             image,
             apt_install(image, build_tools + m["pkgs"] + deps, session_repo, apt_source = m.get("apt_source")) +
+            fetch_submodules +
             m.get("commands", []) +
             ["export JOBS=6"] + commands,
         ),
@@ -294,13 +304,13 @@ def macos(name, arch, cmake = {}):
     opts = {"CMAKE_CXX_FLAGS": "-fcolor-diagnostics"}
     opts.update(cmake)
     return workflow(name, "darwin/" + arch, [
-        build_step("sh", mac_setup + build_commands(opts, 6)),
+        build_step("sh", mac_setup + fetch_submodules + build_commands(opts, 6)),
         {"name": "tests", "image": "sh", "commands": test_commands()},
     ])
 
 def macos_package(name, script, directory):
     return workflow(name, "darwin/arm64", [
-        build_step("sh", mac_setup + ["export JOBS=6", script]),
+        build_step("sh", mac_setup + fetch_submodules + ["export JOBS=6", script]),
         upload_step("sh", "cd %s && ../utils/ci/static-upload.sh" % directory),
     ])
 
