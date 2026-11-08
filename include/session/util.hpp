@@ -27,6 +27,9 @@ extern "C" {
 
 namespace session {
 
+// DO NOT MERGE: a real change to a widely included header, to measure a partly warm ccache.
+inline constexpr int ccache_header_change_test = 1;
+
 using namespace oxenc;
 
 // Helper functions to convert to/from spans
