@@ -175,11 +175,22 @@ ccache_env = {
     "CCACHE_SECONDARY_STORAGE": ccache_url,
     "CCACHE_REMOTE_ONLY": "true",
 }
+# A cache miss costs a few round trips on top of compiling, so a runner far from the cache server
+# (or one that can't reach it) builds without it.  Best of three connections, in seconds.
+ccache_max_connect = "0.15"
+ccache_probe = """best=9
+for i in 1 2 3; do
+  t=$$(curl -s -o /dev/null -w '%{time_connect}' --max-time 2 http://builds.session.codes:18080/status) || t=9
+  best=$$(printf '%s\\n%s\\n' "$$best" "$$t" | sort -n | head -1)
+done
+echo "ccache server: best connect $${best}s, limit """ + ccache_max_connect + """s"
+if awk "BEGIN { exit !($$best > """ + ccache_max_connect + """) }"; then
+  unset CCACHE_REMOTE_STORAGE CCACHE_SECONDARY_STORAGE CCACHE_REMOTE_ONLY
+  echo "remote ccache off: the server is too far or unreachable"
+fi"""
 ccache_before = [
-    # session-qa-2 is about 260 ms from angus: every miss costs more than compiling.
-    "if [ \"$${CI_MACHINE}\" = session-qa-2 ]; then unset CCACHE_REMOTE_STORAGE CCACHE_SECONDARY_STORAGE CCACHE_REMOTE_ONLY; echo 'remote ccache off on this runner'; fi",
+    ccache_probe,
     "export CCACHE_BASEDIR=$${CI_WORKSPACE}",
-    "curl -sS -o /dev/null -w 'ccache server: connect %{time_connect}s, request %{time_total}s\\n' http://builds.session.codes:18080/status || true",
     "ccache --version | head -1 || true",
     "ccache -z || true",
 ]
