@@ -5,6 +5,7 @@
 #include <oxen/quic/btstream.hpp>
 #include <oxen/quic/connection.hpp>
 #include <oxen/quic/gnutls_crypto.hpp>
+#include <oxen/quic/result.hpp>
 
 #include "session/ed25519.hpp"
 #include "session/network/session_network_types.hpp"
@@ -578,13 +579,13 @@ void QuicTransport::_fail_connection(
         std::optional<uint64_t> error_code,
         std::optional<std::string> custom_error,
         std::optional<oxen::quic::ConnectionID> conn_id) {
-    if (error_code == NGTCP2_NO_ERROR)
+    if (error_code == 0)
         log::info(
                 cat,
                 "[Request {}] Connection to {} closed gracefully.",
                 initiating_req_id,
                 address_pubkey_hex);
-    else if (error_code == static_cast<uint64_t>(NGTCP2_ERR_HANDSHAKE_TIMEOUT)) {
+    else if (error_code == oxen::quic::CONN_HANDSHAKE_TIMEOUT) {
         log::warning(
                 cat,
                 "[Request {}] Handshake timeout when connecting to {}. "
@@ -646,7 +647,7 @@ void QuicTransport::_fail_connection(
         _pending_requests.erase(it);
 
         std::string failure_reason = "Failed to establish connection to service node";
-        if (error_code == static_cast<uint64_t>(NGTCP2_ERR_HANDSHAKE_TIMEOUT))
+        if (error_code == oxen::quic::CONN_HANDSHAKE_TIMEOUT)
             failure_reason += " (handshake timeout)";
 
         log::error(cat, "Failing {} pending request(s) due to connection failure.", to_fail.size());
