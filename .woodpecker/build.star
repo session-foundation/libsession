@@ -61,6 +61,8 @@ default_cmake = {
     "WARNINGS_AS_ERRORS": True,
     "BUILD_SHARED_LIBS": True,
     "BUILD_STATIC_DEPS": False,
+    # liboxen-quic-dev 1.14 on deb.session.foundation ships without oxen/quic.hpp.
+    "DEPS_FORCE_liboxenquic_SUBMODULE": True,
     "USE_LTO": False,
     "LOCAL_MIRROR": "https://builds.session.codes/deps",
 }
