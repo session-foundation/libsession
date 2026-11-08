@@ -168,8 +168,9 @@ def apt_install(image, pkgs, session_repo = True, foreign_arch = None, apt_sourc
     ]
 
 # DO NOT MERGE: a throwaway cache on angus, for measuring a shared ccache.  ccache before 4.8
-# (Ubuntu 22.04 has 4.5) only reads the older secondary_storage name.
-ccache_url = "http://ci:6166c7c640e205fbad2ef20a35cc12350dd8d66ff16d50ab@builds.session.codes:18080|layout=bazel|connect-timeout=1000"
+# (Ubuntu 22.04 has 4.5) only reads the older secondary_storage name.  angus by its IPv4 address:
+# several runners have IPv6 that doesn't work, and each compile would wait on it.
+ccache_url = "http://ci:6166c7c640e205fbad2ef20a35cc12350dd8d66ff16d50ab@104.243.40.38:18080|layout=bazel|connect-timeout=1000"
 ccache_env = {
     "CCACHE_REMOTE_STORAGE": ccache_url,
     "CCACHE_SECONDARY_STORAGE": ccache_url,
@@ -179,8 +180,10 @@ ccache_env = {
 # (or one that can't reach it) builds without it.  Best of three connections, in seconds.
 ccache_max_connect = "0.15"
 ccache_probe = """best=9
+command -v curl >/dev/null || best=0
 for i in 1 2 3; do
-  t=$$(curl -s -o /dev/null -w '%{time_connect}' --max-time 2 http://builds.session.codes:18080/status) || t=9
+  [ "$$best" = 0 ] && break
+  t=$$(curl -4 -s -o /dev/null -w '%{time_connect}' --max-time 2 http://104.243.40.38:18080/status) || t=9
   best=$$(printf '%s\\n%s\\n' "$$best" "$$t" | sort -n | head -1)
 done
 echo "ccache server: best connect $${best}s, limit """ + ccache_max_connect + """s"
