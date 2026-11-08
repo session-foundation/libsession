@@ -5,7 +5,6 @@
 
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
-#include <oxen/quic.hpp>
 #include <oxen/quic/utils.hpp>
 
 using namespace oxen;

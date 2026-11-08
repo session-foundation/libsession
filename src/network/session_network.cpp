@@ -8,6 +8,7 @@
 #include <oxen/log/format.hpp>
 #include <oxen/log/level.hpp>
 #include <ranges>
+#include <unordered_set>
 #include <vector>
 
 #include "../internal-util.hpp"

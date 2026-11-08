@@ -2,7 +2,12 @@
 
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
+#include <oxen/quic/btstream.hpp>
+#include <oxen/quic/connection.hpp>
+#include <oxen/quic/endpoint.hpp>
 #include <oxen/quic/gnutls_crypto.hpp>
+#include <oxen/quic/opt.hpp>
+#include <oxen/quic/result.hpp>
 
 #include "session/crypto/ed25519.hpp"
 #include "session/network/session_network_types.hpp"

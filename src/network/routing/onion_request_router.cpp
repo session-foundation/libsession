@@ -2,6 +2,7 @@
 
 #include <event2/event.h>
 #include <fmt/ranges.h>
+#include <ngtcp2/ngtcp2.h>
 
 #include <chrono>
 #include <exception>
@@ -9,6 +10,7 @@
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
 #include <ranges>
+#include <unordered_set>
 
 #include "session/file.hpp"
 #include "session/hash.hpp"
