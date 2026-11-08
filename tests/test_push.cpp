@@ -512,6 +512,9 @@ TEST_CASE("Push subscribe: a signed request for the account's namespaces", "[pus
     auto& dest = std::get<network::ServerDestination>(sent[0].request.destination);
     CHECK(dest.host == "push.getsession.org");
     CHECK(dest.method == "POST");
+    // The X25519 form of the server's Ed25519 key, which is what the server decrypts with.
+    CHECK(dest.x25519_pubkey.hex() ==
+          "b84ed40471d669340d823291f9a625272d4533c26fb031bc53f827e0b1afae0b");
 
     auto body = body_of(sent[0]);
     REQUIRE(body.is_array());

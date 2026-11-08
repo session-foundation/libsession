@@ -137,7 +137,7 @@ namespace {
                 network::ServerDestination{
                         server.scheme,
                         server.host,
-                        server.pubkey,
+                        network::x25519_pubkey::from_bytes(ed25519::pk_to_x25519(server.pubkey)),
                         server.port,
                         std::vector<std::pair<std::string, std::string>>{
                                 {"Content-Type", "application/json"}},

@@ -187,9 +187,10 @@ struct Server {
     std::string scheme = "https";
     std::string host = "push.getsession.org";
     std::optional<uint16_t> port;
-    /// The key onion requests to it are encrypted for.
-    network::x25519_pubkey pubkey = network::x25519_pubkey::from_hex(
-            "d7557fe563e2610de876c0ac7341b62f3c82d5eea4b62c702392ea4368f51b3b");
+    /// The server's Ed25519 key.  Onion requests are encrypted for its X25519 form; QUIC and
+    /// Session Router reach the server at this key itself.
+    network::ed25519_pubkey pubkey = network::ed25519_pubkey::from_hex(
+            "87a324b8a9472fbd397f14973b6443fb0902ee0b663595806bd601aa1a156496");
 };
 
 enum class SubscribeResult {
