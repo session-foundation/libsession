@@ -61,6 +61,8 @@ default_cmake = {
     "WARNINGS_AS_ERRORS": True,
     "BUILD_SHARED_LIBS": True,
     "BUILD_STATIC_DEPS": False,
+    # DO NOT MERGE: liboxen-quic-dev 1.14 on deb.session.foundation lacks oxen/quic.hpp.
+    "DEPS_FORCE_liboxenquic_SUBMODULE": True,
     "USE_LTO": False,
     "LOCAL_MIRROR": "https://builds.session.codes/deps",
 }
@@ -174,6 +176,8 @@ ccache_env = {
     "CCACHE_REMOTE_ONLY": "true",
 }
 ccache_before = [
+    # session-qa-2 is about 260 ms from angus: every miss costs more than compiling.
+    "if [ \"$${CI_MACHINE}\" = session-qa-2 ]; then unset CCACHE_REMOTE_STORAGE CCACHE_SECONDARY_STORAGE CCACHE_REMOTE_ONLY; echo 'remote ccache off on this runner'; fi",
     "export CCACHE_BASEDIR=$${CI_WORKSPACE}",
     "curl -sS -o /dev/null -w 'ccache server: connect %{time_connect}s, request %{time_total}s\\n' http://builds.session.codes:18080/status || true",
     "ccache --version | head -1 || true",
