@@ -44,7 +44,7 @@ endif()
 # session-router provides oxen::quic when it is built (above); otherwise pull in oxen-libquic alone.
 if(ENABLE_NETWORKING AND NOT TARGET oxen::quic)
     set(LIBQUIC_BUILD_TESTS OFF CACHE BOOL "")
-    sessiondep_or_submodule(liboxenquic 1.8.0 session-router/external/oxen-libquic oxen::quic)
+    sessiondep_or_submodule(liboxenquic 1.14.1 session-router/external/oxen-libquic oxen::quic)
 endif()
 
 if(NOT TARGET oxen::logging)
