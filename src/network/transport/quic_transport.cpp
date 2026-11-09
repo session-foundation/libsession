@@ -585,7 +585,7 @@ void QuicTransport::_fail_connection(
                 "[Request {}] Connection to {} closed gracefully.",
                 initiating_req_id,
                 address_pubkey_hex);
-    else if (error_code == oxen::quic::CONN_HANDSHAKE_TIMEOUT) {
+    else if (error_code == quic::CONN_HANDSHAKE_TIMEOUT) {
         log::warning(
                 cat,
                 "[Request {}] Handshake timeout when connecting to {}. "
@@ -647,7 +647,7 @@ void QuicTransport::_fail_connection(
         _pending_requests.erase(it);
 
         std::string failure_reason = "Failed to establish connection to service node";
-        if (error_code == oxen::quic::CONN_HANDSHAKE_TIMEOUT)
+        if (error_code == quic::CONN_HANDSHAKE_TIMEOUT)
             failure_reason += " (handshake timeout)";
 
         log::error(cat, "Failing {} pending request(s) due to connection failure.", to_fail.size());

@@ -1327,7 +1327,7 @@ void OnionRequestRouter::_on_edge_connectivity_response(
                 edge_node.to_string());
 
         // The "handshake timeout" error already records a node failure, so don't record another
-        if (error_code && *error_code != oxen::quic::CONN_HANDSHAKE_TIMEOUT)
+        if (error_code && *error_code != quic::CONN_HANDSHAKE_TIMEOUT)
             if (auto snode_pool = _snode_pool.lock())
                 snode_pool->record_node_failure(edge_node);
 
