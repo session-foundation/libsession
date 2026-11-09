@@ -139,7 +139,7 @@ std::vector<unsigned char> encrypt_for_multiple_simple(
     oxenc::bt_dict_producer d;
 
     std::array<unsigned char, 24> random_nonce;
-    if (!nonce) {
+    if (!nonce || nonce->empty()) {
         randombytes_buf(random_nonce.data(), random_nonce.size());
         nonce.emplace(random_nonce.data(), random_nonce.size());
     } else if (nonce->size() != 24) {

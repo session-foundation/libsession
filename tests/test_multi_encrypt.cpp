@@ -407,3 +407,43 @@ TEST_CASE("Multi-recipient encryption, simpler interface", "[encrypt][multi][sim
             session::to_span(x_keys[0].second),
             "test suite"));
 }
+
+TEST_CASE(
+        "Multi-recipient encryption generates a nonce for empty input",
+        "[encrypt][multi][simple]") {
+    auto sender_seed = "0123456789abcdef0123456789abcdef00000000000000000000000000000000"_hexbytes;
+    auto recipient_seed =
+            "0123456789abcdef111111111111111100000000000000000000000000000000"_hexbytes;
+
+    std::array<unsigned char, 32> sender_ed_pubkey;
+    std::array<unsigned char, 64> sender_ed_secret;
+    crypto_sign_ed25519_seed_keypair(
+            sender_ed_pubkey.data(), sender_ed_secret.data(), sender_seed.data());
+
+    auto sender_x = to_x_keys(sender_seed);
+    auto recipient_x = to_x_keys(recipient_seed);
+    std::vector<std::span<const unsigned char>> recipients{session::to_span(recipient_x.second)};
+
+    auto default_nonce = session::encrypt_for_multiple_simple(
+            "hello", recipients, session::to_span(sender_ed_secret), "test suite");
+    auto empty_nonce = session::encrypt_for_multiple_simple(
+            "hello",
+            recipients,
+            session::to_span(sender_x.first),
+            session::to_span(sender_x.second),
+            "test suite",
+            std::span<const unsigned char>{});
+
+    CHECK(default_nonce != empty_nonce);
+
+    for (const auto& encrypted : {default_nonce, empty_nonce}) {
+        auto decrypted = session::decrypt_for_multiple_simple(
+                encrypted,
+                session::to_span(recipient_x.first),
+                session::to_span(recipient_x.second),
+                session::to_span(sender_x.second),
+                "test suite");
+        REQUIRE(decrypted);
+        CHECK(session::to_string(*decrypted) == "hello");
+    }
+}
