@@ -950,14 +950,18 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
 
     // Fetch account key seeds for inclusion in the payload.
     std::vector<AccountKeySeed> acc_keys;
-    for (auto [seed, created, rotated] :
-         conn().prepared_results<sqlite::blobn<32>, int64_t, std::optional<int64_t>>(
-                 "SELECT seed, created, rotated FROM device_account_keys"
-                 " ORDER BY rotated DESC NULLS FIRST, created DESC")) {
-        auto& k = acc_keys.emplace_back();
-        std::memcpy(k.seed.data(), seed.data(), 32);
-        k.created = created;
-        k.rotated = rotated;
+    {
+        // Named, so that the connection stays this thread's while the rows are stepped through.
+        auto c = conn();
+        for (auto [seed, created, rotated] :
+             c.prepared_results<sqlite::blobn<32>, int64_t, std::optional<int64_t>>(
+                     "SELECT seed, created, rotated FROM device_account_keys"
+                     " ORDER BY rotated DESC NULLS FIRST, created DESC")) {
+            auto& k = acc_keys.emplace_back();
+            std::memcpy(k.seed.data(), seed.data(), 32);
+            k.created = created;
+            k.rotated = rotated;
+        }
     }
 
     auto plaintext_devices = encode_group_payload(devices, acc_keys);
