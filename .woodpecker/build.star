@@ -173,11 +173,16 @@ def apt_install(image, pkgs, session_repo = True, foreign_arch = None, apt_sourc
 ccache_stats_start = ['export CCACHE_STATSLOG="$${CI_WORKSPACE}/ccache-stats.log"']
 ccache_stats_end = ["ccache --show-log-stats -v || true", "ccache -s -v || true"]
 
+# The Mac's workspace is a new temporary directory for every job, so absolute paths in the compile
+# commands would miss the cache on every run.  Compilers see the /private/var form of that path.
+mac_ccache_basedir = ['export CCACHE_BASEDIR="$$(cd "$${CI_WORKSPACE}" && pwd -P)"']
+
 def build_step(image, commands):
+    setup = ccache_stats_start + (mac_ccache_basedir if image == "sh" else [])
     step = {
         "name": "build",
         "image": image,
-        "commands": ['echo "Building on $${CI_MACHINE}"'] + ccache_stats_start + commands + ccache_stats_end,
+        "commands": ['echo "Building on $${CI_MACHINE}"'] + setup + commands + ccache_stats_end,
     }
     if image != "sh":
         step["pull"] = True
