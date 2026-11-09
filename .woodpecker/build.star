@@ -165,8 +165,18 @@ def apt_install(image, pkgs, session_repo = True, foreign_arch = None, apt_sourc
         "eatmydata " + apt_get + " install --no-install-recommends -y " + " ".join(pkgs),
     ]
 
+# The stats log holds only this job's ccache counters: `ccache -s` totals every build that has used
+# the cache directory, which on the Mac is shared with every earlier job.  The first `ccache -s`
+# shows what the job starts with.
+ccache_stats_start = ['export CCACHE_STATSLOG="$${CI_WORKSPACE}/ccache-stats.log"', "ccache -s || true"]
+ccache_stats_end = ["ccache --show-log-stats -v || true"]
+
 def build_step(image, commands):
-    step = {"name": "build", "image": image, "commands": ['echo "Building on $${CI_MACHINE}"'] + commands}
+    step = {
+        "name": "build",
+        "image": image,
+        "commands": ['echo "Building on $${CI_MACHINE}"'] + commands[:-1] + ccache_stats_start + commands[-1:] + ccache_stats_end,
+    }
     if image != "sh":
         step["pull"] = True
     return step
