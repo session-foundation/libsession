@@ -7,7 +7,9 @@
 #include <session/core/swarm_message.hpp>
 #include <session/util.hpp>
 #include <span>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace session::core {
@@ -40,6 +42,15 @@ enum class MessageDecryptFailure {
     bad_format,      ///< Message is structurally malformed (e.g. invalid bencode, truncated fields)
     unknown_version,  ///< Message starts with 0x00 but carries an unrecognised version byte;
                       ///< likely a future protocol version this build does not understand
+};
+
+/// What `Core::receive_messages` could not read, for a caller that has to act on it there and then
+/// rather than through `message_decrypt_failed` -- a notification extension, deciding what a push
+/// that arrived but would not decrypt should show.
+struct ReceiveResult {
+    /// One-to-one messages that did not decrypt, by swarm hash, with the reason.  Each is also
+    /// reported to `message_decrypt_failed`.
+    std::vector<std::pair<std::string, MessageDecryptFailure>> undecryptable;
 };
 
 /// A successfully decrypted one-to-one message from Namespace::Default.

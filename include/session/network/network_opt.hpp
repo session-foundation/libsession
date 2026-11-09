@@ -235,6 +235,23 @@ namespace opt {
     /// Can be used to attempt to increase the NOFILE limit (can cause issues with automated tests).
     struct increase_no_file_limit {};
 
+    /// A network built to carry a handful of requests and then be destroyed, such as one a
+    /// notification extension makes to fetch a message too large for its push.  Every router
+    /// honours it:
+    ///
+    /// - No clock resync on construction.  A storage server that finds our clock too far out
+    ///   answers 425, which resyncs and retries the request anyway, so the resync only adds round
+    ///   trips in front of the one request this network exists for.
+    /// - Onion requests: a single path, built when the first request needs it (as with
+    ///   `onionreq_single_path_mode` and `onionreq_disable_pre_build_paths`).
+    /// - Session Router: one outbound path per destination, and a shorter build timeout, since the
+    ///   whole job has a deadline of seconds.
+    /// - Direct: nothing further; it builds nothing in advance.
+    ///
+    /// The caches (`cache_directory`) are read and written as usual, so a network sharing the
+    /// application's cache directory starts warm.
+    struct one_shot {};
+
     /// Can be used to override the default (3) path length used when building onion request or
     /// session router paths.
     struct path_length {
@@ -502,6 +519,7 @@ namespace opt {
 
             // General options
             increase_no_file_limit,
+            one_shot,
             path_length,
             disable_subnet_diversity,
             retry_delay,

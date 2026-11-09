@@ -29,6 +29,9 @@ namespace config {
         fs::path cache_directory;
 
         uint8_t path_length;
+
+        // See `opt::one_shot`.
+        bool one_shot = false;
     };
 }  // namespace config
 

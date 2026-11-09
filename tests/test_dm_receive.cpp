@@ -145,7 +145,14 @@ TEST_CASE("_handle_direct_messages: failure paths", "[core][dm]") {
 
     auto deliver = [&](std::span<const std::byte> data) {
         OwnedMessage om{data};
-        recipient->receive_messages({&om.msg, 1}, config::Namespace::Default, true);
+        auto before = failures.size();
+        auto result = recipient->receive_messages({&om.msg, 1}, config::Namespace::Default, true);
+        // What receive_messages returns is what the callback was told, failure by failure.
+        REQUIRE(result.undecryptable.size() == failures.size() - before);
+        for (size_t i = 0; i < result.undecryptable.size(); i++) {
+            CHECK(result.undecryptable[i].first == om.msg.hash);
+            CHECK(result.undecryptable[i].second == failures[before + i]);
+        }
     };
 
     SECTION("empty data → bad_format") {

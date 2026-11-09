@@ -18,6 +18,12 @@ Config::Config(const std::vector<opt::any>& opts) {
 }
 
 void Config::_init() {
+    // Here rather than in the option's handler so that it holds whichever order the options came
+    // in: the onion router reads these two flags and nothing else.
+    if (one_shot) {
+        onionreq_single_path_mode = true;
+        onionreq_disable_pre_build_paths = true;
+    }
     log::debug(cat, "Network config created successfully");
 }
 
@@ -129,6 +135,11 @@ void Config::handle_config_opt(opt::quic_file_server_port qfp) {
 void Config::handle_config_opt(opt::increase_no_file_limit) {
     increase_no_file_limit = true;
     log::debug(cat, "Network config will attempt to increase the NOFILE limit");
+}
+
+void Config::handle_config_opt(opt::one_shot) {
+    one_shot = true;
+    log::debug(cat, "Network config set to one-shot");
 }
 
 void Config::handle_config_opt(opt::path_length pl) {
