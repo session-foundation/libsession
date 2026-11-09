@@ -81,7 +81,7 @@ ed25519_pubkey parse_ed25519_pubkey(std::string_view pubkey_in) {
 x25519_pubkey parse_x25519_pubkey(std::string_view pubkey_in) {
     return parse_pubkey<x25519_pubkey>(pubkey_in);
 }
-x25519_pubkey compute_x25519_pubkey(std::span<const unsigned char> ed25519_pk) {
+x25519_pubkey compute_x25519_pubkey(std::span<const unsigned char, 32> ed25519_pk) {
     std::array<unsigned char, 32> xpk;
     if (0 != crypto_sign_ed25519_pk_to_curve25519(xpk.data(), ed25519_pk.data()))
         throw std::runtime_error{

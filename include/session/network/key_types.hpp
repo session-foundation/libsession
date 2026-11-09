@@ -98,7 +98,7 @@ using x25519_keypair = std::pair<x25519_pubkey, x25519_seckey>;
 legacy_pubkey parse_legacy_pubkey(std::string_view pubkey_in);
 ed25519_pubkey parse_ed25519_pubkey(std::string_view pubkey_in);
 x25519_pubkey parse_x25519_pubkey(std::string_view pubkey_in);
-x25519_pubkey compute_x25519_pubkey(std::span<const unsigned char> ed25519_pk);
+x25519_pubkey compute_x25519_pubkey(std::span<const unsigned char, 32> ed25519_pk);
 
 }  // namespace session::network
 

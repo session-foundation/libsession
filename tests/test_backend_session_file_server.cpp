@@ -213,8 +213,19 @@ TEST_CASE("Default file server onion pubkey", "[backend][session_file_server]") 
     // form, so every request derives one from the other. Pinned here because the two forms are 32
     // bytes either way: using the wrong one produces a perfectly well-formed key that simply never
     // decrypts, and the only symptom is the file server rejecting the request without naming a key.
-    const auto derived = compute_x25519_pubkey(session::to_span<unsigned char>(
-            oxenc::from_hex(file_server::DEFAULT_CONFIG.pubkey_hex)));
+    const auto derived =
+            compute_x25519_pubkey(ed25519_pubkey::from_hex(file_server::DEFAULT_CONFIG.pubkey_hex));
 
     CHECK(derived.hex() == "09324794aa9c11948189762d198c618148e9136ac9582068180661208927ef34");
+}
+
+TEST_CASE("File server requests reject oversized pubkeys", "[backend][session_file_server]") {
+    auto config = file_server::DEFAULT_CONFIG;
+    config.pubkey_hex += "00";
+
+    DownloadRequest request{};
+    request.download_url = "https://example.com/file/abc123";
+
+    CHECK_THROWS_AS(
+            file_server::to_request("download", config, std::move(request)), std::runtime_error);
 }

@@ -215,8 +215,7 @@ Request to_request(
             ServerDestination{
                     config.scheme,
                     config.host,
-                    compute_x25519_pubkey(
-                            to_span<unsigned char>(oxenc::from_hex(config.pubkey_hex))),
+                    compute_x25519_pubkey(ed25519_pubkey::from_hex(config.pubkey_hex)),
                     config.port,
                     std::move(headers),
                     "POST"},
@@ -252,7 +251,7 @@ Request to_request(
             ServerDestination{
                     std::move(scheme),
                     std::move(host),
-                    compute_x25519_pubkey(to_span<unsigned char>(oxenc::from_hex(pubkey_hex))),
+                    compute_x25519_pubkey(ed25519_pubkey::from_hex(pubkey_hex)),
                     port,
                     std::nullopt,
                     "GET"},
@@ -334,8 +333,7 @@ Request extend_ttl(
             ServerDestination{
                     config.scheme,
                     config.host,
-                    compute_x25519_pubkey(
-                            to_span<unsigned char>(oxenc::from_hex(config.pubkey_hex))),
+                    compute_x25519_pubkey(ed25519_pubkey::from_hex(config.pubkey_hex)),
                     config.port,
                     std::move(headers),
                     "POST"},
@@ -363,8 +361,7 @@ Request get_client_version(
     auto blinded_keys = blind_version_key_pair(to_span(seckey.view()));
     auto timestamp = epoch_seconds(std::chrono::system_clock::now());
     auto signature = blind_version_sign(to_span(seckey.view()), platform, timestamp);
-    auto pubkey = compute_x25519_pubkey(
-            to_span<unsigned char>(oxenc::from_hex(DEFAULT_CONFIG.pubkey_hex)));
+    auto pubkey = compute_x25519_pubkey(ed25519_pubkey::from_hex(DEFAULT_CONFIG.pubkey_hex));
     std::string blinded_pk_hex;
     blinded_pk_hex.reserve(66);
     blinded_pk_hex += "07";
