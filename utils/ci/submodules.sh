@@ -43,8 +43,10 @@ get() {
         full=${dir#.}/$path
         full=${full#/}
         skip "$full" && continue
+        # A .gitmodules entry with no gitlink behind it is stale; git submodule update skips it too.
+        sha=$(git -C "$dir" ls-tree HEAD -- "$path" | awk '$1 == "160000" { print $3 }')
+        [ -n "$sha" ] || continue
         url=$(git config -f "$dir/.gitmodules" "submodule.$name.url")
-        sha=$(git -C "$dir" rev-parse "HEAD:$path")
         (
             cd "$full"
             git init -q
