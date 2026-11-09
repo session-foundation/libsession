@@ -302,6 +302,13 @@ mac_setup = [
     # If you don't do this then the C compiler doesn't have an include path containing basic system
     # headers.  WTF apple:
     'export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"',
+    # The workspace is a new temporary directory for every job, so absolute paths in the compile
+    # commands would miss the cache on every run.  This runs at the top of the workspace, whose
+    # path compilers see in its /private/var form.  With -g, ccache also hashes the working
+    # directory, since it ends up in the debug info; not hashing it lets a hit carry an earlier
+    # job's directory there, which CI builds don't care about.
+    'export CCACHE_BASEDIR="$(pwd -P)"',
+    "export CCACHE_NOHASHDIR=1",
 ]
 
 def macos(name, arch, cmake = {}):
