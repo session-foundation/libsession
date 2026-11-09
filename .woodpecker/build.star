@@ -165,17 +165,17 @@ def apt_install(image, pkgs, session_repo = True, foreign_arch = None, apt_sourc
         "eatmydata " + apt_get + " install --no-install-recommends -y " + " ".join(pkgs),
     ]
 
-# The stats log holds only this job's ccache counters: `ccache -s` totals every build that has used
-# the cache directory, which on the Mac is shared with every earlier job.  The first `ccache -s`
-# shows what the job starts with.
-ccache_stats_start = ['export CCACHE_STATSLOG="$${CI_WORKSPACE}/ccache-stats.log"', "ccache -s || true"]
-ccache_stats_end = ["ccache --show-log-stats -v || true"]
+# The stats log holds only this job's ccache counters, while `ccache -s` totals every build that has
+# used the cache directory, which on the Mac is shared with every earlier job.  On Docker the two
+# match unless the job started with a non-empty cache.
+ccache_stats_start = ['export CCACHE_STATSLOG="$${CI_WORKSPACE}/ccache-stats.log"']
+ccache_stats_end = ["ccache --show-log-stats -v || true", "ccache -s -v || true"]
 
 def build_step(image, commands):
     step = {
         "name": "build",
         "image": image,
-        "commands": ['echo "Building on $${CI_MACHINE}"'] + commands[:-1] + ccache_stats_start + commands[-1:] + ccache_stats_end,
+        "commands": ['echo "Building on $${CI_MACHINE}"'] + ccache_stats_start + commands + ccache_stats_end,
     }
     if image != "sh":
         step["pull"] = True
