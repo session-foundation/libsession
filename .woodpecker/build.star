@@ -175,10 +175,15 @@ ccache_stats_end = ["ccache --show-log-stats -v || true", "ccache -s -v || true"
 
 # The Mac's workspace is a new temporary directory for every job, so absolute paths in the compile
 # commands would miss the cache on every run.  Compilers see the /private/var form of that path.
-mac_ccache_basedir = ['export CCACHE_BASEDIR="$$(cd "$${CI_WORKSPACE}" && pwd -P)"']
+# With -g, ccache also hashes the working directory, since it ends up in the debug info; not
+# hashing it lets a hit carry an earlier job's directory there, which CI builds don't care about.
+mac_ccache_env = [
+    'export CCACHE_BASEDIR="$$(cd "$${CI_WORKSPACE}" && pwd -P)"',
+    "export CCACHE_NOHASHDIR=1",
+]
 
 def build_step(image, commands):
-    setup = ccache_stats_start + (mac_ccache_basedir if image == "sh" else [])
+    setup = ccache_stats_start + (mac_ccache_env if image == "sh" else [])
     step = {
         "name": "build",
         "image": image,
