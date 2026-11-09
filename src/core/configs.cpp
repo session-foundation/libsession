@@ -49,9 +49,14 @@ void Configs::_load() {
     // Copied out rather than referenced: a sqlite::blob spans the statement's own memory, which is
     // reused as the iteration advances.
     std::unordered_map<std::string, std::vector<std::byte>> dumps;
-    for (auto [type, data] : conn().prepared_results<std::string, sqlite::blob>(
-                 "SELECT type, data FROM config_dumps WHERE pubkey = ?", core.globals.session_id()))
-        dumps.emplace(std::move(type), std::vector<std::byte>{data.begin(), data.end()});
+    {
+        // Named, so that the connection stays this thread's while the rows are stepped through.
+        auto c = conn();
+        for (auto [type, data] : c.prepared_results<std::string, sqlite::blob>(
+                     "SELECT type, data FROM config_dumps WHERE pubkey = ?",
+                     core.globals.session_id()))
+            dumps.emplace(std::move(type), std::vector<std::byte>{data.begin(), data.end()});
+    }
 
     auto stored = [&dumps](std::string_view type) -> std::optional<std::span<const std::byte>> {
         if (auto it = dumps.find(std::string{type}); it != dumps.end())
