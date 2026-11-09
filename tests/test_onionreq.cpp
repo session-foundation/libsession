@@ -42,6 +42,18 @@ TEST_CASE("Onion request encryption", "[encryption][onionreq]") {
     CHECK_THROWS(e.decrypt_aesgcm(enc_xchacha20_broken2, x25519_pubkey::from_bytes(A)));
     CHECK_THROWS(e.decrypt_xchacha20(enc_xchacha20_broken1, x25519_pubkey::from_bytes(A)));
     CHECK_THROWS(e.decrypt_xchacha20(enc_xchacha20_broken2, x25519_pubkey::from_bytes(A)));
+
+    auto enc_xchacha20_empty = e.encrypt_xchacha20({}, x25519_pubkey::from_bytes(A));
+    CHECK(enc_xchacha20_empty.size() == 24 + 16);
+    CHECK(e.decrypt_xchacha20(enc_xchacha20_empty, x25519_pubkey::from_bytes(A)).empty());
+
+    for (size_t size : {0, 1, 15, 16, 23, 24, 39}) {
+        INFO("ciphertext size: " << size);
+        CHECK_THROWS_AS(
+                e.decrypt_xchacha20(
+                        std::vector<unsigned char>(size, 0x41), x25519_pubkey::from_bytes(A)),
+                std::invalid_argument);
+    }
 }
 
 TEST_CASE("Onion request parser", "[onionreq][parser]") {
