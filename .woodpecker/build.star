@@ -165,8 +165,18 @@ def apt_install(image, pkgs, session_repo = True, foreign_arch = None, apt_sourc
         "eatmydata " + apt_get + " install --no-install-recommends -y " + " ".join(pkgs),
     ]
 
-def build_step(image, commands):
-    step = {"name": "build", "image": image, "commands": ['echo "Building on $${CI_MACHINE}"'] + commands}
+def build_step(image, commands, ccache_stats = True):
+    if ccache_stats:
+        commands = [
+            # The cache directory's own counters cover every build that has used it, so they say
+            # nothing about this job; a log of its own does.
+            'export CCACHE_STATSLOG="$(mktemp "$${TMPDIR:-/tmp}/ccache-stats.XXXXXX")"',
+        ] + commands + ["ccache --show-log-stats -v"]
+    step = {
+        "name": "build",
+        "image": image,
+        "commands": ['echo "Building on $${CI_MACHINE}"'] + commands,
+    }
     if image != "sh":
         step["pull"] = True
     return step
@@ -385,7 +395,7 @@ def main(ctx):
                 ". .venv/bin/activate",
                 "pip install -r requirements.txt",
                 "make build-all",
-            ]),
+            ], ccache_stats = False),
             upload_step(registry + "debian-stable", "cd docs/api && ../../utils/ci/docs-upload.sh"),
         ], when = [{"event": "push", "branch": "dev"}]),
 
