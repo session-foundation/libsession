@@ -1,0 +1,14 @@
+#include <session/mnemonics.hpp>
+
+namespace session::mnemonics {
+
+extern const Mnemonics @lang_var@;
+const Mnemonics @lang_var@ = {
+    "@ENGLISH_NAME@",
+    "@NATIVE_NAME@",
+    @PREFIX_LEN@,
+    {{
+@WORDS_CODE@    }}
+};
+
+} // namespace session::mnemonics

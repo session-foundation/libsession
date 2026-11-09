@@ -109,6 +109,11 @@ option(USE_LTO "Use Link-Time Optimization" ${use_lto_default})
 
 option(ENABLE_NETWORKING_SROUTER "Build with session-router networking support" ON)
 
+# jpegli produces standard JPEGs around 10-15% smaller than libjpeg-turbo at the same perceived
+# quality, and about as fast.  Off, libvips' own (libjpeg-turbo) encoder is used instead.  Either
+# way libjpeg-turbo does all JPEG decoding.
+option(SESSION_ENABLE_JPEGLI "Encode JPEGs with jpegli rather than libjpeg-turbo" ON)
+
 # Push notification handling (libsession::push).  Only mobile clients receive pushes, so a desktop
 # or command-line build can turn this off and leave the code out.
 option(ENABLE_PUSH "Build push notification support (libsession::push)" ON)
