@@ -4,6 +4,7 @@
 # `git submodule update --recursive` clones each branch tip before fetching the pinned commit, and does
 # one repo at a time.  A submodule added upstream is fetched until it's listed in `skipped`.
 set -e
+start=$(date +%s)
 
 sr=external/session-router
 quic=$sr/external/oxen-libquic
@@ -60,3 +61,4 @@ get() {
 }
 
 get .
+echo "Submodules fetched in $(($(date +%s) - start)) s"
