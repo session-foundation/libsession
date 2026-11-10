@@ -61,7 +61,6 @@ add_libsession_util_library(crypto
     attachments.cpp
     blinding.cpp
     crypto/ed25519.cpp
-    crypto/mlkem768.cpp
     crypto/x25519.cpp
     curve25519.cpp
     hash.cpp
@@ -118,7 +117,8 @@ target_link_libraries(crypto
     sessiondep::nettle
     sessiondep::simdutf
     sessiondep::libutf8proc
-    mlkem_native::mlkem768
+    # Implements session::mlkem768, which include/session/crypto/mlkem768.hpp declares.
+    session-router-cryptography
     nlohmann_json::nlohmann_json
     libsession::protos
 )
@@ -168,7 +168,6 @@ target_link_libraries(
     libsession::protos
     sessiondep::libsodium
     nlohmann_json::nlohmann_json
-    mlkem_native::mlkem768
     oxen::quic
 )
 
@@ -203,14 +202,14 @@ add_libsession_util_library(network
     network/transport/quic_transport.cpp
     network/routing/direct_router.cpp
     network/routing/onion_request_router.cpp
+    network/routing/session_router_router.cpp
 )
 
 target_link_libraries(network
     PUBLIC
     crypto
     oxen::quic
-    # service_node.hpp declares `service_node::from_json(nlohmann::json)`, so anything including it
-    # -- which core.hpp does, and so anything using core -- needs the json headers.
+    session-router::core
     nlohmann_json::nlohmann_json
     PRIVATE
     sessiondep::libsodium
@@ -233,14 +232,6 @@ if(WITH_IP_GEOLOCATION)
     target_sources(network PRIVATE network/ip_country/data.cpp)
 else()
     target_sources(network PRIVATE network/ip_country/no_data.cpp)
-endif()
-
-if(ENABLE_NETWORKING_SROUTER)
-    target_sources(network
-        PRIVATE
-        network/routing/session_router_router.cpp)
-    target_link_libraries(network PUBLIC session-router::core)
-    target_compile_definitions(network PUBLIC ENABLE_NETWORKING_SROUTER)
 endif()
 
 if (BUILD_STATIC_DEPS)

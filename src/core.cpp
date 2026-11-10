@@ -2,7 +2,6 @@
 #include <fmt/chrono.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
-#include <mlkem_native.h>
 #include <oxenc/base64.h>
 #include <oxenc/bt_producer.h>
 #include <oxenc/bt_serialize.h>
@@ -18,6 +17,7 @@
 #include <session/core.hpp>
 #include <session/core/schema/schema_registry.hpp>
 #include <session/crypto/ed25519.hpp>
+#include <session/crypto/mlkem768.hpp>
 #include <session/format.hpp>
 #include <session/network/session_network.hpp>
 #include <session/network/session_network_types.hpp>
@@ -1454,7 +1454,7 @@ void Core::_handle_pfs_response(std::span<const std::byte, 33> sid, std::string 
 
         // Track the most recently valid pubkeys seen across all messages.
         std::optional<std::array<std::byte, 32>> pk_x25519;
-        std::optional<std::array<std::byte, MLKEM768_PUBLICKEYBYTES>> pk_mlkem768;
+        std::optional<std::array<std::byte, mlkem768::PUBLICKEYBYTES>> pk_mlkem768;
 
         for (const auto& msg : *msgs_it) {
             auto data_it = msg.find("data");
@@ -1471,7 +1471,7 @@ void Core::_handle_pfs_response(std::span<const std::byte, 33> sid, std::string 
             oxenc::from_base64(b64.begin(), b64.end(), std::back_inserter(decoded));
             try {
                 oxenc::bt_dict_consumer in{decoded};
-                auto M = in.require_span<std::byte, MLKEM768_PUBLICKEYBYTES>("M");
+                auto M = in.require_span<std::byte, mlkem768::PUBLICKEYBYTES>("M");
                 auto X = in.require_span<std::byte, 32>("X");
                 in.require_signature(
                         "~",

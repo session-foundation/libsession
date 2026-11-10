@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <limits>
 #include <optional>
-#include <oxen/quic.hpp>
+#include <oxen/quic/loop.hpp>
 #include <span>
 
 #include "session/clock.hpp"
