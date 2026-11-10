@@ -391,7 +391,7 @@ def main(ctx):
         linux(
             "Debian sid (live tests)",
             "debian-sid",
-            cmake = {"ENABLE_NETWORKING": True, "ENABLE_NETWORKING_SROUTER": True, "BUILD_LIVE_TESTS": True},
+            cmake = {"ENABLE_NETWORKING": True, "BUILD_LIVE_TESTS": True},
             checks = [tests()] + [live_test(m) for m in ["onionreq", "srouter", "direct"]],
         ),
 
@@ -469,7 +469,6 @@ def main(ctx):
             cmake = {
                 "CMAKE_CXX_FLAGS": "-fdiagnostics-color=always",
                 "CMAKE_TOOLCHAIN_FILE": "../cmake/mingw-x86-64-toolchain.cmake",
-                "ENABLE_NETWORKING_SROUTER": False,
             },
         ),
         package(
