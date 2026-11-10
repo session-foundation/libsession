@@ -103,29 +103,6 @@ set(BUILD_STATIC_libzstd ON CACHE BOOL "" FORCE)
 session_dep(libzstd 1.5)
 libsession_static_bundle(sessiondep::libzstd)
 
-# TODO FIXME: integrate this with the updated networking PR, which will end up right about here when
-# merging.  This can basically just get deleted once we are always building session-router.
-if(NOT TARGET mlkem_native::mlkem768)
-    file(GLOB_RECURSE mlkem_sources
-        session-router/external/mlkem-native/mlkem/src/*.c
-        session-router/external/mlkem-native/mlkem/src/*.S)
-
-    add_library(mlkem_native768 STATIC ${mlkem_sources})
-
-    target_compile_definitions(mlkem_native768 PUBLIC
-        MLK_CONFIG_NO_RANDOMIZED_API
-        MLK_CONFIG_PARAMETER_SET=768
-        MLK_CONFIG_NAMESPACE_PREFIX=sr_mlkem768
-        MLK_CONFIG_NO_SUPERCOP
-        MLK_CONFIG_USE_NATIVE_BACKEND_ARITH
-        MLK_CONFIG_USE_NATIVE_BACKEND_FIPS202
-    )
-
-    target_include_directories(mlkem_native768 PUBLIC session-router/external/mlkem-native/mlkem)
-
-    add_library(mlkem_native::mlkem768 ALIAS mlkem_native768)
-endif()
-
 if(NOT TARGET nlohmann_json::nlohmann_json)
     set(JSON_BuildTests OFF CACHE INTERNAL "")
     set(JSON_Install ON CACHE INTERNAL "") # Required to export targets that we use

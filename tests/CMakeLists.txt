@@ -91,7 +91,6 @@ target_link_libraries(test_libs INTERFACE
     sessiondep::nettle
     session::SQLite
     sessiondep::libsodium
-    mlkem_native::mlkem768
     nlohmann_json::nlohmann_json
     oxen::logging)
 
