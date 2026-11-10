@@ -61,7 +61,6 @@ add_libsession_util_library(crypto
     attachments.cpp
     blinding.cpp
     crypto/ed25519.cpp
-    crypto/mlkem768.cpp
     crypto/x25519.cpp
     curve25519.cpp
     hash.cpp
@@ -118,7 +117,8 @@ target_link_libraries(crypto
     sessiondep::nettle
     sessiondep::simdutf
     sessiondep::libutf8proc
-    mlkem_native::mlkem768
+    # Implements session::mlkem768, which include/session/crypto/mlkem768.hpp declares.
+    session-router-cryptography
     nlohmann_json::nlohmann_json
     libsession::protos
 )
@@ -168,7 +168,6 @@ target_link_libraries(
     libsession::protos
     sessiondep::libsodium
     nlohmann_json::nlohmann_json
-    mlkem_native::mlkem768
     oxen::quic
 )
 
