@@ -61,6 +61,8 @@ default_cmake = {
     "WARNINGS_AS_ERRORS": True,
     "BUILD_SHARED_LIBS": True,
     "BUILD_STATIC_DEPS": False,
+    # liboxen-quic-dev 1.14 on deb.session.foundation ships without oxen/quic.hpp.
+    "DEPS_FORCE_liboxenquic_SUBMODULE": True,
     "USE_LTO": False,
     "LOCAL_MIRROR": "https://builds.session.codes/deps",
 }
@@ -165,8 +167,28 @@ def apt_install(image, pkgs, session_repo = True, foreign_arch = None, apt_sourc
         "eatmydata " + apt_get + " install --no-install-recommends -y " + " ".join(pkgs),
     ]
 
+# The stats log holds only this job's ccache counters, while `ccache -s` totals every build that has
+# used the cache directory, which on the Mac is shared with every earlier job.  On Docker the two
+# match unless the job started with a non-empty cache.
+ccache_stats_start = ['export CCACHE_STATSLOG="$${CI_WORKSPACE}/ccache-stats.log"']
+ccache_stats_end = ["ccache --show-log-stats -v || true", "ccache -s -v || true"]
+
+# The Mac's workspace is a new temporary directory for every job, so absolute paths in the compile
+# commands would miss the cache on every run.  Compilers see the /private/var form of that path.
+# With -g, ccache also hashes the working directory, since it ends up in the debug info; not
+# hashing it lets a hit carry an earlier job's directory there, which CI builds don't care about.
+mac_ccache_env = [
+    'export CCACHE_BASEDIR="$$(cd "$${CI_WORKSPACE}" && pwd -P)"',
+    "export CCACHE_NOHASHDIR=1",
+]
+
 def build_step(image, commands):
-    step = {"name": "build", "image": image, "commands": ['echo "Building on $${CI_MACHINE}"'] + commands}
+    setup = ccache_stats_start + (mac_ccache_env if image == "sh" else [])
+    step = {
+        "name": "build",
+        "image": image,
+        "commands": ['echo "Building on $${CI_MACHINE}"'] + setup + commands + ccache_stats_end,
+    }
     if image != "sh":
         step["pull"] = True
     return step

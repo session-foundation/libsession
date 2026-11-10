@@ -122,12 +122,20 @@ if [ "$CONFIGURATION" == "Debug" ] || [ "$CONFIGURATION" == "Debug_Compile_LibSe
 fi
 
 if [ "${SHOULD_BUILD_STATIC_LIBS}" == "SHOULD_BUILD_STATIC_LIBS" ]; then
+    # The builds run with a cleared environment: only these variables, and ccache's settings, survive.
+    build_env=(PATH="$PATH" HOME="$HOME" SDKROOT="$(xcrun --sdk macosx --show-sdk-path)")
+    for var in $(compgen -e); do
+        if [[ $var == CCACHE_* ]]; then
+            build_env+=("$var=${!var}")
+        fi
+    done
+
     for i in "${!TARGET_ARCHS[@]}"; do
         build="${BUILD_DIR}/${TARGET_ARCHS[$i]}"
         platform="${TARGET_PLATFORMS[$i]}"
         echo "Building ${TARGET_ARCHS[$i]} for $platform in $build"
 
-        env -i PATH="$PATH" SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+        env -i "${build_env[@]}" \
             ./utils/static-bundle.sh "$build" "" \
             -DCMAKE_TOOLCHAIN_FILE="${projdir}/external/ios-cmake/ios.toolchain.cmake" \
             -DPLATFORM=$platform \
