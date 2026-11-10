@@ -57,7 +57,8 @@ s390x_deps = ["crossbuild-essential-s390x", "libcli11-dev", "nlohmann-json3-dev"
 # BUILD_STATIC_DEPS is given either way because it defaults to the opposite of BUILD_SHARED_LIBS.
 default_cmake = {
     "CMAKE_BUILD_TYPE": "Release",
-    "CMAKE_CXX_FLAGS": "-fdiagnostics-color=always",
+    # -g for the line numbers in a crash's backtraces (see `tests`); it does not change the code.
+    "CMAKE_CXX_FLAGS": "-fdiagnostics-color=always -g",
     "WARNINGS_AS_ERRORS": True,
     "BUILD_SHARED_LIBS": True,
     "BUILD_STATIC_DEPS": False,
@@ -94,8 +95,15 @@ def test_commands(runner = ""):
         for t in ["testLogging", "testAll"]
     ]
 
+# Under gdb unless there is another runner (qemu), so that a test dying on a signal leaves every
+# thread's backtrace in the log: a heap corruption is reported by whichever thread trips over it,
+# and Catch2 alone only names the test that happened to be running.
+debugger = "gdb -q -batch -nx -x ../utils/ci/backtrace-on-crash.gdb --args "
+
 def tests(runner = ""):
-    return {"name": "tests", "commands": test_commands(runner)}
+    if runner:
+        return {"name": "tests", "commands": test_commands(runner)}
+    return {"name": "tests", "extra_pkgs": ["gdb"], "commands": test_commands(debugger)}
 
 # Checks that a database made by every earlier schema in the history upgrades to the current one.
 # Those schemas exist only in git, so this needs the whole history and the tags, which the default
@@ -218,7 +226,7 @@ def linux(
             "name": check["name"],
             "image": image,
             "pull": True,
-            "commands": apt_install(image, check.get("pkgs", test_deps), session_repo, foreign_arch) + check["commands"],
+            "commands": apt_install(image, check.get("pkgs", test_deps) + check.get("extra_pkgs", []), session_repo, foreign_arch) + check["commands"],
         })
     return workflow(name, "linux/" + arch, steps, clone = clone)
 
