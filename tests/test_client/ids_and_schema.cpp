@@ -114,7 +114,7 @@ TEST_CASE("Client: a message id is never handed out twice", "[client][schema]") 
 
     deliver(*c, kept, "one", from_epoch_ms(1000), "h1");
     deliver(*c, dropped, "two", from_epoch_ms(2000), "h2");
-    auto newest = c->conversation(dropped_convo, await)->messages(await).front().id;
+    auto newest = c->conversation(dropped_convo, await)->messages(await).messages.front().id;
 
     // Each takes away the row holding the highest id, which is the one row whose id an insert
     // would otherwise take next.
@@ -128,7 +128,8 @@ TEST_CASE("Client: a message id is never handed out twice", "[client][schema]") 
     REQUIRE_FALSE(c->message(newest, await));
 
     deliver(*c, kept, "three", from_epoch_ms(3000), "h3");
-    auto next = c->conversation(ConversationId::dm(kept.session_id), await)->messages(await);
+    auto next =
+            c->conversation(ConversationId::dm(kept.session_id), await)->messages(await).messages;
     REQUIRE(next.front().body == "three");
     CHECK(next.front().id > newest);
 }
@@ -227,7 +228,7 @@ TEST_CASE(
                 conn.prepared_get<int64_t>("SELECT message FROM message_attachments")};
     });
     deliver(*c, sender, "after", from_epoch_ms(3000), "h3");
-    CHECK(c->conversation(convo, await)->messages(await).front().id > newest);
+    CHECK(c->conversation(convo, await)->messages(await).messages.front().id > newest);
 
     // The children point at the rebuilt tables, and not at the ones the rebuild dropped: deleting
     // through them still reaches them.
@@ -244,5 +245,5 @@ TEST_CASE(
     });
     CHECK(cached == 0);
     CHECK(children == 0);
-    CHECK(c->conversation(convo, await)->messages(await).size() == 2);
+    CHECK(c->conversation(convo, await)->messages(await).messages.size() == 2);
 }
