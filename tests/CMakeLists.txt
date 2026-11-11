@@ -15,6 +15,7 @@ set(LIB_SESSION_UTESTS_SOURCES
     test_client/receiving.cpp
     test_client/replies.cpp
     test_client/requests.cpp
+    test_client/placements.cpp
     test_client/sending.cpp
     test_client/volatile.cpp
     test_core_configs.cpp
