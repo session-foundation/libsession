@@ -480,21 +480,12 @@ void Client::_dispatch_out(std::function<void()> job) {
 }
 
 void Client::_emit_conversation_added(const ConversationId& id) {
-    if (!_cbs->conversation_added)
-        return;
-    auto convo = _conversation(id);
-    if (!convo)
-        return;
-    // Placed here rather than left to the `conversation_updated` that follows: an add that says
-    // where the row goes is applicable on its own, and the alternative is a guarantee about the
-    // order of two callbacks that nothing enforces.
-    auto placement = _place(*convo);
-    // Mutable so the value moves out: each _emit job runs once, and the handler owns what it gets.
-    _emit([convo = std::move(*convo),
-           placement = std::move(placement)](const callbacks& cbs) mutable {
-        if (cbs.conversation_added)
-            cbs.conversation_added(std::move(convo), std::move(placement));
-    });
+    // Reported by the flush, as a `conversation_added` in place of the row's update, rather than
+    // here.  A placement names the row it follows as the database has it now, so it is only
+    // applicable once every row ahead of it in that order has been placed -- which the flush
+    // guarantees for the whole batch, and an add sent on its own could not.
+    _added.insert(id);
+    _touch(id);
 }
 
 void Client::_emit_conversation_removed(const ConversationId& id) {
@@ -506,6 +497,8 @@ void Client::_emit_conversation_removed(const ConversationId& id) {
         from = held->second;
         _placed.erase(held);
     }
+    // An add still waiting for the flush is moot: the flush skips a row it cannot read.
+    _added.erase(id);
     // `id = id` rather than `id`: a copy-capture of a const lvalue is itself const, which `mutable`
     // does not undo, and the handler is given the id outright.
     _emit([id = id, from](const callbacks& cbs) mutable {
@@ -615,58 +608,114 @@ void Client::_flush_pending() {
     _flush_scheduled = false;
     auto dirty = std::move(_dirty);
     _dirty.clear();
+    auto added = std::move(_added);
+    _added.clear();
 
     // Which list each dirty row sits in, read off the row this loop already fetches rather than by
     // asking again: only a DM can be a request, and the two lists are complements, so each row
     // belongs to exactly one of them -- or, hidden, to neither.
     //
-    // Two questions per list, and they are not the same question.  A row whose *contents* changed
-    // makes the list stale for a subscriber holding whole lists, and most of what dirties a
-    // conversation does that: a read receipt, a nickname, an expiry.  A row that *moved* is the
-    // narrower case, and only that one can change the order.
+    // Only for the whole-list handlers.  A row whose *contents* changed makes its list stale for a
+    // subscriber holding whole lists, and most of what dirties a conversation does that: a read
+    // receipt, a nickname, an expiry.  What this cannot see is the list a row has just *left*: it
+    // reads the row as it is now, so a row just hidden, or just approved out of the requests, looks
+    // like one that was always where it is.  Every writer that can move a row out of a list --
+    // the priority writers, approval, deletion -- names that list itself, through `_touch_lists`.
     bool convos_changed = std::exchange(_stale_conversations, false);
     bool requests_changed = std::exchange(_stale_requests, false);
 
+    // Nothing is placed for a subscriber with no per-row handler: an anchor is a query, and one
+    // holding only whole lists has no use for it.
+    const bool placing = _cbs->conversation_updated || _cbs->conversation_added;
+
+    struct report {
+        AnyConversation convo;
+        ListPlacement placement;
+        int64_t row;
+        bool added;
+    };
+    std::vector<report> reports;
+    reports.reserve(dirty.size());
     for (const auto& id : dirty) {
         auto convo = _conversation(id);
         if (!convo)
             continue;
-        // A hidden row is in neither list, so nothing about it makes either one stale.
-        //
-        // This reads the row's priority now, so it cannot tell a row that was always hidden from
-        // one that has just become hidden -- and the second of those did change both lists, by
-        // leaving one of them.  That case does not arrive here: every write to
-        // `conversations.priority` emits a replacement on its own path rather than dirtying the
-        // row and leaving this to report it, so the removal has already been sent by the time the
-        // row turns up in `_dirty`.  Should a fifth writer of that column ever appear, it has to do
-        // the same, because there is nothing here that could notice the transition.
         if (convo->priority() >= 0) {
             auto* dm = convo->dm();
             const bool request = dm && dm->request;
             (request ? requests_changed : convos_changed) = true;
         }
+        if (!placing)
+            continue;
+        auto row = [&] {
+            auto c = core.database().conn();
+            return find_conversation(c, id);
+        }();
+        if (!row)
+            continue;
         // Read before the emit, and off the row this loop already fetched: the anchor is one
         // indexed seek, against reading the whole list to say the same thing.
-        auto placement = _place(*convo);
-        _emit([convo = std::move(*convo),
-               placement = std::move(placement)](const callbacks& cbs) mutable {
-            if (cbs.conversation_updated)
+        auto placement = _place(*convo, *row);
+        reports.push_back({std::move(*convo), std::move(placement), *row, added.contains(id)});
+    }
+
+    // **In final order**, top to bottom of each list, which is what makes applying them one after
+    // another correct.  Each row is placed after its predecessor in the list as it is now, and that
+    // predecessor is either a row nothing touched -- and untouched rows have kept their order
+    // among themselves, so it is where the subscriber already holds it -- or a touched row earlier
+    // in this order, which has just been placed.  Sent in any other order a row could be placed
+    // after one that is about to move, and stay behind where that one used to be.
+    //
+    // Rows leaving both lists go first; nothing is placed after a row that is in neither.  The two
+    // lists are independent of each other: a row crossing between them is taken out of one and
+    // put into the other in a single placement, and no anchor names a row in the other list.
+    auto rank = [](const report& r) {
+        switch (r.placement.to) {
+            case ConversationList::none: return 0;
+            case ConversationList::conversations: return 1;
+            case ConversationList::requests: return 2;
+        }
+        return 0;
+    };
+    std::ranges::stable_sort(reports, [&rank](const report& a, const report& b) {
+        if (rank(a) != rank(b))
+            return rank(a) < rank(b);
+        // The two lists' own orders: `priority DESC, last_activity DESC, id` for conversations and
+        // `last_activity DESC, id` for requests, whose order has no priority in it.
+        if (a.placement.to == ConversationList::conversations &&
+            a.convo.priority() != b.convo.priority())
+            return a.convo.priority() > b.convo.priority();
+        auto a_active = epoch_ms(a.convo.last_activity()),
+             b_active = epoch_ms(b.convo.last_activity());
+        if (a_active != b_active)
+            return a_active > b_active;
+        return a.row < b.row;
+    });
+
+    for (auto& r : reports) {
+        // Mutable so the value moves out: each _emit job runs once, and the handler owns what it
+        // gets.
+        _emit([convo = std::move(r.convo), placement = std::move(r.placement), added = r.added](
+                      const callbacks& cbs) mutable {
+            if (added) {
+                if (cbs.conversation_added)
+                    cbs.conversation_added(std::move(convo), std::move(placement));
+            } else if (cbs.conversation_updated) {
                 cbs.conversation_updated(std::move(convo), std::move(placement));
+            }
         });
     }
 
-    // And then the lists, each through whichever handler asked for it.
+    // And then the whole lists, each only to a handler that asked for one.
     //
-    // A `conversation_updated` carries its row's position, so a subscriber applying those in order
-    // keeps its lists arranged without ever sorting -- which it could not do correctly anyway,
-    // since the two lists are not sorted the same way.
+    // The placements above are complete on their own: a subscriber that read each list once and
+    // applies them in order holds what these would carry.  These are the other way to keep a list
+    // -- simpler and dearer, since every change re-reads it -- and a subscriber normally keeps one
+    // or the other.
     //
-    // Deliberately after that loop rather than before it: a replaced list only ever carries
-    // conversations the subscriber has already been told about, so one it does not recognise means
-    // it missed a notification rather than that the two are racing.
-    //
-    // Once for the batch, not once per row: a poll delivering fifty messages to one conversation
-    // reaches here a single time, which is the same reason `_dirty` exists.
+    // After the placements rather than before: a replaced list only ever carries conversations the
+    // subscriber has already been told about.  Once for the batch, not once per row, which is the
+    // same reason `_dirty` exists.
     _report_lists(convos_changed, requests_changed);
 }
 
@@ -2455,7 +2504,7 @@ void Client::_set_nickname(const ConversationId& id, std::string_view nickname) 
 
 void Client::_set_priority(const ConversationId& id, int priority) {
     int changed = 0;
-    bool request = false;
+    bool request = false, created = false;
     {
         auto c = core.database().conn();
         auto tx = c.begin_immediate();
@@ -2463,7 +2512,14 @@ void Client::_set_priority(const ConversationId& id, int priority) {
         // Not ensure_conversation() for one that already exists: that moves last_activity forward,
         // and pinning is not activity -- it would reorder the very list it is being used to order.
         auto existing = find_conversation(c, id);
-        auto convo = existing ? *existing : ensure_conversation(c, id, clock_now_ms()).id;
+        int64_t convo;
+        if (existing) {
+            convo = *existing;
+        } else {
+            auto row = ensure_conversation(c, id, clock_now_ms());
+            convo = row.id;
+            created = row.created;
+        }
 
         changed = c.prepared_exec(
                 "UPDATE conversations SET priority = ?1 WHERE id = ?2 AND priority IS NOT ?1",
@@ -2477,9 +2533,14 @@ void Client::_set_priority(const ConversationId& id, int priority) {
         tx.commit();
     }
 
+    if (created)
+        _emit_conversation_added(id);
     if (changed > 0) {
         _sync_conversation(id);
-        _report_lists_replaced(!request, request);
+        // The row, for its placement -- to `none` when hidden -- and its list, which the flush
+        // cannot tell a row has just left.
+        _touch(id);
+        _touch_lists(!request, request);
     }
 }
 
@@ -2570,8 +2631,10 @@ void Client::_delete_conversation(const ConversationId& id, bool keep_messages) 
         _withdraw_orphaned_requests();
         _emit_history_replaced(id);
     }
-    if (hidden)
-        _report_lists_replaced(!request, request);
+    if (hidden) {
+        _touch(id);
+        _touch_lists(!request, request);
+    }
 }
 
 void Client::_delete_contact(const ConversationId& id) {
@@ -2617,7 +2680,7 @@ void Client::_delete_contact(const ConversationId& id) {
         _emit_conversation_removed(id);
         // The one list it was in.  A conversation is in exactly one of the two, so deleting it
         // outright leaves the other exactly as it was.
-        _report_lists_replaced(was_listed && !was_request, was_listed && was_request);
+        _touch_lists(was_listed && !was_request, was_listed && was_request);
     }
 }
 
@@ -3055,13 +3118,10 @@ void Client::_set_delete_before(const ConversationId& id, sys_ms before) {
     contacts.set(*entry);
 }
 
-ListPlacement Client::_place(const AnyConversation& convo) {
+ListPlacement Client::_place(const AnyConversation& convo, int64_t row) {
     ListPlacement out;
 
     auto c = core.database().conn();
-    auto row = find_conversation(c, convo.id());
-    if (!row)
-        return out;
 
     // Where the subscriber is holding it, which is what it has to take the row out of -- not what
     // the database says now, which is where the row is going.  A row it has never been told about
@@ -3084,13 +3144,13 @@ ListPlacement Client::_place(const AnyConversation& convo) {
                                     "SELECT c.id {} {}"_format(SUBJECT_JOIN, REQUEST_ANCHOR),
                                     _self_or_none(),
                                     epoch_ms(convo.last_activity()),
-                                    *row)
+                                    row)
                           : c.prepared_maybe_get<int64_t>(
                                     "SELECT c.id {} {}"_format(SUBJECT_JOIN, CONVO_ANCHOR),
                                     _self_or_none(),
                                     convo.priority(),
                                     epoch_ms(convo.last_activity()),
-                                    *row);
+                                    row);
     // Nothing sorts before it, so it goes first -- which an unset anchor is what says.
     if (before)
         out.after = conversation_id_at(c, *before);
@@ -3132,17 +3192,6 @@ void Client::_report_lists(bool convos_changed, bool requests_changed) {
             ConversationList::requests,
             &Client::_message_requests,
             &callbacks::request_list_replaced);
-}
-
-// Both lists, always, and deliberately not one or the other: what moves a conversation between them
-// is approval, what removes it from either is hiding or deletion, and a caller that had to work out
-// which of those it just did would eventually get it wrong.  A replacement is idempotent, so the
-// cost of sending one nobody needed is a query.
-void Client::_report_lists_replaced(bool convos, bool requests) {
-    // A row appeared, went, or moved to a new position.  Named for what the caller knows -- that a
-    // list is wholly different now -- rather than for the query, which is the one a changed row
-    // takes as well.
-    _report_lists(convos, requests);
 }
 
 // -- Config reconciliation ----------------------------------------------------------------------
@@ -3534,8 +3583,7 @@ WHERE id = ?1
     // Each list only if something in it changed.  A removal can be from either -- what was taken
     // out is gone from whichever list held it -- so it names both.
     if (order_changed || requests_changed || !removed.empty())
-        _report_lists_replaced(
-                order_changed || !removed.empty(), requests_changed || !removed.empty());
+        _touch_lists(order_changed || !removed.empty(), requests_changed || !removed.empty());
 }
 
 void Client::_sync_all_contacts() {
@@ -3888,14 +3936,14 @@ WHERE id = ?1 AND (exp_mode, exp_timer) IS NOT (?2, ?3)
 
     if (created)
         _emit_conversation_added(me);
-    else if (profile_changed || convo_changed || history_changed)
+    else if (profile_changed || convo_changed || history_changed || order_changed)
         _touch(me);
     if (history_changed)
         _emit_history_replaced(me);
     // Note to self only, and it cannot be a request -- we are not our own contact -- so the request
     // list cannot have been touched by this.
     if (order_changed)
-        _report_lists_replaced(true, false);
+        _touch_lists(true, false);
 }
 
 // -- Messages ---------------------------------------------------------------------------------

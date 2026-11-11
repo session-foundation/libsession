@@ -74,13 +74,27 @@ struct ListPlacement {
 /// is not a template on its argument — it is a promise by the caller that the object is spent
 /// afterwards.
 ///
-/// The conversation list an application maintains from these is expected to be *complete*: the
-/// order is given as a whole list, so a partial one cannot be placed in it.  Showing only part of
-/// it is fine, holding only part of it is not.
+/// **There are two independent ways to keep the conversation lists**, and a subscriber normally
+/// picks one:
+///
+/// - **Placements.**  Read each list once, with `conversations()` and `message_requests()`, then
+///   apply `conversation_added`, `conversation_updated` and `conversation_removed` in the order
+///   they arrive.  Every change to either list reaches one of those three -- a new message, a pin,
+///   a hide, an approval, a whole config merge from another device -- so they are complete on
+///   their own, and each costs an indexed seek.
+/// - **Whole lists.**  `conversation_list_replaced` and `request_list_replaced` re-send a list,
+///   ordered, whenever anything about it changes.  Simpler to keep, and dearer: every change reads
+///   the whole list again.  Nothing is read for a handler that is not registered, so a subscriber
+///   keeping placements pays nothing for these by leaving them unset.
+///
+/// Either way the list an application holds is expected to be *complete*: a placement names the
+/// row it follows, so a partial list has nowhere to put one.  Showing only part of it is fine,
+/// holding only part of it is not.
 ///
 /// The order itself is **ours, not the application's**.  Every handler that carries a list carries
-/// it already ordered, so an application never has to sort, and should not: the two lists are not
-/// sorted the same way and a comparator copied from one gets the other wrong.
+/// it already ordered, and every placement says where its row goes, so an application never has
+/// to sort, and should not: the two lists are not sorted the same way and a comparator copied from
+/// one gets the other wrong.
 struct callbacks {
     /// A conversation now exists that did not before.
     ///
@@ -100,21 +114,27 @@ struct callbacks {
     /// another, so one applied out of order, or skipped, leaves the list wrong with nothing to
     /// detect it.  A subscriber that has not read the list once with `conversations()` has nothing
     /// to place rows into.
+    ///
+    /// Several changed at once -- one poll, one config merge pinning and hiding several rows -- are
+    /// reported in the order of the lists they end up in, top to bottom, so each one's anchor has
+    /// already been placed or never moved.  A pin, unpin, hide or unhide is reported here like any
+    /// other change: a hidden row's `to` is `none`.
     std::function<void(AnyConversation&&, ListPlacement&&)> conversation_updated;
 
     /// A conversation is gone and should be dropped from the list it is in, which is the second
     /// argument -- `none` if it was never shown in one.  Saves searching both.
     std::function<void(ConversationId&&, ConversationList)> conversation_removed;
 
-    /// Priorities changed — a pin, unpin, hide or unhide — carrying the whole list in its new
-    /// order.  A replacement rather than a description of what moved, because one config update
-    /// from another device can repin, reveal and hide arbitrarily many conversations at once, and
-    /// because a replacement cannot leave the application subtly out of step the way a missed
-    /// delta would.
+    /// The conversation list changed in any way -- a row's contents, its position, a row joining
+    /// or leaving -- carrying the whole list in its new order, once per batch of changes.
+    ///
+    /// The whole-list way to keep it, and an alternative to the placements above rather than a
+    /// supplement: a subscriber holding only this is correct, at the price of the list being read
+    /// on every change.  Left unset, it costs nothing.
     std::function<void(std::vector<AnyConversation>&&)> conversation_list_replaced;
 
-    /// The message requests changed, carrying the whole list of them, for the same reasons and with
-    /// the same guarantees as the above.
+    /// The message requests changed, carrying the whole list of them, on the same terms as the
+    /// above.
     ///
     /// The two lists are disjoint and a conversation moves between them, so approving one fires
     /// both: it left the requests and joined the conversations.  `conversation_added` and the rest

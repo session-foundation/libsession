@@ -1646,11 +1646,6 @@ class Client {
 
     void _emit_conversation_added(const ConversationId& id);
     void _emit_conversation_removed(const ConversationId& id);
-    // Reports both lists as wholly changed -- a row added, removed, or moved to a new position --
-    // through whichever handlers the subscriber registered.  A replacement carries the order, so
-    // this cannot send one without also considering the order event, or a subscriber holding only
-    // that handler hears nothing.
-    void _report_lists_replaced(bool convos, bool requests);
     void _emit_history_replaced(const ConversationId& id);
     // Reports a message, and then reports every message that replies to it.
     //
@@ -1686,18 +1681,18 @@ class Client {
     // reports it once; `_flush_pending` is scheduled on the loop and runs when the work that
     // dirtied them is finished.
     std::vector<ConversationId> _dirty;
+    // Of those, the ones that did not exist before: reported as added rather than updated.
+    std::unordered_set<ConversationId> _added;
     bool _flush_scheduled = false;
     void _touch(const ConversationId& id);
     void _flush_pending();
 
-    // Lists that changed wholesale -- a row joined or left one -- to be reported with the same
-    // flush as the rows, rather than on their own.  Approval arrives with a message, and the
-    // message dirties the row, so reporting the lists at approval and again when the row flushed
-    // sent the conversation list twice for one change.
+    // Lists a row has left, for the whole-list handlers, reported with the same flush as the rows.
+    // The flush sees each row as it is now, which says what list it is in but not which one it
+    // just left, so whatever moves a row out of a list -- a hide, an approval, a deletion -- names
+    // that list here.
     bool _stale_conversations = false, _stale_requests = false;
     void _touch_lists(bool conversations, bool requests);
-    // Reports one list, if a row in it changed and the subscriber asked for it.  The rows are the
-    // expensive part, so nothing is read for a handler that is not there.
     // Which list each conversation was last *reported* in.  The subscriber's belief rather than
     // the database's state, which is the point: it is what the subscriber has to take the row out
     // of before putting it where it now belongs.
@@ -1706,8 +1701,11 @@ class Client {
     // deleted -- `_delete_contact` commits the DELETE first -- so there is nothing left to look a
     // row id up from, and an entry keyed that way could never be erased.
     std::unordered_map<ConversationId, ConversationList> _placed;
-    // Where a conversation was and where it belongs now, and records the latter.
-    ListPlacement _place(const AnyConversation& convo);
+    // Where a conversation was and where it belongs now, and records the latter.  `row` is the
+    // conversation's row id, which the anchor query compares against.
+    ListPlacement _place(const AnyConversation& convo, int64_t row);
+    // Reports one list, if a row in it changed and the subscriber asked for it.  The rows are the
+    // expensive part, so nothing is read for a handler that is not there.
     void _report_list(
             bool changed,
             ConversationList list_kind,
