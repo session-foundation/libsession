@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <fstream>
+#include <mutex>
 #include <session/client.hpp>
 #include <session/hash.hpp>
 #include <session/network/backends/session_file_server.hpp>
@@ -59,7 +60,8 @@ bool wait_until_sent(Client& c, int64_t id, std::chrono::seconds limit) {
 TEST_CASE(
         "Live: a message's attachment is uploaded and named in what is stored", "[live][client]") {
     auto file = std::filesystem::temp_directory_path() / "live_attachment_send.bin";
-    std::vector<std::byte> contents(64 * 1024);
+    // Large enough that the upload reports progress before its outcome, not only the outcome.
+    std::vector<std::byte> contents(2 * 1024 * 1024);
     randombytes_buf(contents.data(), contents.size());
     {
         std::ofstream out{file, std::ios::binary};
@@ -70,23 +72,50 @@ TEST_CASE(
     b33 me;
     std::ranges::copy(c->core.globals.session_id(), me.begin());
 
+    // Written on Core's loop and read here once the send is done, behind the mutex either way: a
+    // report arriving on any other thread is what `off_loop` is counting.
+    std::mutex reports_lock;
     std::vector<std::tuple<size_t, int64_t, int64_t, std::optional<Expected<void>>>> reports;
+    int off_loop = 0;
     auto id = c->send_message(
             ConversationId::dm(me),
             {.body = "with an attachment",
              .attachments = {OutgoingAttachment{
                      .path = file, .content_type = "application/octet-stream"}}},
             [&](size_t idx, int64_t sent, int64_t total, std::optional<Expected<void>> result) {
+                std::lock_guard lock{reports_lock};
+                if (!c->core.loop().inside())
+                    ++off_loop;
                 reports.emplace_back(idx, sent, total, std::move(result));
             },
             await);
 
     REQUIRE(wait_until_sent(*c.client, id, 120s));
+    // Copied out rather than read under the lock, which a late report would then wait on from
+    // Core's loop while the rest of the test calls into the Client.
+    decltype(reports) seen;
+    int seen_off_loop = 0;
+    {
+        std::lock_guard lock{reports_lock};
+        seen = reports;
+        seen_off_loop = off_loop;
+    }
+
+    // Started first, as a download starts.  Then progress, except over onion requests, which carry
+    // an upload as one HTTP request and report only its outcome.  With no dispatcher, every report
+    // runs on Core's loop.
+    REQUIRE(!seen.empty());
+    CHECK(std::get<1>(seen.front()) == 0);
+    CHECK(std::get<2>(seen.front()) == 0);
+    CHECK_FALSE(std::get<3>(seen.front()).has_value());
+    if (live_router_mode.type != session::network::opt::router::Type::onion_requests)
+        CHECK(seen.size() > 2);
+    CHECK(seen_off_loop == 0);
 
     // The upload reported itself finished, and did so as a result rather than by reaching the
     // total: the file server's acceptance is what counts.
-    REQUIRE(!reports.empty());
-    auto& [idx, sent, total, result] = reports.back();
+    REQUIRE(!seen.empty());
+    auto& [idx, sent, total, result] = seen.back();
     CHECK(idx == 0);
     REQUIRE(result.has_value());
     CHECK(result->has_value());

@@ -68,7 +68,8 @@ struct OutgoingAttachment {
 /// with a message.
 enum class AutoDownload : int {
     none = 0,               ///< Nothing; every attachment waits to be asked for.
-    image_attachments = 1,  ///< Attachments whose content type is an image.
+    image_attachments = 1,  ///< Attachments whose content type is one Session displays as an
+                            ///< image; see image::displayable_image_types.
     all = 2,                ///< Every attachment.
 };
 
@@ -180,9 +181,10 @@ struct Attachment {
     /// The file's size in bytes, before encryption -- what the file server holds is larger, since
     /// it carries the stream's per-chunk overhead and the padding that hides the true length.
     ///
-    /// Unset on an outgoing attachment that has not been uploaded yet.  On an incoming one this is
-    /// the sender's claim: for a legacy-encrypted attachment it is load-bearing, being what the
-    /// padding is trimmed by, and a wrong value there shows up as a corrupt file.
+    /// On an outgoing attachment, the file's size when it was sent, and the size its upload sent
+    /// once that finishes.  On an incoming one this is the sender's claim: for a legacy-encrypted
+    /// attachment it is load-bearing, being what the padding is trimmed by, and a wrong value there
+    /// shows up as a corrupt file.
     std::optional<int64_t> size;
 
     /// Whether the file is on the file server: for an outgoing attachment, that its upload

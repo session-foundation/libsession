@@ -1,0 +1,14 @@
+#include <session/mnemonics.hpp>
+#include <array>
+
+namespace session::mnemonics {
+
+@LANG_EXTERNS@
+static constexpr std::array<const Mnemonics*, @LANG_COUNT@> all_languages = {{
+@LANG_LIST@}};
+
+std::span<const Mnemonics* const> get_languages() {
+    return all_languages;
+}
+
+} // namespace session::mnemonics
