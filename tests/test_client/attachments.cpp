@@ -1774,7 +1774,7 @@ TEST_CASE("Client: a conversation set to auto-download fetches on arrival", "[cl
         c->conversation(convo, await)->set_auto_download(AutoDownload::image_attachments, await);
         arrive("h6", false, "image/svg+xml");
         CHECK(net->downloads.empty());
-        CHECK_FALSE(c->conversation(convo, await)->messages(await)[0].gallery_viewable);
+        CHECK_FALSE(c->conversation(convo, await)->messages(await).messages[0].gallery_viewable);
     }
 
     SECTION("all fetches both, and an all-image message opens as a gallery") {
@@ -2253,7 +2253,7 @@ TEST_CASE("Client: only image types we display count as images", "[client][attac
         REQUIRE(found != convos.end());
         REQUIRE(found->last_preview());
         CHECK(found->last_preview()->all_images == image);
-        CHECK(c->conversation(id, await)->messages(await)[0].gallery_viewable == image);
+        CHECK(c->conversation(id, await)->messages(await).messages[0].gallery_viewable == image);
     }
 }
 
