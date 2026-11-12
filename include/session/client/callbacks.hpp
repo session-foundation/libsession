@@ -133,6 +133,46 @@ struct callbacks {
             int64_t total,
             std::optional<Expected<void>> result)>
             display_picture_progress;
+
+    /// Whether this Client has outbound work in flight changed: `true` when something started
+    /// going out with nothing else under way, `false` when the last of it has finished, whichever
+    /// way it finished.  The same value `Client::outbound_busy()` returns.
+    ///
+    /// For holding the process alive.  A user who sends and immediately leaves the app expects the
+    /// message to go, and an operating system that suspends a backgrounded app stops it going; a
+    /// platform holds a keep-alive -- a background task on iOS, an expedited job on Android -- from
+    /// `true` until `false`, and can then let the process be suspended without losing anything.
+    ///
+    /// What counts as outbound work:
+    ///
+    /// - a message whose `send_state` is `pending`, `sending` or `uploading` -- queued, on its way
+    ///   to the recipient's swarm, or with its attachments still going to the file server;
+    /// - a message whose `sync_send_state` is one of those: the copy for our own swarm, which can
+    ///   still be going after the recipient's has arrived;
+    /// - a push of the account's configs that is scheduled or unanswered -- see
+    ///   `core::Configs::push_pending()` -- such as the change of name, contact or read state
+    ///   that was just made here.
+    ///
+    /// Anything else is idle, including a send that ended `sent`, `failed`, `interrupted` or
+    /// `unsendable`.  Downloads do not count: nothing is lost if one is cut off, since asking again
+    /// starts it again.  Nor does a config push that failed or has nowhere to go, which stays owed
+    /// until something schedules another but is not, meanwhile, going to finish.
+    ///
+    /// Sends are read from the database, so they include any made by another Client on the same
+    /// file.  At start-up there are none: anything a previous run left in flight is marked
+    /// `interrupted` or `failed` before the first answer is taken.
+    ///
+    /// **Fires only on a change**, never twice running with the same value, and never at all for a
+    /// Client that sends nothing.  It is not fired at construction to say "idle"; a Client starts
+    /// idle, and a handler first hears of it when that stops being true.  A Client that is busy the
+    /// moment it is built -- a new account's first config push -- reports `true` from inside the
+    /// constructor, as anything else the constructor reports is.
+    ///
+    /// Like every handler here it runs through the dispatcher, so it arrives after the change and
+    /// may arrive after a later one has already happened; the reports arrive in order, and the last
+    /// one delivered is the current state.  A platform deciding at the moment the app backgrounds
+    /// should read `outbound_busy()` there rather than relying on having seen the latest report.
+    std::function<void(bool busy)> outbound_changed;
 };
 
 }  // namespace session::client
