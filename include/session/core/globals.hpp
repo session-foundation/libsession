@@ -28,7 +28,9 @@ struct predefined_seed;
 // A note on keys: to avoid conflicts, external users of these globals should use prefix names that
 // are unlikely to conflict with other uses.  For example, "session_ios_dark_mode" is a decent name,
 // but "pubkey" is a terrible one.  All internal libsession keys in this table begin with an
-// underscore, and should never be accesses outside libsession itself.
+// underscore, and the public accessors below refuse them, throwing std::invalid_argument: they
+// hold the account seed and the flag hide_seed() sets, which nothing outside libsession may read
+// or change.
 //
 /// Thrown when something requiring the account's identity is used before there is one.  Only
 /// reachable when the Core was constructed with defer_account: without it, construction either
@@ -96,6 +98,12 @@ class Globals final : detail::CoreComponent {
     void _create_account();
     void _restore_account(const predefined_seed& seed);
 
+    // The accessors libsession's own underscore keys go through: the public ones refuse those keys.
+    std::optional<int64_t> _get_integer(std::string_view key);
+    bool _get_blob_to(std::string_view key, std::span<std::byte> to);
+    void _set(std::string_view key, int64_t integer);
+    void _set(std::string_view key, std::span<const std::byte> blob);
+
   public:
     /// Whether this account has an identity yet.
     ///
@@ -139,6 +147,9 @@ class Globals final : detail::CoreComponent {
     // Retrieval methods.  These query for the given key and, if the type matches, return the given
     // value.  You get back nullopt if the database key does not exist, or if it contains a value
     // of some other type.
+    //
+    // Each of these, `set` and `erase` throws std::invalid_argument for a key beginning with an
+    // underscore, which is libsession's own (see above).
     //
     // These, `set` and `erase` are the exception to the threading rule on the rest of this class:
     // each is one self-contained query against a connection the pool hands the calling thread, and
