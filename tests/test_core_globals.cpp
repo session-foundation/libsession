@@ -132,3 +132,78 @@ TEST_CASE("Globals: defer_account leaves the account unresolved", "[core][global
     std::error_code ec;
     std::filesystem::remove(path, ec);
 }
+
+TEST_CASE("Globals: hide_seed withholds the mnemonic but not the seed", "[core][globals]") {
+    auto path = std::filesystem::temp_directory_path() /
+                fmt::format("{}.db", session::random::unique_id("test_seed_hidden", 7));
+    std::filesystem::remove(path);
+
+    std::string id;
+    std::vector<std::byte> raw_seed;
+    {
+        Core core{path};
+        CHECK_FALSE(core.globals.seed_hidden());
+        CHECK_NOTHROW(core.globals.seed_mnemonic());
+        id = core.globals.session_id_hex();
+        {
+            auto acc = core.globals.account_seed();
+            raw_seed.assign(acc.seed().begin(), acc.seed().end());
+        }
+
+        core.globals.hide_seed();
+        CHECK(core.globals.seed_hidden());
+        CHECK_THROWS_AS(core.globals.seed_mnemonic(), seed_hidden_error);
+        CHECK_THROWS_AS(
+                core.globals.seed_mnemonic(mnemonics::get_language("English"), true),
+                seed_hidden_error);
+
+        // libsession keeps deriving keys from the seed, so it stays readable.
+        {
+            auto acc = core.globals.account_seed();
+            CHECK(std::vector<std::byte>(acc.seed().begin(), acc.seed().end()) == raw_seed);
+        }
+        CHECK(core.globals.session_id_hex() == id);
+
+        // Hiding again is a no-op, not an error.
+        CHECK_NOTHROW(core.globals.hide_seed());
+        CHECK(core.globals.seed_hidden());
+    }
+    {
+        // Stored in the database, so it survives a restart.
+        Core core{path};
+        CHECK(core.globals.session_id_hex() == id);
+        CHECK(core.globals.seed_hidden());
+        CHECK_THROWS_AS(core.globals.seed_mnemonic(), seed_hidden_error);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("Globals: hide_seed needs an identity", "[core][globals]") {
+    TempCore c{defer_account{}};
+    REQUIRE_FALSE(c->globals.have_account());
+    CHECK_FALSE(c->globals.seed_hidden());
+
+    // A flag set now would apply to whichever account is created next.
+    CHECK_THROWS_AS(c->globals.hide_seed(), no_account);
+    CHECK_FALSE(c->globals.seed_hidden());
+
+    c->globals.create_account(await);
+    CHECK_FALSE(c->globals.seed_hidden());
+    CHECK_NOTHROW(c->globals.seed_mnemonic());
+}
+
+TEST_CASE("Globals: a hidden seed is per database, not per account", "[core][globals]") {
+    constexpr auto seed = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"_hex_b;
+
+    TempCore hidden{predefined_seed{seed}};
+    hidden->globals.hide_seed();
+    REQUIRE(hidden->globals.seed_hidden());
+
+    // The same account restored onto another database can still show its recovery password.
+    TempCore other{predefined_seed{seed}};
+    CHECK(other->globals.session_id_hex() == hidden->globals.session_id_hex());
+    CHECK_FALSE(other->globals.seed_hidden());
+    CHECK_NOTHROW(other->globals.seed_mnemonic());
+}

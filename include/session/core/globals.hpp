@@ -40,6 +40,15 @@ struct no_account : std::logic_error {
                     "restore_account() first"} {}
 };
 
+/// Thrown by Globals::seed_mnemonic() once Globals::hide_seed() has been called on this device.
+/// Check Globals::seed_hidden() first to avoid it.
+struct seed_hidden_error : std::logic_error {
+    seed_hidden_error() :
+            std::logic_error{
+                    "The recovery password has been hidden on this device and cannot be "
+                    "retrieved"} {}
+};
+
 class Globals final : detail::CoreComponent {
 
   private:
@@ -193,6 +202,10 @@ class Globals final : detail::CoreComponent {
     // Each of these needs an identity, so each throws no_account when there is not one yet.  That
     // is only reachable via defer_account; without it an account always exists by the time the
     // Core constructor returns.
+    //
+    // account_seed() works whether or not the seed is hidden (see hide_seed()), because libsession
+    // derives keys from it.  A client that exports the raw seed -- as hex for a QR code, say --
+    // must check seed_hidden() itself before doing so.
     AccountSeedAccess account_seed() {
         _require_account();
         auto acc = _account_seed.access();
@@ -221,10 +234,36 @@ class Globals final : detail::CoreComponent {
     /// If `force_24` is false (the default), returns 13 words when the upper 16 bytes of the
     /// seed are all zero (128-bit entropy), or 25 words otherwise.  If `force_24` is true,
     /// always returns 25 words.
+    ///
+    /// @throws seed_hidden_error once hide_seed() has been called on this device.
+    /// @throws no_account if there is no identity yet.
     mnemonics::secure_mnemonic seed_mnemonic(
             const mnemonics::Mnemonics& lang, bool force_24 = false);
     mnemonics::secure_mnemonic seed_mnemonic(
             std::string_view lang_name = "English", bool force_24 = false);
+
+    /// Permanently hides the account's recovery password on this device: from then on
+    /// seed_mnemonic() throws seed_hidden_error.  There is no way to undo it.
+    ///
+    /// The flag is stored in this device's database, so it survives restarts but is not synced:
+    /// the account's other devices, and this account restored onto a fresh database, are
+    /// unaffected.  Calling it again is harmless.
+    ///
+    /// Like `get` and `set`, safe to call from any thread, subject to have_account()'s rule on
+    /// reading the identity while create_account() or restore_account() is in flight.
+    ///
+    /// @throws no_account if there is no identity yet: there is nothing to hide, and a flag set now
+    /// would silently apply to whichever account is created later.
+    void hide_seed();
+
+    /// Whether hide_seed() has been called on this device.
+    ///
+    /// This only gates seed_mnemonic(): account_seed() keeps working, since libsession derives keys
+    /// from it, so a client exporting the raw seed in any other form must check this itself.
+    ///
+    /// Like `get` and `set`, safe to call from any thread: it reads the database on each call
+    /// rather than a cached value.
+    bool seed_hidden();
 };
 
 }  // namespace session::core
