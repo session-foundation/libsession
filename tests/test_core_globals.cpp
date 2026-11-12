@@ -6,6 +6,7 @@
 using namespace session;
 using namespace session::core;
 using namespace oxenc::literals;
+using namespace std::literals;
 
 TEST_CASE("Globals: set/get round-trip", "[core][globals]") {
     TempCore c{};
@@ -206,4 +207,55 @@ TEST_CASE("Globals: a hidden seed is per database, not per account", "[core][glo
     CHECK(other->globals.session_id_hex() == hidden->globals.session_id_hex());
     CHECK_FALSE(other->globals.seed_hidden());
     CHECK_NOTHROW(other->globals.seed_mnemonic());
+}
+
+TEST_CASE("Globals: libsession's own keys are refused by the public accessors", "[core][globals]") {
+    auto path = std::filesystem::temp_directory_path() /
+                fmt::format("{}.db", session::random::unique_id("test_reserved_keys", 7));
+    std::filesystem::remove(path);
+
+    std::string id;
+    {
+        Core core{path};
+        id = core.globals.session_id_hex();
+        core.globals.hide_seed();
+
+        // Neither the flag nor the seed can be read, changed or removed from outside, which would
+        // bring the recovery password back or hand the seed out in another form.
+        for (std::string_view key : {"_seed_hidden"sv, "_seed"sv}) {
+            CAPTURE(key);
+            CHECK_THROWS_AS(core.globals.set(key, int64_t{0}), std::invalid_argument);
+            CHECK_THROWS_AS(core.globals.set(key, 0.0), std::invalid_argument);
+            CHECK_THROWS_AS(core.globals.set(key, "false"sv), std::invalid_argument);
+            CHECK_THROWS_AS(
+                    core.globals.set(key, std::span<const std::byte>{}), std::invalid_argument);
+            CHECK_THROWS_AS(core.globals.erase(key), std::invalid_argument);
+            CHECK_THROWS_AS(core.globals.get_integer(key), std::invalid_argument);
+            CHECK_THROWS_AS(core.globals.get_real(key), std::invalid_argument);
+            CHECK_THROWS_AS(core.globals.get_text(key), std::invalid_argument);
+            CHECK_THROWS_AS(core.globals.get_blob(key), std::invalid_argument);
+            CHECK_THROWS_AS(core.globals.get_blob_secure(key), std::invalid_argument);
+            std::array<std::byte, 32> to{};
+            CHECK_THROWS_AS(core.globals.get_blob_to(key, to), std::invalid_argument);
+            CHECK_THROWS_AS(core.globals.get(key), std::invalid_argument);
+            CHECK_THROWS_AS(core.globals.get_secure(key), std::invalid_argument);
+        }
+        CHECK(core.globals.seed_hidden());
+        CHECK_THROWS_AS(core.globals.seed_mnemonic(), seed_hidden_error);
+
+        // Keys without the prefix are untouched.
+        CHECK_NOTHROW(core.globals.set("seed_hidden", int64_t{0}));
+        CHECK(core.globals.get_integer("seed_hidden") == 0);
+    }
+    {
+        // The seed was not erased, so the same account loads rather than a new one inheriting the
+        // flag; and the flag is still set.
+        Core core{path};
+        CHECK(core.globals.session_id_hex() == id);
+        CHECK(core.globals.seed_hidden());
+        CHECK_THROWS_AS(core.globals.seed_mnemonic(), seed_hidden_error);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
 }
