@@ -53,7 +53,6 @@ endmacro()
 
 add_libsession_util_library(util
     file.cpp
-    image/thumbhash.cpp
     logging.cpp
     util.cpp
 )
@@ -251,6 +250,36 @@ endif()
 # core's public headers expose network::Network and it constructs network::Request, so it
 # depends on the network target (defined after core above).
 target_link_libraries(core PUBLIC network)
+
+add_libsession_util_library(image
+    image/jpeg_encode.cpp
+    image/probe.cpp
+    image/source.cpp
+    image/thumbhash.cpp
+    image/vips.cpp
+)
+target_link_libraries(image
+    PUBLIC
+    # Source reads encrypted files with attachment::SeekableDecryptor.
+    crypto
+    PRIVATE
+    sessiondep::vips
+    sessiondep::libheif
+)
+if(APPLE)
+    # HEIC decodes through ImageIO, since we ship no HEVC decoder.
+    target_sources(image PRIVATE image/platform_apple.cpp)
+    target_link_libraries(image PRIVATE
+        "-framework ImageIO" "-framework CoreGraphics" "-framework CoreFoundation")
+else()
+    target_sources(image PRIVATE image/platform_none.cpp)
+endif()
+if(SESSION_ENABLE_JPEGLI)
+    # jpegli's include directory comes first and holds its own <jpeglib.h>, so no source in this
+    # library may use libjpeg(-turbo) directly; only libvips, compiled elsewhere, does.
+    target_link_libraries(image PRIVATE sessiondep::jpegli)
+    target_compile_definitions(image PRIVATE SESSION_ENABLE_JPEGLI)
+endif()
 
 if(WARNINGS_AS_ERRORS AND NOT USE_LTO AND CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION MATCHES "^11\\.")
     # GCC 11 has an overzealous (and false) stringop-overread warning, but only when LTO is off.

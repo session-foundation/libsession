@@ -67,6 +67,9 @@ struct MessagePreview {
 
     /// True if there is at least one attachment and every one of them is an image, so a row can say
     /// "3 images" where it would otherwise say "3 files".  False when there are none at all.
+    ///
+    /// "Image" means a content type Session displays as one (image::displayable_image_types), the
+    /// same rule as Message::gallery_viewable: an SVG or TIFF counts as a file.
     bool all_images = false;
 };
 
@@ -343,9 +346,9 @@ class Conversation {
     ///
     /// Progress fires as often as the transfer reports, which on a fast upload is often; coalescing
     /// is the caller's to do, since dropping intermediate values loses nothing.  Like the
-    /// `callbacks` handlers it runs on Core's event loop, so it must not block or throw — and note
-    /// it can fire before this function returns, so it must not depend on anything the caller sets
-    /// up afterwards.
+    /// `callbacks` handlers it is delivered through the Client's dispatcher, or run on Core's event
+    /// loop when there is none, so it must not block or throw — and note it can fire before this
+    /// function returns, so it must not depend on anything the caller sets up afterwards.
     ///
     /// The files are read at this point, not when they were attached, so they must still exist.
     /// Nothing about them is stored: what persists is the message, whose content names the uploaded

@@ -109,6 +109,11 @@ option(USE_LTO "Use Link-Time Optimization" ${use_lto_default})
 
 option(ENABLE_NETWORKING_SROUTER "Build with session-router networking support" ON)
 
+# jpegli produces standard JPEGs around 10-15% smaller than libjpeg-turbo at the same perceived
+# quality, and about as fast.  Off, libvips' own (libjpeg-turbo) encoder is used instead.  Either
+# way libjpeg-turbo does all JPEG decoding.
+option(SESSION_ENABLE_JPEGLI "Encode JPEGs with jpegli rather than libjpeg-turbo" ON)
+
 # Off by default: it adds ~1.8MB of database to the binary, and a client that already ships its own
 # geo data wants nothing to do with it.  With it off the lookup API still exists and reports every
 # address as unknown, so nothing needs an #ifdef.

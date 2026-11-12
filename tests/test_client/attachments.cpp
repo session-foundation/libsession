@@ -162,6 +162,126 @@ TEST_CASE("Client: a message reports the attachments it carries", "[client][send
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE(
+        "Client: an upload reports its start, progress and outcome through the dispatcher",
+        "[client][send][attachments][callbacks]") {
+    TempClient c;
+    attach_mock_network(c->core);
+
+    // Stands in for an application's loop, as the dispatcher test does: a report run on Core's
+    // loop instead of being handed over shows up as one that arrived before the jobs were run.
+    std::vector<std::function<void()>> queued;
+    c->set_dispatcher([&](std::function<void()> job) { queued.push_back(std::move(job)); });
+
+    auto dir = std::filesystem::temp_directory_path() / random::unique_id("test_upload", 7);
+    std::filesystem::create_directories(dir);
+    auto photo = dir / "photo.png";
+    std::ofstream{photo, std::ios::binary} << "not really a picture";
+
+    auto me = own_sid(*c);
+    TestHelper::seed_pfs_nak(c->core, me);
+
+    std::vector<std::tuple<size_t, int64_t, int64_t, std::optional<Expected<void>>>> reports;
+    c->send_message(
+            ConversationId::dm(me),
+            {.attachments = {OutgoingAttachment{.path = photo}}},
+            [&](size_t index, int64_t sent, int64_t total, std::optional<Expected<void>> result) {
+                reports.emplace_back(index, sent, total, std::move(result));
+            },
+            await);
+    sync(*c);
+
+    CHECK(reports.empty());
+    for (auto& job : queued)
+        job();
+
+    // Started, as a download starts, then the bytes, then done: in that order and nothing else.
+    REQUIRE(reports.size() == 3);
+    auto& [start_index, start_sent, start_total, start_result] = reports[0];
+    CHECK(start_index == 0);
+    CHECK(start_sent == 0);
+    CHECK(start_total == 0);
+    CHECK_FALSE(start_result.has_value());
+    auto& [progress_index, progress_sent, progress_total, progress_result] = reports[1];
+    CHECK(progress_index == 0);
+    CHECK(progress_total > 0);
+    CHECK(progress_sent == progress_total);
+    CHECK_FALSE(progress_result.has_value());
+    auto& [done_index, done_sent, done_total, done_result] = reports[2];
+    CHECK(done_index == 0);
+    REQUIRE(done_result.has_value());
+    CHECK(done_result->has_value());
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE(
+        "Client: a message's upload reports all reach the one handler it was given",
+        "[client][send][attachments][callbacks]") {
+    TempClient c;
+    attach_mock_network(c->core);
+
+    auto dir = std::filesystem::temp_directory_path() / random::unique_id("test_upload", 7);
+    std::filesystem::create_directories(dir);
+    auto first = dir / "first.png";
+    auto second = dir / "second.pdf";
+    std::ofstream{first, std::ios::binary} << "not really a picture";
+    std::ofstream{second, std::ios::binary} << "not really a document";
+
+    auto me = own_sid(*c);
+    TestHelper::seed_pfs_nak(c->core, me);
+
+    // State kept in the handler itself: a copy per role or per attachment would start counting
+    // again, so the counts come out 0, 1, 2... only if every report reached the same object.
+    std::vector<std::pair<size_t, int>> calls;
+    c->send_message(
+            ConversationId::dm(me),
+            {.attachments =
+                     {OutgoingAttachment{.path = first}, OutgoingAttachment{.path = second}}},
+            [&calls, count = 0](
+                    size_t index, int64_t, int64_t, std::optional<Expected<void>>) mutable {
+                calls.emplace_back(index, count++);
+            },
+            await);
+    sync(*c);
+
+    // Started, progress and done for each file, the first file's before the second's.
+    REQUIRE(calls.size() == 6);
+    for (size_t i = 0; i < calls.size(); i++) {
+        CHECK(calls[i].first == (i < 3 ? 0 : 1));
+        CHECK(calls[i].second == static_cast<int>(i));
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE(
+        "Client: a sending attachment's size is known before its upload starts",
+        "[client][send][attachments]") {
+    // No network attached, so nothing is uploaded: whatever size the message has came from the
+    // send itself.
+    TempClient c;
+
+    auto dir = std::filesystem::temp_directory_path() / random::unique_id("test_upload", 7);
+    std::filesystem::create_directories(dir);
+    auto doc = dir / "notes.pdf";
+    std::ofstream{doc, std::ios::binary} << std::string(1234, 'x');
+
+    auto me = own_sid(*c);
+    TestHelper::seed_pfs_nak(c->core, me);
+
+    auto id = c->send_message(
+            ConversationId::dm(me), {.attachments = {OutgoingAttachment{.path = doc}}}, await);
+
+    auto msg = c->message(id, await);
+    REQUIRE(msg.has_value());
+    REQUIRE(msg->attachments.size() == 1);
+    CHECK(msg->attachments[0].size == 1234);
+    CHECK_FALSE(msg->attachments[0].uploaded);
+
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("Client: an attachment carries a thumbhash in both directions", "[client][attachments]") {
     TempClient c;
     SenderKeys peer;
@@ -329,14 +449,20 @@ TEST_CASE(
     std::filesystem::create_directories(dir);
     auto dest = dir / "saved.bin";
 
+    // `calls` is counted in the handler itself, so it runs 0, 1, 2... only if every report reached
+    // the same object rather than a copy made for it.
     std::vector<AttachmentProgress> reports;
+    std::vector<int> calls;
     std::promise<std::optional<Error>> done;
     auto waiter = done.get_future();
     c->Client::save_attachment(
             msg_id,
             0,
             dest,
-            [&](const AttachmentProgress& p) { reports.push_back(p); },
+            [&reports, &calls, count = 0](const AttachmentProgress& p) mutable {
+                reports.push_back(p);
+                calls.push_back(count++);
+            },
             [&](auto r) {
                 done.set_value(r ? std::nullopt : std::optional{std::move(r).error()});
             });
@@ -370,6 +496,8 @@ TEST_CASE(
     CHECK(reports.front().done == 0);
     CHECK(reports.front().total == 0);
     CHECK(succeeded(reports.back().result));
+    for (size_t i = 0; i < calls.size(); i++)
+        CHECK(calls[i] == static_cast<int>(i));
     for (const auto& r : reports) {
         CHECK(r.message_id == msg_id);
         CHECK(r.index == 0);
@@ -1573,7 +1701,7 @@ TEST_CASE("Client: a conversation set to auto-download fetches on arrival", "[cl
     net->served["img"] = image_ct;
     net->served["doc"] = doc_ct;
 
-    auto arrive = [&](std::string hash, bool with_doc) {
+    auto arrive = [&](std::string hash, bool with_doc, std::string_view image_type = "image/png") {
         deliver(*c,
                 peer,
                 "",
@@ -1588,7 +1716,7 @@ TEST_CASE("Client: a conversation set to auto-download fetches on arrival", "[cl
                     a->set_key(std::string{
                             reinterpret_cast<const char*>(image_key.data()), image_key.size()});
                     a->set_size(image.size());
-                    a->set_contenttype("image/png");
+                    a->set_contenttype(std::string{image_type});
                     if (with_doc) {
                         auto* b = data.add_attachments();
                         b->set_id(2);
@@ -1621,6 +1749,13 @@ TEST_CASE("Client: a conversation set to auto-download fetches on arrival", "[cl
         auto m = c->conversation(convo, await)->messages(await)[0];
         CHECK_FALSE(m.gallery_viewable);
         CHECK_FALSE(m.gallery);
+    }
+
+    SECTION("images only leaves an image type we do not display") {
+        c->conversation(convo, await)->set_auto_download(AutoDownload::image_attachments, await);
+        arrive("h6", false, "image/svg+xml");
+        CHECK(net->downloads.empty());
+        CHECK_FALSE(c->conversation(convo, await)->messages(await)[0].gallery_viewable);
     }
 
     SECTION("all fetches both, and an all-image message opens as a gallery") {
@@ -2038,6 +2173,66 @@ TEST_CASE("Client: the list preview describes a message's attachments", "[client
     CHECK(w.body == "look at this");
     CHECK(w.filenames == std::vector<std::string>{"photo.png"});
     CHECK(w.all_images);
+}
+
+TEST_CASE("Client: only image types we display count as images", "[client][attachments]") {
+    // One conversation per content type, so each preview describes exactly one attachment.  The
+    // preview's flag comes from SQL and gallery_viewable from C++, and they must agree on every
+    // one.
+    const std::vector<std::pair<std::string_view, bool>> types{
+            {"image/png", true},
+            {"image/jpeg", true},
+            {"image/jpg", true},
+            {"image/webp", true},
+            {"image/gif", true},
+            {"image/avif", true},
+            // MIME types are case-insensitive.
+            {"IMAGE/PNG", true},
+            {"Image/WebP", true},
+            // Image types we will not decode, so not images as far as presentation goes.
+            {"image/svg+xml", false},
+            {"image/tiff", false},
+            {"image/bmp", false},
+            // Converted to JPEG before any Session client sends it; one arriving anyway is a file.
+            {"image/heic", false},
+            {"image/heif", false},
+    };
+
+    TempClient c;
+    std::vector<SenderKeys> senders(types.size());
+    uint64_t next_id = 700;
+    for (size_t i = 0; i < types.size(); i++) {
+        approve(*c, senders[i].session_id);
+        deliver(*c,
+                senders[i],
+                "",
+                from_epoch_ms(1000 + i),
+                "h{}"_format(i),
+                "",
+                std::nullopt,
+                [&](SessionProtos::DataMessage& data) {
+                    auto* a = data.add_attachments();
+                    a->set_id(next_id);
+                    a->set_url("http://fs.example/file/{}#d"_format(next_id++));
+                    a->set_key(std::string(32, 'k'));
+                    a->set_size(10);
+                    a->set_contenttype(std::string{types[i].first});
+                });
+    }
+    sync(*c);
+
+    auto convos = c->conversations(await);
+    REQUIRE(convos.size() == types.size());
+    for (size_t i = 0; i < types.size(); i++) {
+        auto [type, image] = types[i];
+        INFO(type);
+        auto id = ConversationId::dm(senders[i].session_id);
+        auto found = std::ranges::find_if(convos, [&](const auto& c) { return c.id() == id; });
+        REQUIRE(found != convos.end());
+        REQUIRE(found->last_preview());
+        CHECK(found->last_preview()->all_images == image);
+        CHECK(c->conversation(id, await)->messages(await)[0].gallery_viewable == image);
+    }
 }
 
 TEST_CASE("Client: a text-only message previews no attachments", "[client][attachments]") {

@@ -1221,10 +1221,16 @@ class Client {
             const OutgoingMessage& msg,
             Conversation::upload_progress on_upload);
 
+    // A send's upload handler as the chain below carries it: made once where the send or retry
+    // begins, then shared by every lambda that reports, so a report copies a pointer rather than
+    // the callable, and the whole message talks to the one callable it was given -- state in it is
+    // never split across copies by role or by attachment.  Null for a send with no handler.
+    using upload_handler = std::shared_ptr<const Conversation::upload_progress>;
+
     // Uploads the message's first attachment that has no url yet and, when there are none left,
     // finishes the send.  Each upload's completion calls this again, so the chain runs one file at
     // a time and resumes wherever it was left -- which is also what a retry does.
-    void _upload_next(int64_t client_id, Conversation::upload_progress on_upload);
+    void _upload_next(int64_t client_id, upload_handler on_upload);
 
     // The rest of `_upload_next`, once the disk loop has looked at the file: uploads attachment
     // `index` from `path`, or fails the message for good if `file_size` says the file is gone.
@@ -1233,7 +1239,7 @@ class Client {
             size_t index,
             std::string path,
             std::optional<int64_t> file_size,
-            Conversation::upload_progress on_upload);
+            upload_handler on_upload);
 
     // Rebuilds the message's content with its now-uploaded attachments named in it, replaces what
     // was stored, and dispatches it.  Rebuilt from the database rather than from what send_message
@@ -1255,6 +1261,12 @@ class Client {
     // binds that in first and hands the result here; what is shared is the hop and the emptiness,
     // not what the numbers are about.
     transfer_progress _dispatch_progress(transfer_progress cb);
+
+    // The same for a send's or a retry's upload handler, wrapped once where the send begins so that
+    // every report -- started, progress, failed, done -- leaves through the dispatcher as a
+    // download's do.  Called only on Core's loop, which is where `_dispatch_out` reads the
+    // dispatcher.  Null when given an empty handler.
+    upload_handler _dispatch_upload(Conversation::upload_progress cb);
 
     // The same for a caller following one attachment, with its identity filled in before the hop:
     // the download reports only numbers, and which attachment they are about is this layer's to
