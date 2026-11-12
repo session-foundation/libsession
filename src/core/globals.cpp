@@ -236,8 +236,22 @@ void Globals::_restore_account(const predefined_seed& seed) {
     tx.commit();
 }
 
+// Set, never cleared, by hide_seed().
+static constexpr auto seed_hidden_key = "_seed_hidden"sv;
+
+void Globals::hide_seed() {
+    _require_account();
+    set(seed_hidden_key, int64_t{1});
+}
+
+bool Globals::seed_hidden() {
+    return get_integer(seed_hidden_key).value_or(0) != 0;
+}
+
 mnemonics::secure_mnemonic Globals::seed_mnemonic(const mnemonics::Mnemonics& lang, bool force_24) {
     _require_account();
+    if (seed_hidden())
+        throw seed_hidden_error{};
     auto seed = _account_seed.access();
     // _account_seed stores the 96-byte key material; the first 32 bytes are the account seed.
     // A Session account uses 128-bit entropy when the last 16 bytes of that seed are all zero;
