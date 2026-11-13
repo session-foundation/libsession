@@ -1,10 +1,12 @@
 #include <fcntl.h>
+#include <session/network/session_network.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
+#include <cstring>
 #include <future>
 #include <session/network/session_network_types.hpp>
 #include <session/network/transport/quic_transport.hpp>
@@ -152,4 +154,37 @@ TEST_CASE("Network", "[network][quic_transport][resume]") {
     auto answer = error_code.get_future();
     REQUIRE(answer.wait_for(10s) == std::future_status::ready);
     CHECK(answer.get().has_value());
+}
+
+TEST_CASE("Network", "[network][c_api][resume]") {
+    // Devnet with a local seed node keeps the network's own startup requests off the internet
+    network_service_node seed{};
+    std::strcpy(
+            seed.ed25519_pubkey_hex,
+            "4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7");
+    seed.ip[0] = 127;
+    seed.ip[3] = 1;
+    seed.https_port = 20001;
+    seed.omq_port = 30001;
+    seed.version[0] = 2;
+    seed.version[1] = 11;
+
+    auto config = session_network_config_default();
+    config.netid = SESSION_NETWORK_DEVNET;
+    config.router = SESSION_NETWORK_ROUTER_DIRECT;
+    config.devnet_seed_nodes = &seed;
+    config.devnet_seed_nodes_size = 1;
+
+    network_object* network = nullptr;
+    char error[256] = {};
+    REQUIRE(session_network_init(&network, &config, error));
+
+    session_network_suspend(network);
+    {
+        exhausted_file_descriptors no_fds;
+        REQUIRE(exhausted_file_descriptors::socket_fails());
+        CHECK_NOTHROW(session_network_resume(network, false));
+    }
+
+    session_network_free(network);
 }
