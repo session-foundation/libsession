@@ -8,6 +8,8 @@
 #include <oxen/quic/gnutls_crypto.hpp>
 #include <oxen/quic/opt.hpp>
 #include <oxen/quic/result.hpp>
+#include <string>
+#include <system_error>
 
 #include "session/crypto/ed25519.hpp"
 #include "session/network/session_network_types.hpp"
@@ -24,6 +26,14 @@ namespace {
     inline auto cat = log::Cat("quic-transport");
 
     static constexpr uint16_t ACTIVE_STREAM_PRUNE_LIMIT = 32;
+
+    // The errno is what says why a socket couldn't be opened, and a system_error's message
+    // doesn't always make it recoverable
+    std::string describe(const std::exception& e) {
+        if (const auto* se = dynamic_cast<const std::system_error*>(&e))
+            return "{} (errno {})"_format(se->what(), se->code().value());
+        return e.what();
+    }
 
     inline bool use_reserved_stream(RequestCategory category) {
         switch (category) {
@@ -79,8 +89,21 @@ void QuicTransport::resume(bool /*automatically_reconnect*/) {
     // Use 'call_get' to force this to be synchronous
     _jq.call_get([this] {
         // Recreate the endpoint before updating the `_suspended` flag to avoid the chance that
-        // something will try to use it before we are ready
-        _recreate_endpoint();
+        // something will try to use it before we are ready.
+        //
+        // Opening its socket can fail, and an exception from here would escape `Network::resume`
+        // before the router resumes, into an app coming back to the foreground (on iOS it
+        // terminated the app).  Left without an endpoint, the transport creates one on its next
+        // connection attempt.
+        try {
+            _recreate_endpoint();
+        } catch (const std::exception& e) {
+            log::error(
+                    cat,
+                    "Unable to recreate the endpoint on resume, will retry on the next "
+                    "connection: {}",
+                    describe(e));
+        }
         _suspended = false;
         log::info(cat, "Resumed.");
     });
@@ -305,7 +328,7 @@ void QuicTransport::_establish_connection(
         if (_suspended)
             throw std::runtime_error{"QuickTransport is suspended"};
         if (!_endpoint)
-            throw std::runtime_error{"Network is invalid"};
+            _recreate_endpoint();
 
         auto [conn_pk, conn_sk] = ed25519::keypair();
         auto creds = quic::GNUTLSCreds::make_from_ed_seckey(to_string_view(conn_sk));
@@ -422,7 +445,7 @@ void QuicTransport::_establish_connection(
                             conn.reference_id());
                 });
     } catch (const std::exception& e) {
-        _fail_connection(address_pubkey_hex, initiating_req_id, std::nullopt, e.what());
+        _fail_connection(address_pubkey_hex, initiating_req_id, std::nullopt, describe(e));
     }
 }
 
