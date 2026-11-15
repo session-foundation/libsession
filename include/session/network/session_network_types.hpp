@@ -351,4 +351,41 @@ struct PathInfo {
     std::vector<PathHop> hops;
 };
 
+/// How a path has been doing, from the pings the router sends along it.  Every figure is for the
+/// whole path, out to its far end and back: the router does not time individual hops.
+struct PathPerformance {
+    /// Mean round trip of the path's pings.  Zero until the first one is answered.
+    std::chrono::milliseconds latency{0};
+
+    /// Mean difference between consecutive round trips.  Zero until two pings have been answered.
+    std::chrono::microseconds jitter{0};
+
+    /// Pings answered and pings that timed out, over the life of the path.
+    int ping_responses = 0;
+    int ping_timeouts = 0;
+
+    /// The latest the path can stay in use.  The router replaces paths well before this, so it
+    /// bounds the path's life rather than predicting when it will change.
+    std::chrono::sys_time<std::chrono::milliseconds> expiry{};
+};
+
+/// A path the router is holding open, and what has been sent along it: for a screen showing every
+/// route a client has, rather than the one to a given node (`get_path_to`).
+struct OpenPath {
+    /// Who the path's session is with.  For a storage node this is the path's last hop; for a
+    /// client (`remote_is_client`), such as the file server, it lies beyond the last hop.
+    ed25519_pubkey remote;
+    bool remote_is_client = false;
+
+    PathInfo path;
+    PathPerformance performance;
+
+    /// Requests sent to `remote` since the router started, and how many of them it was asked to
+    /// pass on to a server outside the network (a community, or the file server's web interface).
+    /// Totals rather than rates, so that a caller sampling them can take the difference between two
+    /// samples; they survive the path being replaced, because they belong to the remote.
+    uint64_t requests_sent = 0;
+    uint64_t proxied_requests_sent = 0;
+};
+
 }  // namespace session::network

@@ -139,6 +139,8 @@ class Network {
     /// The route traffic to `node` is taking right now, for showing a user where it goes.  A
     /// snapshot rather than a commitment; see IRouter::get_path_to.
     std::optional<PathInfo> get_path_to(const service_node& node);
+    /// Every path the router is holding open; see IRouter::get_open_paths.
+    std::vector<OpenPath> get_open_paths();
 
     /// API: network/get_swarm
     ///

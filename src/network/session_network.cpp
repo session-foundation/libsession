@@ -454,6 +454,13 @@ std::optional<PathInfo> Network::get_path_to(const service_node& node) {
     return std::nullopt;
 }
 
+std::vector<OpenPath> Network::get_open_paths() {
+    if (_router)
+        return _router->get_open_paths();
+
+    return {};
+}
+
 void Network::get_swarm(
         session::network::x25519_pubkey swarm_pubkey,
         bool ignore_strike_count,
