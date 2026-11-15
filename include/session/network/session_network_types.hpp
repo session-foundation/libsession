@@ -377,6 +377,11 @@ struct OpenPath {
     ed25519_pubkey remote;
     bool remote_is_client = false;
 
+    /// A path the router holds ready for `remote` but sends nothing along: each session keeps a
+    /// spare, so it can switch without waiting for a build.  A remote has one path that is not
+    /// standby, and the request counts are on that one; a standby path's are zero.
+    bool standby = false;
+
     PathInfo path;
     PathPerformance performance;
 

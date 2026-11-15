@@ -294,21 +294,28 @@ std::vector<OpenPath> SessionRouter::get_open_paths() {
                 continue;
             }
 
-            OpenPath& open = paths.emplace_back();
-            open.remote = *remote;
-            open.remote_is_client = session.remote.ends_with(".sesh");
-            open.path = hops_of(session.path);
-            open.performance = {
-                    session.path.latency,
-                    session.path.jitter,
-                    session.path.ping_responses,
-                    session.path.ping_timeouts,
-                    session.path.expiry};
+            auto add = [&](const session::router::path_info& info, bool standby) -> OpenPath& {
+                OpenPath& open = paths.emplace_back();
+                open.remote = *remote;
+                open.remote_is_client = session.remote.ends_with(".sesh");
+                open.standby = standby;
+                open.path = hops_of(info);
+                open.performance = {
+                        info.latency,
+                        info.jitter,
+                        info.ping_responses,
+                        info.ping_timeouts,
+                        info.expiry};
+                return open;
+            };
 
+            OpenPath& current = add(session.path, false);
             if (auto it = _request_counts.find(*remote); it != _request_counts.end()) {
-                open.requests_sent = it->second.sent;
-                open.proxied_requests_sent = it->second.proxied;
+                current.requests_sent = it->second.sent;
+                current.proxied_requests_sent = it->second.proxied;
             }
+            for (const auto& info : session.standby)
+                add(info, true);
         }
 
         return paths;
