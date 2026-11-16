@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <session/network/snode_pool.hpp>
 
@@ -286,6 +287,10 @@ TEST_CASE("Network", "[network][update_cache]") {
     // Should have stored the nodes by the time it returns
     snode_pool->update_cache(snode_cache);
     CHECK(snode_pool->size() == snode_cache.size());
+
+    // And hand back a copy of every one of them, in whatever order the cache keeps
+    auto nodes = snode_pool->nodes();
+    CHECK(std::ranges::is_permutation(nodes, snode_cache));
 }
 
 TEST_CASE("Network", "[network][refresh_min_cache_size]") {

@@ -74,6 +74,9 @@ class SnodePool : public std::enable_shared_from_this<SnodePool> {
     // Returns the number of nodes currently in the pool
     size_t size();
 
+    // Returns a copy of every node currently in the pool; empty until it is first populated
+    std::vector<service_node> nodes();
+
     // Forcibly clears the cache from memory and disk
     void clear_cache();
 
