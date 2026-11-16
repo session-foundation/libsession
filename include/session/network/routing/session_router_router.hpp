@@ -67,8 +67,13 @@ class SessionRouter : public IRouter, public std::enable_shared_from_this<Sessio
     struct RequestCounts {
         uint64_t sent = 0;
         uint64_t proxied = 0;
+        /// When the last request was sent to it; set with `sent`, never by `proxied` alone.
+        std::chrono::steady_clock::time_point last_sent{};
     };
     std::unordered_map<ed25519_pubkey, RequestCounts> _request_counts;
+
+    /// Counts one request sent to `remote` and notes when.  On the loop, as every count is.
+    void _count_request(const ed25519_pubkey& remote);
 
     /// This router's own jobs, rather than the loop's shared queue, so that ~SessionRouter can take
     /// them away from the loop before anything is torn down: `stop()` waits out whatever is running

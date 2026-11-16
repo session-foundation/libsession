@@ -391,6 +391,11 @@ struct OpenPath {
     /// samples; they survive the path being replaced, because they belong to the remote.
     uint64_t requests_sent = 0;
     uint64_t proxied_requests_sent = 0;
+
+    /// How long ago the last of `requests_sent` went, so a caller can tell which paths are in use
+    /// from one sample rather than by waiting for the totals to move.  Empty on a standby path and
+    /// for a remote nothing has been sent to.
+    std::optional<std::chrono::milliseconds> since_last_request;
 };
 
 }  // namespace session::network
