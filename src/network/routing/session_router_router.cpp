@@ -455,6 +455,7 @@ void SessionRouter::_start_file_upload(
                     if (!pubkey)
                         return nullptr;
 
+                    _count_request(*pubkey);
                     return &_get_file_client(
                             *pubkey, "::1", held.tunnel->local_port, TUNNELED_QUIC_MAX_UDP_PAYLOAD);
                 });
