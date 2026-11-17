@@ -1,12 +1,55 @@
+#include <fcntl.h>
+#include <session/network/session_network.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
+#include <cstring>
 #include <future>
 #include <session/network/session_network_types.hpp>
 #include <session/network/transport/quic_transport.hpp>
+#include <vector>
 
 using namespace session::network;
 using namespace std::literals;
 
 namespace {
+// Takes every file descriptor the process may open, under a lowered limit, so that the next
+// socket() fails with EMFILE - a real failure of the endpoint's own socket setup, rather than an
+// injected one.  The descriptors and the limit are given back on destruction.
+class exhausted_file_descriptors {
+    rlimit _original{};
+    std::vector<int> _fds;
+
+  public:
+    exhausted_file_descriptors() {
+        getrlimit(RLIMIT_NOFILE, &_original);
+        auto lowered = _original;
+        lowered.rlim_cur = std::min<rlim_t>(_original.rlim_cur, 1024);
+        setrlimit(RLIMIT_NOFILE, &lowered);
+
+        for (int fd; (fd = ::open("/dev/null", O_RDONLY)) >= 0;)
+            _fds.push_back(fd);
+    }
+
+    ~exhausted_file_descriptors() {
+        for (int fd : _fds)
+            ::close(fd);
+        setrlimit(RLIMIT_NOFILE, &_original);
+    }
+
+    // Whether a socket can't be opened, which is what the tests below rely on
+    static bool socket_fails() {
+        int sock = ::socket(AF_INET6, SOCK_DGRAM, 0);
+        if (sock < 0)
+            return true;
+        ::close(sock);
+        return false;
+    }
+};
+
 std::shared_ptr<QuicTransport> make_transport(std::shared_ptr<oxen::quic::Loop> loop) {
     return std::make_shared<QuicTransport>(
             config::QuicTransport{
@@ -80,4 +123,68 @@ TEST_CASE("Network", "[network][quic_transport][close_connections]") {
     CHECK(answers == 1);
     CHECK_FALSE(success);
     CHECK_FALSE(error_code);
+}
+
+TEST_CASE("Network", "[network][quic_transport][resume]") {
+    auto loop = std::make_shared<oxen::quic::Loop>();
+    auto transport = make_transport(loop);
+    transport->suspend();
+
+    {
+        exhausted_file_descriptors no_fds;
+        REQUIRE(exhausted_file_descriptors::socket_fails());
+
+        // Throwing here would reach the C API's caller, which can't catch it
+        CHECK_NOTHROW(transport->resume(true));
+    }
+
+    // Once sockets can be opened again a connection attempt rebuilds the endpoint, so it is made
+    // and times out with an error code; without an endpoint it would fail at once with none
+    std::promise<std::optional<uint64_t>> error_code;
+    transport->verify_connectivity(
+            test_node(),
+            3s,
+            "AAAA",
+            RequestCategory::standard,
+            [&error_code, answered = false](bool, std::optional<uint64_t> e) mutable {
+                if (!std::exchange(answered, true))
+                    error_code.set_value(e);
+            });
+
+    auto answer = error_code.get_future();
+    REQUIRE(answer.wait_for(10s) == std::future_status::ready);
+    CHECK(answer.get().has_value());
+}
+
+TEST_CASE("Network", "[network][c_api][resume]") {
+    // Devnet with a local seed node keeps the network's own startup requests off the internet
+    network_service_node seed{};
+    std::strcpy(
+            seed.ed25519_pubkey_hex,
+            "4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7");
+    seed.ip[0] = 127;
+    seed.ip[3] = 1;
+    seed.https_port = 20001;
+    seed.omq_port = 30001;
+    seed.version[0] = 2;
+    seed.version[1] = 11;
+
+    auto config = session_network_config_default();
+    config.netid = SESSION_NETWORK_DEVNET;
+    config.router = SESSION_NETWORK_ROUTER_DIRECT;
+    config.devnet_seed_nodes = &seed;
+    config.devnet_seed_nodes_size = 1;
+
+    network_object* network = nullptr;
+    char error[256] = {};
+    REQUIRE(session_network_init(&network, &config, error));
+
+    session_network_suspend(network);
+    {
+        exhausted_file_descriptors no_fds;
+        REQUIRE(exhausted_file_descriptors::socket_fails());
+        CHECK_NOTHROW(session_network_resume(network, false));
+    }
+
+    session_network_free(network);
 }

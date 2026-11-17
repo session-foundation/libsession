@@ -9,6 +9,7 @@
 #include <oxen/log/format.hpp>
 #include <oxen/log/level.hpp>
 #include <ranges>
+#include <string_view>
 #include <vector>
 
 #include "session/blinding.hpp"
@@ -1258,6 +1259,18 @@ inline bool set_error(char* error, const std::exception& e) {
     return false;
 }
 
+// For the entry points that block on the network's loop: whatever the loop job throws is rethrown
+// in the caller, and callers of the C API (Swift, JNI) generally can't catch a C++ exception, so
+// one escaping terminates the app.
+template <typename F>
+void without_throwing(std::string_view action, F&& f) {
+    try {
+        f();
+    } catch (const std::exception& e) {
+        log::error(cat, "Failed to {}: {}", action, e.what());
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -1583,20 +1596,22 @@ LIBSESSION_C_API void session_request_params_free(session_request_params* params
 }
 
 LIBSESSION_C_API void session_network_suspend(network_object* network) {
-    unbox(network)->suspend();
+    without_throwing("suspend the network", [&] { unbox(network)->suspend(); });
 }
 
 LIBSESSION_C_API void session_network_resume(
         network_object* network, bool automatically_reconnect) {
-    unbox(network)->resume(automatically_reconnect);
+    without_throwing(
+            "resume the network", [&] { unbox(network)->resume(automatically_reconnect); });
 }
 
 LIBSESSION_C_API void session_network_close_connections(network_object* network) {
-    unbox(network)->close_connections();
+    without_throwing(
+            "close the network's connections", [&] { unbox(network)->close_connections(); });
 }
 
 LIBSESSION_C_API void session_network_clear_cache(network_object* network) {
-    unbox(network)->clear_cache();
+    without_throwing("clear the network's cache", [&] { unbox(network)->clear_cache(); });
 }
 
 LIBSESSION_C_API bool session_network_has_retrieved_time_offset(network_object* network) {

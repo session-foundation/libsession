@@ -17,7 +17,7 @@ if(CCACHE_PROGRAM)
 endif()
 
 project(libsession-util
-    VERSION 1.9.5
+    VERSION 1.9.6
     DESCRIPTION "Session client utility library"
     LANGUAGES ${LANGS})
 
