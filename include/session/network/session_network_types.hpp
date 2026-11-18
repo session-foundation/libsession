@@ -396,6 +396,17 @@ struct OpenPath {
     /// from one sample rather than by waiting for the totals to move.  Empty on a standby path and
     /// for a remote nothing has been sent to.
     std::optional<std::chrono::milliseconds> since_last_request;
+
+    /// Set on an `onion_requests` path, which is built before any destination is chosen and
+    /// carries requests to all of them: the kind of request it carries.  Such a path has no
+    /// `remote` (it is left zero), its last hop is a relay that forwards to whatever each request
+    /// names, its counts are its own and start again when it is replaced, and its performance is
+    /// taken from its requests' round trips, there being no pings.
+    std::optional<PathCategory> any_destination;
+
+    /// The router's name for the path, unique while the router runs: what tells one
+    /// `onion_requests` path from the next.  Empty where `remote` names it.
+    std::string id;
 };
 
 }  // namespace session::network
