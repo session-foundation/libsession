@@ -61,6 +61,20 @@ class SessionRouter : public IRouter, public std::enable_shared_from_this<Sessio
     std::unordered_map<std::string, std::pair<UploadRequest, std::thread>> _active_uploads;
     std::unordered_map<std::string, DownloadRequest> _active_downloads;
 
+    /// Requests sent to each remote, for `get_open_paths`.
+    /// Never pruned: a client talks to a bounded set of nodes, and a total that went back to zero
+    /// when a tunnel was replaced would read as requests going missing.
+    struct RequestCounts {
+        uint64_t sent = 0;
+        uint64_t proxied = 0;
+        /// When the last request was sent to it; set with `sent`, never by `proxied` alone.
+        std::chrono::steady_clock::time_point last_sent{};
+    };
+    std::unordered_map<ed25519_pubkey, RequestCounts> _request_counts;
+
+    /// Counts one request sent to `remote` and notes when.  On the loop, as every count is.
+    void _count_request(const ed25519_pubkey& remote);
+
     /// This router's own jobs, rather than the loop's shared queue, so that ~SessionRouter can take
     /// them away from the loop before anything is torn down: `stop()` waits out whatever is running
     /// and cancels the rest.  That is what lets the jobs capture `this` bare.
@@ -83,6 +97,7 @@ class SessionRouter : public IRouter, public std::enable_shared_from_this<Sessio
 
     ConnectionStatus get_status() const override { return _status.load(); };
     std::optional<PathInfo> get_path_to(const service_node& node) override;
+    std::vector<OpenPath> get_open_paths() override;
     void send_request(Request request, network_response_callback_t callback) override;
     void upload(UploadRequest request) override;  // deprecated: use upload_file()
     void upload_file(FileUploadRequest request, std::span<const std::byte> seed) override;

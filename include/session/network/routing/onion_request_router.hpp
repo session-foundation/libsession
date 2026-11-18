@@ -81,6 +81,24 @@ struct OnionPath {
     uint16_t strike_count = 0;
     bool rotation_in_progress = false;
 
+    /// What has gone along this path, for `get_open_paths`.  The path's own rather than a
+    /// destination's, since an onion path carries requests to every destination: a replacement
+    /// starts again from zero.
+    uint64_t requests_sent = 0;
+    uint64_t proxied_requests_sent = 0;
+    std::optional<std::chrono::steady_clock::time_point> last_request_at;
+
+    /// How its requests' round trips have gone: the router sends no pings, so these stand in for
+    /// them.  A round trip includes the destination's own time to answer.  There is no jitter:
+    /// consecutive requests differ in kind, size and destination, so the difference between their
+    /// round trips is mostly that, not the network.
+    std::chrono::milliseconds mean_round_trip{0};
+    int responses = 0;
+    int timeouts = 0;
+
+    /// Folds in one request's outcome: answered after `round_trip`, or timed out.
+    void record_round_trip(std::optional<std::chrono::steady_clock::duration> round_trip);
+
     std::string to_string() const;
 };
 
@@ -181,6 +199,7 @@ class OnionRequestRouter : public IRouter, public std::enable_shared_from_this<O
 
     ConnectionStatus get_status() const override { return _status.load(); };
     std::optional<PathInfo> get_path_to(const service_node& node) override;
+    std::vector<OpenPath> get_open_paths() override;
     std::vector<service_node> get_all_used_nodes() override;
     void send_request(Request request, network_response_callback_t callback) override;
     void upload(UploadRequest request) override;  // deprecated: use upload_file()
@@ -255,6 +274,8 @@ class OnionRequestRouter : public IRouter, public std::enable_shared_from_this<O
             network_response_callback_t callback);
 
     void _decrement_and_cleanup_path(const std::string& path_id, PathCategory category);
+    /// The live path `path_id`, or one retiring with requests still on it; null once it is gone.
+    OnionPath* _path_by_id(const std::string& path_id, PathCategory category);
     void _handle_path_failure(
             const std::string& path_id,
             const PathCategory& category,

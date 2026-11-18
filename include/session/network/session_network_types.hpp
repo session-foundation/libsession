@@ -351,4 +351,63 @@ struct PathInfo {
     std::vector<PathHop> hops;
 };
 
+/// How a path has been doing, from the pings the router sends along it.  Every figure is for the
+/// whole path, out to its far end and back: the router does not time individual hops.
+struct PathPerformance {
+    /// Mean round trip of the path's pings.  Zero until the first one is answered.
+    std::chrono::milliseconds latency{0};
+
+    /// Mean difference between consecutive round trips.  Zero until two pings have been answered.
+    std::chrono::microseconds jitter{0};
+
+    /// Pings answered and pings that timed out, over the life of the path.
+    int ping_responses = 0;
+    int ping_timeouts = 0;
+
+    /// The latest the path can stay in use.  The router replaces paths well before this, so it
+    /// bounds the path's life rather than predicting when it will change.
+    std::chrono::sys_time<std::chrono::milliseconds> expiry{};
+};
+
+/// A path the router is holding open, and what has been sent along it: for a screen showing every
+/// route a client has, rather than the one to a given node (`get_path_to`).
+struct OpenPath {
+    /// Who the path's session is with.  For a storage node this is the path's last hop; for a
+    /// client (`remote_is_client`), such as the file server, it lies beyond the last hop.
+    ed25519_pubkey remote;
+    bool remote_is_client = false;
+
+    /// A path the router holds ready for `remote` but sends nothing along: each session keeps a
+    /// spare, so it can switch without waiting for a build.  A remote has one path that is not
+    /// standby, and the request counts are on that one; a standby path's are zero.
+    bool standby = false;
+
+    PathInfo path;
+    PathPerformance performance;
+
+    /// Requests sent to `remote` since the router started, and how many of them it was asked to
+    /// pass on to a server outside the network (a community, or the file server's web interface).
+    /// Totals rather than rates, so that a caller sampling them can take the difference between two
+    /// samples; they survive the path being replaced, because they belong to the remote.
+    uint64_t requests_sent = 0;
+    uint64_t proxied_requests_sent = 0;
+
+    /// How long ago the last of `requests_sent` went, so a caller can tell which paths are in use
+    /// from one sample rather than by waiting for the totals to move.  Empty on a standby path and
+    /// for a remote nothing has been sent to.
+    std::optional<std::chrono::milliseconds> since_last_request;
+
+    /// Set on an `onion_requests` path, which is built before any destination is chosen and
+    /// carries requests to all of them: the kind of request it carries.  Such a path has no
+    /// `remote` (it is left zero), its last hop is a relay that forwards to whatever each request
+    /// names, its counts are its own and start again when it is replaced, and its latency is its
+    /// requests' round trips, there being no pings: file transfers left out, so a `file` path's
+    /// stays zero, and no jitter at all, as requests that differ in kind and size give none.
+    std::optional<PathCategory> any_destination;
+
+    /// The router's name for the path, unique while the router runs: what tells one
+    /// `onion_requests` path from the next.  Empty where `remote` names it.
+    std::string id;
+};
+
 }  // namespace session::network

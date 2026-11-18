@@ -63,6 +63,16 @@ class TestOnionRequestRouter {
         router->_build_path(category, initiating_req_id, nodes_to_exclude_, original_path_id);
     }
 
+    static void send_on_path(
+            std::shared_ptr<OnionRequestRouter> router,
+            PathCategory category,
+            const std::string& path_id,
+            Request request) {
+        for (auto& path : router->_paths[category])
+            if (path.id == path_id)
+                router->_send_on_path(path, std::move(request), [](auto&&...) {});
+    }
+
     static OnionPath* find_valid_path(
             std::shared_ptr<OnionRequestRouter> router, const Request& request) {
         return router->_find_valid_path(request);
@@ -208,8 +218,12 @@ namespace {
             func_called("remove_failure_listeners");
         }
 
-        void send_request(Request, network_response_callback_t) override {
+        /// What each request sent was to be answered through, so a test can answer it.
+        std::vector<network_response_callback_t> sent_callbacks;
+
+        void send_request(Request, network_response_callback_t callback) override {
             func_called("send_request");
+            sent_callbacks.push_back(std::move(callback));
         }
     };
 
@@ -693,6 +707,135 @@ TEST_CASE("Network", "[network][onion_request_router][find_valid_path]") {
     router = std::make_shared<OnionRequestRouter>(config, *loop, *disk_loop, snode_pool, transport);
     TestOnionRequestRouter::set_paths(router, PathCategory::standard, {path1});
     CHECK(TestOnionRequestRouter::find_valid_path(router, request) != nullptr);
+}
+
+TEST_CASE("Network", "[network][onion_request_router][record_round_trip]") {
+    OnionPath path{"Test", {}};
+
+    // Timing out counts against the path without moving its figures
+    path.record_round_trip(std::nullopt);
+    CHECK(path.timeouts == 1);
+    CHECK(path.responses == 0);
+    CHECK(path.mean_round_trip == 0ms);
+
+    // The first answer is the mean, and each after it counts the same
+    path.record_round_trip(100ms);
+    CHECK(path.mean_round_trip == 100ms);
+    path.record_round_trip(140ms);
+    path.record_round_trip(120ms);
+    CHECK(path.responses == 3);
+    CHECK(path.mean_round_trip == 120ms);
+}
+
+TEST_CASE("Network", "[network][onion_request_router][get_open_paths]") {
+    config::SnodePool pool_config = {
+            .cache_directory = std::nullopt,
+            .fallback_snode_pool_path = std::nullopt,
+            .cache_expiration = std::chrono::minutes{5},
+            .cache_min_lifetime = std::chrono::minutes{5},
+            .enforce_subnet_diversity = false,
+            .retry_delay = network::opt::retry_delay{50ms, 200ms},
+            .netid = opt::netid::Target::testnet,
+            .seed_nodes = {},
+            .cache_min_size = 0,
+            .cache_min_swarm_size = 0,
+            .cache_num_nodes_to_use_for_refresh = 3,
+            .cache_min_num_refresh_presence_to_include_node = 2,
+            .cache_node_strike_threshold = 3};
+    config::OnionRequestRouter config = {
+            file_server::DEFAULT_CONFIG,
+            std::nullopt,
+            std::chrono::days{10},
+            opt::netid::Target::testnet,
+            {},
+            network::opt::retry_delay{50ms, 200ms},
+            3,
+            3,
+            10,
+            10min,
+            3,
+            true,
+            false,
+            {{PathCategory::standard, 2}, {PathCategory::file, 1}}};
+    auto node = [](std::string_view hex, uint16_t port) {
+        return service_node{
+                ed25519_pubkey::from_hex(hex),
+                oxen::quic::ipv4{"127.0.0.1"},
+                port,
+                static_cast<uint16_t>(port + 10000),
+                {2, 11, 0},
+                0};
+    };
+    auto a = node("4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7", 20001);
+    auto b = node("5ea34e72bb044654a6a23675690ef5ffaaf1656b02f93fb76655f9cbdbe89876", 20002);
+    auto c = node("e17a692033200ae41350df9709754edde7343e2cf2f23e88f993319e0720e5e5", 20003);
+    auto d = node("7b633fa6fb462b90db6f0f50384190ce7715e31b7aa93d87dbd7e94e33d4251f", 20004);
+
+    auto loop = std::make_shared<oxen::quic::Loop>();
+    auto disk_loop = std::make_shared<oxen::quic::Loop>();
+    auto snode_pool = std::make_shared<TestSnodePool>(pool_config, *loop, *disk_loop);
+    auto transport = std::make_shared<TestTransport>();
+    auto router =
+            std::make_shared<OnionRequestRouter>(config, *loop, *disk_loop, snode_pool, transport);
+    TestOnionRequestRouter::set_paths(
+            router,
+            PathCategory::standard,
+            {OnionPath{"S1", {a, b, c}}, OnionPath{"S2", {b, c, d}}});
+    TestOnionRequestRouter::set_paths(router, PathCategory::file, {OnionPath{"F1", {c, d, a}}});
+
+    // Every built path is reported, of either kind, with no remote and nothing sent yet
+    auto open = router->get_open_paths();
+    REQUIRE(open.size() == 3);
+    std::ranges::sort(open, {}, &OpenPath::id);
+    CHECK(open[0].id == "F1");
+    CHECK(open[0].any_destination == PathCategory::file);
+    CHECK(open[1].id == "S1");
+    CHECK(open[1].any_destination == PathCategory::standard);
+    CHECK(open[1].remote == ed25519_pubkey{});
+    REQUIRE(open[1].path.hops.size() == 3);
+    CHECK(open[1].path.hops[0].pubkey == a.remote_pubkey);
+    CHECK(open[1].path.hops[2].pubkey == c.remote_pubkey);
+    CHECK(open[1].requests_sent == 0);
+    CHECK_FALSE(open[1].since_last_request);
+
+    // A request sent counts on the path that carried it alone, and one to a server outside the
+    // network counts as proxied too
+    auto to_node = Request{"AAAA", d, "info", to_vector("{}"), RequestCategory::standard, 0ms};
+    auto to_server = Request{
+            "BBBB",
+            ServerDestination{
+                    "https",
+                    "example.org",
+                    x25519_pubkey::from_hex(
+                            "d7557fe563e2610de876c0ac7341b62f3c82d5eea4b62c702392ea4368f51b3b"),
+                    443},
+            "/room",
+            to_vector("test"),
+            RequestCategory::standard,
+            0ms};
+    TestOnionRequestRouter::send_on_path(router, PathCategory::standard, "S1", to_node);
+    TestOnionRequestRouter::send_on_path(router, PathCategory::standard, "S1", to_server);
+    open = router->get_open_paths();
+    std::ranges::sort(open, {}, &OpenPath::id);
+    CHECK(open[1].requests_sent == 2);
+    CHECK(open[1].proxied_requests_sent == 1);
+    CHECK(open[1].since_last_request);
+    CHECK(open[2].requests_sent == 0);
+
+    // A standard request's answer is timed; a file transfer's is not, as it would time the file as
+    // much as the path
+    auto to_file = Request{"CCCC", d, "info", to_vector("{}"), RequestCategory::file, 0ms};
+    TestOnionRequestRouter::send_on_path(router, PathCategory::file, "F1", to_file);
+    for (auto& answer : transport->sent_callbacks)
+        answer(false, true, -1, {}, std::nullopt);
+    auto timeouts = [&](PathCategory category, std::string_view id) {
+        for (const auto& path : TestOnionRequestRouter::get_paths(router, category))
+            if (path.id == id)
+                return path.timeouts;
+        return -1;
+    };
+    CHECK(timeouts(PathCategory::standard, "S1") == 2);
+    CHECK(timeouts(PathCategory::file, "F1") == 0);
 }
 
 TEST_CASE("Network", "[network][onion_request_router][check_request_queue_timeouts]") {

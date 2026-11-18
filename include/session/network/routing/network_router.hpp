@@ -25,6 +25,10 @@ class IRouter {
     /// Takes the whole node rather than its pubkey because sending direct has no route to look
     /// up: the answer is the node itself, and that needs its address.
     virtual std::optional<PathInfo> get_path_to(const service_node&) { return std::nullopt; };
+    /// Every path the router is holding open, with how each is performing and how many requests
+    /// have gone along it.  A snapshot like `get_path_to`; empty from a router that keeps no paths
+    /// of its own.  Safe to call from any thread.
+    virtual std::vector<OpenPath> get_open_paths() { return {}; };
     virtual std::vector<service_node> get_all_used_nodes() { return {}; };
     virtual void send_request(Request request, network_response_callback_t callback) = 0;
     [[deprecated("use upload_file() instead")]]

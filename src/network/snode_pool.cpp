@@ -952,6 +952,10 @@ size_t SnodePool::size() {
     return _jq.call_get([this] { return _snode_cache.size(); });
 }
 
+std::vector<service_node> SnodePool::nodes() {
+    return _jq.call_get([this] { return _snode_cache; });
+}
+
 void SnodePool::clear_cache() {
     // Use 'call_get' to force this to be synchronous
     _jq.call_get([this] {

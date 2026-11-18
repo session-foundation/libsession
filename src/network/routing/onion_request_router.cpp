@@ -253,7 +253,28 @@ namespace {
 
         return all_used_nodes;
     }
+
+    PathInfo hops_of(const OnionPath& path) {
+        PathInfo info;
+        info.hops.reserve(path.nodes.size());
+        for (const auto& n : path.nodes)
+            info.hops.push_back({n.remote_pubkey, n.ip});
+        return info;
+    }
 }  // namespace
+
+void OnionPath::record_round_trip(std::optional<std::chrono::steady_clock::duration> round_trip) {
+    if (!round_trip) {
+        timeouts += 1;
+        return;
+    }
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(*round_trip);
+    responses += 1;
+    // A running mean, as Session Router keeps for its pings: every answer counts the same.
+    auto mean_us = std::chrono::duration_cast<std::chrono::microseconds>(mean_round_trip);
+    mean_round_trip = std::chrono::duration_cast<std::chrono::milliseconds>(
+            mean_us + (us - mean_us) / responses);
+}
 
 std::string OnionPath::to_string() const {
     std::vector<std::string> node_descriptions;
@@ -560,13 +581,33 @@ std::optional<PathInfo> OnionRequestRouter::get_path_to(const service_node& node
                 &node, RequestCategory::standard_small, std::nullopt, "path query");
         if (!path)
             return std::nullopt;
+        return hops_of(*path);
+    });
+}
 
-        PathInfo info;
-        info.hops.reserve(path->nodes.size());
-        for (const auto& n : path->nodes)
-            info.hops.push_back({n.remote_pubkey, n.ip});
-
-        return info;
+std::vector<OpenPath> OnionRequestRouter::get_open_paths() {
+    return _jq.call_get([this] {
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<OpenPath> paths;
+        for (const auto& [category, list] : _paths) {
+            for (const auto& path : list) {
+                OpenPath& open = paths.emplace_back();
+                open.id = path.id;
+                open.any_destination = category;
+                open.path = hops_of(path);
+                // No pings: the latency is the requests' round trips, and the ping counts and
+                // jitter stay zero rather than claim pings that were never sent.
+                open.performance.latency = path.mean_round_trip;
+                open.performance.expiry = std::chrono::time_point_cast<std::chrono::milliseconds>(
+                        path.created_at + _config.path_rotation_frequency);
+                open.requests_sent = path.requests_sent;
+                open.proxied_requests_sent = path.proxied_requests_sent;
+                if (path.last_request_at)
+                    open.since_last_request = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - *path.last_request_at);
+            }
+        }
+        return paths;
     });
 }
 
@@ -1643,6 +1684,11 @@ void OnionRequestRouter::_send_on_path(
 
     // Increment the `active_requests` and actually send the `onion_request`
     path.active_requests++;
+    path.requests_sent++;
+    if (std::holds_alternative<ServerDestination>(request.destination))
+        path.proxied_requests_sent++;
+    const auto sent_at = std::chrono::steady_clock::now();
+    path.last_request_at = sent_at;
 
     auto transport = _transport.lock();
     if (!transport) {
@@ -1654,6 +1700,7 @@ void OnionRequestRouter::_send_on_path(
                                 this,
                                 parser = std::move(parser),
                                 path_id = path.id,
+                                sent_at,
                                 original_request = std::move(request),
                                 cb = std::move(callback)](
                                        bool success,
@@ -1664,6 +1711,16 @@ void OnionRequestRouter::_send_on_path(
         auto self = weak_self.lock();
         if (!self)
             return;
+
+        // Any answer is a round trip, an error status included; a failure to send is neither. A
+        // file transfer's would time the file as much as the path, so it is left out.
+        auto category = to_path_category(original_request.category);
+        if (auto* p = category == PathCategory::file ? nullptr : _path_by_id(path_id, category)) {
+            if (timeout)
+                p->record_round_trip(std::nullopt);
+            else if (success)
+                p->record_round_trip(std::chrono::steady_clock::now() - sent_at);
+        }
 
         try {
             if (!success)
@@ -1894,6 +1951,14 @@ void OnionRequestRouter::_handle_transport_response(
             final_status_code,
             std::move(headers),
             std::move(decrypted_body));
+}
+
+OnionPath* OnionRequestRouter::_path_by_id(const std::string& path_id, PathCategory category) {
+    for (auto* list : {&_paths[category], &_paths_pending_drop[category]})
+        for (auto& p : *list)
+            if (p.id == path_id)
+                return &p;
+    return nullptr;
 }
 
 void OnionRequestRouter::_decrement_and_cleanup_path(

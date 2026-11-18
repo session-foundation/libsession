@@ -139,6 +139,16 @@ class Network {
     /// The route traffic to `node` is taking right now, for showing a user where it goes.  A
     /// snapshot rather than a commitment; see IRouter::get_path_to.
     std::optional<PathInfo> get_path_to(const service_node& node);
+    /// Every path the router is holding open; see IRouter::get_open_paths.
+    std::vector<OpenPath> get_open_paths();
+
+    /// API: network/get_cached_nodes
+    ///
+    /// Every service node in the snode cache, as last fetched: the network as this client knows
+    /// it, for a caller that wants its shape (how many nodes each country holds, say) rather than
+    /// nodes to send through.  Empty until the cache is first populated, and with no snode pool.
+    /// Safe to call from any thread; it copies the whole cache, so not for every frame.
+    std::vector<service_node> get_cached_nodes();
 
     /// API: network/get_swarm
     ///

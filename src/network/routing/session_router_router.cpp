@@ -107,6 +107,33 @@ namespace {
 
 }  // namespace
 
+// The hops of one of Session Router's paths as a user is shown them.  A hop that cannot be shown
+// is left out rather than failing the whole path: the rest still say where the traffic goes.
+static PathInfo hops_of(const session::router::path_info& path) {
+    PathInfo info;
+    info.hops.reserve(path.hops.size());
+
+    for (const auto& [address, ip] : path.hops) {
+        auto pubkey = pubkey_from_srouter_address(address);
+        if (!pubkey) {
+            log::warning(cat, "Omitting path hop with an unparseable address: {}", address);
+            continue;
+        }
+
+        try {
+            info.hops.push_back({*pubkey, oxen::quic::ipv4{ip}});
+        } catch (const std::exception& e) {
+            log::warning(
+                    cat,
+                    "Omitting path hop {} with an unparseable ip {}",
+                    pubkey->short_string(),
+                    ip);
+        }
+    }
+
+    return info;
+}
+
 std::shared_ptr<SessionRouter> SessionRouter::make(
         config::SessionRouter config,
         std::shared_ptr<oxen::quic::Loop> loop,
@@ -236,33 +263,74 @@ std::optional<PathInfo> SessionRouter::get_path_to(const service_node& node) {
 
     // Deliberately the single-session lookup rather than get_all_session_paths(): we hold a
     // session to every swarm member we have spoken to, to the file server, and to every group's
-    // swarm, and reporting all of them answers a question nobody asked.
+    // swarm, and a caller wanting all of them asks get_open_paths().
     auto path = srouter->get_path_for_session(srouter_address(node.remote_pubkey));
     if (!path)
         return std::nullopt;
 
-    PathInfo info;
-    info.hops.reserve(path->hops.size());
+    return hops_of(*path);
+}
 
-    for (const auto& [address, ip] : path->hops) {
-        auto pubkey = pubkey_from_srouter_address(address);
-        if (!pubkey) {
-            log::warning(cat, "Omitting path hop with an unparseable address: {}", address);
-            continue;
+void SessionRouter::_count_request(const ed25519_pubkey& remote) {
+    auto& counts = _request_counts[remote];
+    counts.sent += 1;
+    counts.last_sent = std::chrono::steady_clock::now();
+}
+
+std::vector<OpenPath> SessionRouter::get_open_paths() {
+    if (!srouter)
+        return {};
+
+    // Session Router answers on the loop itself, so this is not inside the call_get below.
+    auto sessions = srouter->get_all_session_paths();
+
+    // The counts are written by jobs on the loop, so they are read there too.
+    return _loop->call_get([this, &sessions] {
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<OpenPath> paths;
+        paths.reserve(sessions.size());
+
+        for (const auto& session : sessions) {
+            // A session between builds has no path to show.
+            if (session.path.hops.empty())
+                continue;
+
+            auto remote = pubkey_from_srouter_address(session.remote);
+            if (!remote) {
+                log::warning(cat, "Omitting a path to an unparseable address: {}", session.remote);
+                continue;
+            }
+
+            auto add = [&](const session::router::path_info& info, bool standby) -> OpenPath& {
+                OpenPath& open = paths.emplace_back();
+                open.remote = *remote;
+                open.remote_is_client = session.remote.ends_with(".sesh");
+                open.standby = standby;
+                open.path = hops_of(info);
+                open.performance = {
+                        info.latency,
+                        info.jitter,
+                        info.ping_responses,
+                        info.ping_timeouts,
+                        info.expiry};
+                return open;
+            };
+
+            OpenPath& current = add(session.path, false);
+            if (auto it = _request_counts.find(*remote); it != _request_counts.end()) {
+                current.requests_sent = it->second.sent;
+                current.proxied_requests_sent = it->second.proxied;
+                if (it->second.sent > 0)
+                    current.since_last_request =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    now - it->second.last_sent);
+            }
+            for (const auto& info : session.standby)
+                add(info, true);
         }
 
-        try {
-            info.hops.push_back({*pubkey, oxen::quic::ipv4{ip}});
-        } catch (const std::exception& e) {
-            log::warning(
-                    cat,
-                    "Omitting path hop {} with an unparseable ip {}",
-                    pubkey->short_string(),
-                    ip);
-        }
-    }
-
-    return info;
+        return paths;
+    });
 }
 
 void SessionRouter::send_request(Request request, network_response_callback_t callback) {
@@ -387,6 +455,7 @@ void SessionRouter::_start_file_upload(
                     if (!pubkey)
                         return nullptr;
 
+                    _count_request(*pubkey);
                     return &_get_file_client(
                             *pubkey, "::1", held.tunnel->local_port, TUNNELED_QUIC_MAX_UDP_PAYLOAD);
                 });
@@ -685,6 +754,8 @@ void SessionRouter::_send_proxy_request(Request request, network_response_callba
     }
 
     service_node proxy_node = proxy_nodes[0];
+    // Only the share passed on: the request itself is counted when it is sent to the proxy.
+    _request_counts[proxy_node.remote_pubkey].proxied += 1;
     std::vector<std::byte> encrypted_blob;
     std::shared_ptr<onionreq::ResponseParser> parser;
     log::debug(
@@ -812,6 +883,7 @@ void SessionRouter::_quic_upload_via_tunnel(
         return;
     }
 
+    _count_request(*pubkey);
     _get_file_client(*pubkey, "::1", info.local_port, TUNNELED_QUIC_MAX_UDP_PAYLOAD)
             .upload(std::move(data),
                     upload_request.ttl,
@@ -853,6 +925,7 @@ void SessionRouter::_quic_download_via_tunnel(
         return;
     }
 
+    _count_request(*pubkey);
     _get_file_client(*pubkey, "::1", info.local_port, TUNNELED_QUIC_MAX_UDP_PAYLOAD)
             .download(
                     std::move(file_id),
@@ -1432,6 +1505,7 @@ void SessionRouter::_send_via_tunnel(
 
     auto [remote_pubkey, _] = remote_info_for_destination(request.destination, request.request_id);
     const auto remote_pubkey_hex = oxenc::to_hex(remote_pubkey);
+    _count_request(ed25519_pubkey::from_bytes(remote_pubkey));
     auto test_key = remote_pubkey;
     // auto test_key =
     // oxenc::from_base64("1n+DAM9hKyJhtXSPR5L/HdemIKPiHs8dZsPn2kEQuMs="); auto test_key
