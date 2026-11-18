@@ -133,6 +133,23 @@ TEST_CASE("Core automatic polling", "[core][poll]") {
     CHECK(params_for(*mock_net->sent_requests[0].request.body, 21)["last_hash"] == "hash1");
 }
 
+TEST_CASE("Poll: attaching a network polls at once", "[core][poll]") {
+    TempCore core;
+    // Attached as an application attaches one, rather than through attach_mock_network, which
+    // turns this off for the tests that drive every poll themselves.
+    auto net = std::make_unique<MockNetwork>(network::config::Config{});
+    auto* mock_net = net.get();
+    mock_net->core = &*core;
+    core->set_network(std::move(net));
+
+    // Long before the poll interval: the attach queued a poll of its own.
+    TestHelper::drain(*core);
+    REQUIRE(mock_net->sent_requests.size() == 1);
+    CHECK(mock_net->sent_requests[0].request.endpoint == "batch");
+    CHECK(namespaces_in(*mock_net->sent_requests[0].request.body) ==
+          std::vector<int16_t>{-21, 0, 2, 3, 4, 5, 21});
+}
+
 TEST_CASE(
         "Polling uses per-node last_hash to avoid missing messages on swarm-member switch",
         "[core][poll]") {

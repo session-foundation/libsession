@@ -154,14 +154,6 @@ class MockNetwork : public network::Network {
 /// keeps a raw pointer rather than a second reference.
 ///
 /// `config` for a test that depends on how the network is configured -- which router it uses, say.
-inline MockNetwork* attach_mock_network(core::Core& core, network::config::Config config = {}) {
-    auto net = std::make_unique<MockNetwork>(std::move(config));
-    auto* raw = net.get();
-    raw->core = &core;
-    core.set_network(std::move(net));
-    return raw;
-}
-
 /// Answers one captured download with `data`, delivered in chunks as a transport would rather than
 /// in one piece -- a decryptor that only works when handed the whole file at once is a bug this is
 /// meant to catch -- and stops the moment its caller asks it to, as a router does.  Returns how
@@ -416,6 +408,9 @@ class TestHelper {
         core.call_get([&core] { core._poll(); });
     }
 
+    /// Stops attaching a network from polling at once, for a test that drives every poll itself.
+    static void no_poll_on_attach(core::Core& core) { core._poll_on_attach = false; }
+
     /// Runs `f` on Core's loop and hands back what it returned.
     ///
     /// Core's components are the loop's, not the caller's, and a test is on its own thread like
@@ -633,5 +628,16 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
                             : std::nullopt};
     }
 };
+
+/// Attaches a MockNetwork, without the poll attaching one would otherwise start: a test that uses
+/// this drives each poll itself and counts what was sent.
+inline MockNetwork* attach_mock_network(core::Core& core, network::config::Config config = {}) {
+    auto net = std::make_unique<MockNetwork>(std::move(config));
+    auto* raw = net.get();
+    raw->core = &core;
+    TestHelper::no_poll_on_attach(core);
+    core.set_network(std::move(net));
+    return raw;
+}
 
 }  // namespace session
