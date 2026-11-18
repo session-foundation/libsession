@@ -344,6 +344,10 @@ class Core {
 
     // Polling-related members and methods.
     std::chrono::milliseconds _poll_interval = 20s;
+
+    // Whether attaching a network polls at once rather than a whole interval later.  Off only in
+    // tests that drive every poll themselves, where one starting on its own would be noise.
+    bool _poll_on_attach = true;
     quic::TimerID _poll_timer;
     void _remove_timer(quic::TimerID& timer);
     void _update_polling();

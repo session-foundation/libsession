@@ -224,6 +224,12 @@ void Core::set_network(std::unique_ptr<network::Network> network) {
     }
 
     _update_polling();
+
+    // The timer's first poll is a whole interval away, and until a poll the account sees nothing
+    // new and holds no subscription; so poll now as well.  Queued rather than run here, on the
+    // caller's thread.  Requests sent before the network is ready wait for it.
+    if (_network && _poll_on_attach)
+        _jq.call_soon([this] { _poll(); });
 }
 
 void Core::_remove_timer(quic::TimerID& timer) {
