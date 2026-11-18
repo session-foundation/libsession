@@ -89,12 +89,12 @@ struct OnionPath {
     std::optional<std::chrono::steady_clock::time_point> last_request_at;
 
     /// How its requests' round trips have gone: the router sends no pings, so these stand in for
-    /// them.  A round trip includes the destination's own time to answer.
+    /// them.  A round trip includes the destination's own time to answer.  There is no jitter:
+    /// consecutive requests differ in kind, size and destination, so the difference between their
+    /// round trips is mostly that, not the network.
     std::chrono::milliseconds mean_round_trip{0};
-    std::chrono::microseconds mean_jitter{0};
     int responses = 0;
     int timeouts = 0;
-    std::chrono::microseconds last_round_trip{0};
 
     /// Folds in one request's outcome: answered after `round_trip`, or timed out.
     void record_round_trip(std::optional<std::chrono::steady_clock::duration> round_trip);

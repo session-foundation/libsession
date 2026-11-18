@@ -270,15 +270,10 @@ void OnionPath::record_round_trip(std::optional<std::chrono::steady_clock::durat
     }
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(*round_trip);
     responses += 1;
-    // Running means, as Session Router keeps for its pings: every answer counts the same.
+    // A running mean, as Session Router keeps for its pings: every answer counts the same.
     auto mean_us = std::chrono::duration_cast<std::chrono::microseconds>(mean_round_trip);
     mean_round_trip = std::chrono::duration_cast<std::chrono::milliseconds>(
             mean_us + (us - mean_us) / responses);
-    if (responses > 1) {
-        auto gap = us > last_round_trip ? us - last_round_trip : last_round_trip - us;
-        mean_jitter += (gap - mean_jitter) / (responses - 1);
-    }
-    last_round_trip = us;
 }
 
 std::string OnionPath::to_string() const {
@@ -600,10 +595,9 @@ std::vector<OpenPath> OnionRequestRouter::get_open_paths() {
                 open.id = path.id;
                 open.any_destination = category;
                 open.path = hops_of(path);
-                // No pings: the figures are the requests' round trips, so the ping counts stay
-                // zero rather than claim pings that were never sent.
+                // No pings: the latency is the requests' round trips, and the ping counts and
+                // jitter stay zero rather than claim pings that were never sent.
                 open.performance.latency = path.mean_round_trip;
-                open.performance.jitter = path.mean_jitter;
                 open.performance.expiry = std::chrono::time_point_cast<std::chrono::milliseconds>(
                         path.created_at + _config.path_rotation_frequency);
                 open.requests_sent = path.requests_sent;
@@ -1718,8 +1712,10 @@ void OnionRequestRouter::_send_on_path(
         if (!self)
             return;
 
-        // Any answer is a round trip, an error status included; a failure to send is neither.
-        if (auto* p = _path_by_id(path_id, to_path_category(original_request.category))) {
+        // Any answer is a round trip, an error status included; a failure to send is neither. A
+        // file transfer's would time the file as much as the path, so it is left out.
+        auto category = to_path_category(original_request.category);
+        if (auto* p = category == PathCategory::file ? nullptr : _path_by_id(path_id, category)) {
             if (timeout)
                 p->record_round_trip(std::nullopt);
             else if (success)

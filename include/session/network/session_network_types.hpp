@@ -400,8 +400,9 @@ struct OpenPath {
     /// Set on an `onion_requests` path, which is built before any destination is chosen and
     /// carries requests to all of them: the kind of request it carries.  Such a path has no
     /// `remote` (it is left zero), its last hop is a relay that forwards to whatever each request
-    /// names, its counts are its own and start again when it is replaced, and its performance is
-    /// taken from its requests' round trips, there being no pings.
+    /// names, its counts are its own and start again when it is replaced, and its latency is its
+    /// requests' round trips, there being no pings: file transfers left out, so a `file` path's
+    /// stays zero, and no jitter at all, as requests that differ in kind and size give none.
     std::optional<PathCategory> any_destination;
 
     /// The router's name for the path, unique while the router runs: what tells one

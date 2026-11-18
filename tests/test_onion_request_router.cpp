@@ -218,8 +218,12 @@ namespace {
             func_called("remove_failure_listeners");
         }
 
-        void send_request(Request, network_response_callback_t) override {
+        /// What each request sent was to be answered through, so a test can answer it.
+        std::vector<network_response_callback_t> sent_callbacks;
+
+        void send_request(Request, network_response_callback_t callback) override {
             func_called("send_request");
+            sent_callbacks.push_back(std::move(callback));
         }
     };
 
@@ -714,17 +718,13 @@ TEST_CASE("Network", "[network][onion_request_router][record_round_trip]") {
     CHECK(path.responses == 0);
     CHECK(path.mean_round_trip == 0ms);
 
-    // The first answer is the mean, and there is no jitter until a second
+    // The first answer is the mean, and each after it counts the same
     path.record_round_trip(100ms);
     CHECK(path.mean_round_trip == 100ms);
-    CHECK(path.mean_jitter == 0us);
-
-    // Then each answer counts the same towards the mean, and jitter is the mean gap between them
     path.record_round_trip(140ms);
     path.record_round_trip(120ms);
     CHECK(path.responses == 3);
     CHECK(path.mean_round_trip == 120ms);
-    CHECK(path.mean_jitter == 30ms);
 }
 
 TEST_CASE("Network", "[network][onion_request_router][get_open_paths]") {
@@ -821,6 +821,21 @@ TEST_CASE("Network", "[network][onion_request_router][get_open_paths]") {
     CHECK(open[1].proxied_requests_sent == 1);
     CHECK(open[1].since_last_request);
     CHECK(open[2].requests_sent == 0);
+
+    // A standard request's answer is timed; a file transfer's is not, as it would time the file as
+    // much as the path
+    auto to_file = Request{"CCCC", d, "info", to_vector("{}"), RequestCategory::file, 0ms};
+    TestOnionRequestRouter::send_on_path(router, PathCategory::file, "F1", to_file);
+    for (auto& answer : transport->sent_callbacks)
+        answer(false, true, -1, {}, std::nullopt);
+    auto timeouts = [&](PathCategory category, std::string_view id) {
+        for (const auto& path : TestOnionRequestRouter::get_paths(router, category))
+            if (path.id == id)
+                return path.timeouts;
+        return -1;
+    };
+    CHECK(timeouts(PathCategory::standard, "S1") == 2);
+    CHECK(timeouts(PathCategory::file, "F1") == 0);
 }
 
 TEST_CASE("Network", "[network][onion_request_router][check_request_queue_timeouts]") {
