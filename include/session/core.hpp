@@ -151,6 +151,10 @@ namespace session {
 class TestHelper;
 }
 
+namespace session::push::detail {
+class CoreAccess;
+}
+
 // Forward declared rather than including SessionProtos.pb.h so that consumers of this header do not
 // inherit a protobuf include dependency; only the send_dm() Content overload needs the full type.
 namespace SessionProtos {
@@ -253,6 +257,18 @@ struct predefined_seed {
 /// start until a network is attached.
 struct defer_account {};
 
+/// Opens a Core for a single job rather than for the life of an application -- a notification
+/// extension handling one push, which may have to fetch the message the push could not carry and
+/// is then torn down.
+///
+/// Attaching a network starts no polling, so there is no poll timer and no swarm subscription:
+/// the job asks for what it needs itself.  A layer built on Core reads one_shot() to skip its own
+/// start-up work for the same reason; Client skips the recovery that assumes the previous run has
+/// ended, which is false while the application that shares the database is merely suspended.
+///
+/// Pair it with a network built with `network::opt::one_shot`.
+struct one_shot {};
+
 /// Additional database migrations to apply during Core construction, on behalf of a layer built on
 /// top of Core (such as a Client holding conversations and message history in the same database).
 ///
@@ -297,10 +313,15 @@ concept CoreOption = sqlite::DatabaseOption<std::remove_cvref_t<T>> ||
                      std::same_as<std::remove_cvref_t<T>, predefined_seed> ||
                      std::same_as<std::remove_cvref_t<T>, callbacks> ||
                      std::same_as<std::remove_cvref_t<T>, defer_account> ||
+                     std::same_as<std::remove_cvref_t<T>, one_shot> ||
                      std::same_as<std::remove_cvref_t<T>, schema_extension>;
 
 class Core {
     friend class session::TestHelper;  // for unit tests
+
+    // Push notification handling is built separately (ENABLE_PUSH) but fetches from the swarm the
+    // way polling does; this lends it the private machinery for that without making it public.
+    friend class session::push::detail::CoreAccess;
 
     // Declared first, so it is constructed first and destroyed last: it must outlive every
     // component that uses it, and `_jq` below.
@@ -341,6 +362,9 @@ class Core {
     // Performs the non-templated part of Core construction: this executes any needed database
     // migrations, and then calls init() on each sub-component.
     void init();
+
+    // Set from the one_shot option; see there.
+    bool _one_shot = false;
 
     // Polling-related members and methods.
     std::chrono::milliseconds _poll_interval = 20s;
@@ -498,8 +522,9 @@ class Core {
     // Feeds one pushed message in as though it had been retrieved.
     void _handle_server_push(std::string_view endpoint, std::span<const std::byte> body);
 
-    // Decrypts and dispatches one-to-one messages from Namespace::Default.
-    void _handle_direct_messages(std::span<const SwarmMessage> messages);
+    // Decrypts and dispatches one-to-one messages from Namespace::Default, returning those that
+    // did not decrypt.
+    ReceiveResult _handle_direct_messages(std::span<const SwarmMessage> messages);
 
     // Handles a PFS fetch response
     void _handle_pfs_response(std::span<const std::byte, 33> sid, std::string body);
@@ -613,6 +638,7 @@ class Core {
             globals._predefined_seed = std::move(s->bytes);
         globals._defer_account =
                 detail::maybe_instance<defer_account>(std::forward<Opts>(opts)...).has_value();
+        _one_shot = detail::maybe_instance<core::one_shot>(std::forward<Opts>(opts)...).has_value();
         init();
     }
 
@@ -743,6 +769,9 @@ class Core {
     /// to call without waiting on it: what it finds is merged into `configs` like anything a poll
     /// brings in, and the retrieve cursor it records means the next poll carries on from there.
     void fetch_user_profile(std::function<void(bool found)> done);
+
+    /// Whether this Core was opened with the one_shot option.
+    bool one_shot() const { return _one_shot; }
 
     /// Encrypt and send a direct message to the given recipient.
     ///
@@ -906,7 +935,10 @@ class Core {
     // retrieval), and false if more messages may follow.  Note that if there turn out to be no more
     // messages after a non-final call, the caller should still call this with an empty span and
     // is_final=true to flush any actions that are deferred until the end of a fetch.
-    void receive_messages(
+    //
+    // Returns the one-to-one messages that did not decrypt; see ReceiveResult.  Every caller but
+    // one that must act on a failure immediately can ignore it.
+    ReceiveResult receive_messages(
             std::span<const SwarmMessage> messages, config::Namespace ns, bool is_final);
 
   private:

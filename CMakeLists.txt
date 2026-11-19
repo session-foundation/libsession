@@ -114,6 +114,10 @@ option(ENABLE_NETWORKING_SROUTER "Build with session-router networking support" 
 # way libjpeg-turbo does all JPEG decoding.
 option(SESSION_ENABLE_JPEGLI "Encode JPEGs with jpegli rather than libjpeg-turbo" ON)
 
+# Push notification handling (libsession::push).  Only mobile clients receive pushes, so a desktop
+# or command-line build can turn this off and leave the code out.
+option(ENABLE_PUSH "Build push notification support (libsession::push)" ON)
+
 # Off by default: it adds ~1.8MB of database to the binary, and a client that already ships its own
 # geo data wants nothing to do with it.  With it off the lookup API still exists and reports every
 # address as unknown, so nothing needs an #ifdef.

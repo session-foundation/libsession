@@ -66,12 +66,20 @@ class DataExtractionNotification;
 class UnsendRequest;
 }  // namespace SessionProtos
 
+namespace session::push::detail {
+class ClientAccess;
+}
+
 namespace session::client {
 
 using namespace std::literals;
 
 class Client {
     friend class session::TestHelper;  // for unit tests
+
+    // Push notification handling is built separately (ENABLE_PUSH) and reports its results the way
+    // Client reports its own; this lends it the dispatcher for that.
+    friend class session::push::detail::ClientAccess;
 
     // A conversation *is* part of Client's interface, split off rather than added to: what these
     // call is the same private machinery the methods here do.
@@ -232,6 +240,24 @@ class Client {
     /// A single message by its Client-assigned id, or nullopt if it does not exist.
     void message(int64_t id, result_function<std::optional<Message>> cb);
     std::optional<Message> message(int64_t id, await_t);
+
+    /// The count an application's icon badge shows: every unread message in conversations that
+    /// notify for all messages, plus one for each message request holding an unread message.  Muted
+    /// conversations, conversations with notifications off, and blocked senders count nothing.
+    ///
+    /// One definition for every process sharing the database, so the application and its
+    /// notification extension cannot disagree about it.
+    ///
+    /// TODO: unread mentions in mentions-only conversations, once Client holds groups and tracks
+    /// mentions; mentions-only reads as "all" on a one-to-one conversation, so nothing is missing
+    /// until then.
+    void badge_count(result_function<int64_t> cb);
+    int64_t badge_count(await_t);
+
+    /// A single message by the hash of its copy in our own swarm (`Message::hash`), or nullopt if
+    /// none is stored.  The hash is what a push notification names a message by.
+    void message_by_hash(std::string hash, result_function<std::optional<Message>> cb);
+    std::optional<Message> message_by_hash(std::string hash, await_t);
 
     /// Blocks or unblocks an account named by id.
     ///
@@ -1180,6 +1206,8 @@ class Client {
             std::optional<MessageCursor> before,
             bool include_deleted);
     std::optional<Message> _message(int64_t id);
+    std::optional<Message> _message_by_hash(std::string_view hash);
+    int64_t _badge_count();
     int64_t _send_message(const ConversationId& id, const OutgoingMessage& msg);
     int64_t _send_message(
             const ConversationId& id,

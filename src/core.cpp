@@ -232,6 +232,9 @@ void Core::_remove_timer(quic::TimerID& timer) {
 }
 
 void Core::_update_polling() {
+    // A one-shot Core asks for what it needs itself; see the one_shot option.
+    if (_one_shot)
+        return;
     if (_network && !_poll_timer)
         _poll_timer = _jq.add_timer(_poll_interval, [this] { _poll(); });
     else if (!_network)
@@ -252,102 +255,56 @@ void Core::set_poll_interval(std::chrono::milliseconds interval) {
     });
 }
 
-// Order matters: the batch's results are handled in this order, so a namespace whose contents
-// another one's depend on has to come first.  The configs lead because a message arriving in the
-// same poll may be from a contact those configs are what tells us about; among themselves,
-// ConvoInfoVolatile comes last because it refers to conversations that Contacts and UserGroups
-// are what establish.
-static constexpr std::array POLL_NAMESPACES = {
-        config::Namespace::UserProfile,
-        config::Namespace::Contacts,
-        config::Namespace::UserGroups,
-        config::Namespace::ConvoInfoVolatile,
-        config::Namespace::Default,
-        config::Namespace::Devices,
-        config::Namespace::AccountPubkeys};
+std::optional<retrieved_namespace> decode_retrieved(const nlohmann::json& res, int16_t ns_val) {
+    auto code_it = res.find("code");
+    if (code_it == res.end() || code_it->get<int>() != 200) {
+        log::warning(cat, "Retrieve of namespace {} failed: {}", ns_val, res.dump());
+        return std::nullopt;
+    }
+    auto body_it = res.find("body");
+    if (body_it == res.end())
+        return std::nullopt;
+    auto msgs_it = body_it->find("messages");
+    if (msgs_it == body_it->end() || !msgs_it->is_array())
+        return std::nullopt;
 
-// Ceiling on continuation rounds within one poll.  A well-behaved node exhausts a namespace in far
-// fewer; this exists so that a node whose `more` never goes false cannot poll indefinitely.
-static constexpr int POLL_MAX_ROUNDS = 20;
+    retrieved_namespace got;
+    if (auto m = body_it->find("more"); m != body_it->end() && m->is_boolean())
+        got.more = m->get<bool>();
 
-/// One namespace's slice of a batch retrieve response, decoded but not yet handled.
-///
-/// The decoded bytes are kept beside the messages because `SwarmMessage::data` spans into them:
-/// the messages are only usable while this object is.
-struct retrieved_namespace {
-    std::vector<std::vector<std::byte>> data;
-    std::vector<SwarmMessage> messages;
-    /// The node says it is holding more past what it returned.  A retrieve is capped by the
-    /// storage server, so this is how a namespace reports that one round did not exhaust it.
-    bool more = false;
-};
+    log::debug(cat, "Retrieved {} message(s) from namespace {}", msgs_it->size(), ns_val);
 
-namespace {
+    for (const auto& msg : *msgs_it) {
+        auto data_it = msg.find("data");
+        if (data_it == msg.end() || !data_it->is_string())
+            continue;
+        auto& decoded = got.data.emplace_back();
+        auto b64 = data_it->get<std::string_view>();
+        decoded.reserve(oxenc::from_base64_size(b64.size()));
+        oxenc::from_base64(b64.begin(), b64.end(), std::back_inserter(decoded));
 
-    /// Decodes one result of a batch retrieve, or nothing where the node did not answer it.
-    ///
-    /// **Nothing and an empty answer are different**, and the difference is load-bearing: a
-    /// namespace that failed or answered malformedly is not reported to its handler at all, while
-    /// one that answered with nothing is -- "we asked and there is nothing" is an answer, and some
-    /// handlers act on it.
-    ///
-    /// Takes no node and touches no database, deliberately. Which node an answer came from matters
-    /// to whoever called: the retrieve cursor is kept per node and has to stay with the one that
-    /// produced it, and a decoder that knew about nodes is the shape in which one node's cursor
-    /// gets written from another node's response -- silently, because each node's cursor is
-    /// individually plausible.
-    std::optional<retrieved_namespace> decode_retrieved(const nlohmann::json& res, int16_t ns_val) {
-        auto code_it = res.find("code");
-        if (code_it == res.end() || code_it->get<int>() != 200) {
-            log::warning(cat, "Retrieve of namespace {} failed: {}", ns_val, res.dump());
-            return std::nullopt;
-        }
-        auto body_it = res.find("body");
-        if (body_it == res.end())
-            return std::nullopt;
-        auto msgs_it = body_it->find("messages");
-        if (msgs_it == body_it->end() || !msgs_it->is_array())
-            return std::nullopt;
+        SwarmMessage swarm_msg;
+        swarm_msg.data = {decoded.data(), decoded.size()};
 
-        retrieved_namespace got;
-        if (auto m = body_it->find("more"); m != body_it->end() && m->is_boolean())
-            got.more = m->get<bool>();
+        if (auto h = msg.find("hash"); h != msg.end() && h->is_string())
+            swarm_msg.hash = h->get<std::string>();
 
-        log::debug(cat, "Retrieved {} message(s) from namespace {}", msgs_it->size(), ns_val);
+        if (auto t = msg.find("timestamp"); t != msg.end() && t->is_number_integer())
+            swarm_msg.timestamp = from_epoch_ms(t->get<int64_t>());
 
-        for (const auto& msg : *msgs_it) {
-            auto data_it = msg.find("data");
-            if (data_it == msg.end() || !data_it->is_string())
-                continue;
-            auto& decoded = got.data.emplace_back();
-            auto b64 = data_it->get<std::string_view>();
-            decoded.reserve(oxenc::from_base64_size(b64.size()));
-            oxenc::from_base64(b64.begin(), b64.end(), std::back_inserter(decoded));
+        if (auto e = msg.find("expiry"); e != msg.end() && e->is_number_integer())
+            swarm_msg.expiry = from_epoch_ms(e->get<int64_t>());
 
-            SwarmMessage swarm_msg;
-            swarm_msg.data = {decoded.data(), decoded.size()};
-
-            if (auto h = msg.find("hash"); h != msg.end() && h->is_string())
-                swarm_msg.hash = h->get<std::string>();
-
-            if (auto t = msg.find("timestamp"); t != msg.end() && t->is_number_integer())
-                swarm_msg.timestamp = from_epoch_ms(t->get<int64_t>());
-
-            if (auto e = msg.find("expiry"); e != msg.end() && e->is_number_integer())
-                swarm_msg.expiry = from_epoch_ms(e->get<int64_t>());
-
-            got.messages.push_back(std::move(swarm_msg));
-        }
-
-        // A node claiming more while returning nothing cannot be continued: there is no new hash to
-        // move the cursor to, so another round would ask the same question and get the same answer.
-        // Reported as finished instead, or a handler waiting on `is_final` would wait for one that
-        // never comes.
-        got.more = got.more && !got.messages.empty();
-        return got;
+        got.messages.push_back(std::move(swarm_msg));
     }
 
-}  // namespace
+    // A node claiming more while returning nothing cannot be continued: there is no new hash to
+    // move the cursor to, so another round would ask the same question and get the same answer.
+    // Reported as finished instead, or a handler waiting on `is_final` would wait for one that
+    // never comes.
+    got.more = got.more && !got.messages.empty();
+    return got;
+}
 
 /// How long the first member's config is left open for others to add to.
 ///
@@ -1904,9 +1861,8 @@ int64_t Core::send_dm(
             force_v2);
 }
 
-void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
-    if (!callbacks.message_received && !callbacks.message_decrypt_failed)
-        return;
+ReceiveResult Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
+    ReceiveResult result;
 
     auto seed = globals.account_seed();
     auto session_id = globals.session_id();
@@ -1928,6 +1884,7 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
     };
 
     auto fire_fail = [&](const SwarmMessage& msg, MessageDecryptFailure reason) {
+        result.undecryptable.emplace_back(msg.hash, reason);
         if (!callbacks.message_decrypt_failed)
             return;
         try {
@@ -2037,13 +1994,14 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
             }
         }
     }
+    return result;
 }
 
-void Core::receive_messages(
+ReceiveResult Core::receive_messages(
         std::span<const SwarmMessage> messages, config::Namespace ns, bool is_final) {
     using config::Namespace;
     switch (ns) {
-        case Namespace::Default: _handle_direct_messages(messages); break;
+        case Namespace::Default: return _handle_direct_messages(messages);
         case Namespace::Devices: devices.parse_device_messages(messages, is_final); break;
         case Namespace::AccountPubkeys: devices.parse_account_pubkeys(messages, is_final); break;
         case Namespace::UserProfile:
@@ -2056,6 +2014,7 @@ void Core::receive_messages(
                     "receive_messages: ignoring unhandled namespace {}",
                     static_cast<int16_t>(ns));
     }
+    return {};
 }
 
 void Core::apply_migrations() {

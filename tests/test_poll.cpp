@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <session/core.hpp>
 #include <session/network/session_network.hpp>
+#include <thread>
 
 #include "test_helper.hpp"
 
@@ -205,6 +206,21 @@ TEST_CASE(
         auto p = params_for(*mock_net->sent_requests[0].request.body, 21);
         CHECK(p["last_hash"] == "xyz");
     }
+}
+
+TEST_CASE("Poll: a one-shot Core never starts polling", "[core][poll]") {
+    TempCore core{core::one_shot{}};
+    CHECK(core->one_shot());
+    auto* mock_net = attach_mock_network(*core);
+
+    // Short enough that an ordinary Core would have polled several times over.
+    core->set_poll_interval(10ms);
+    std::this_thread::sleep_for(150ms);
+    TestHelper::drain(*core);
+
+    CHECK(std::ranges::none_of(mock_net->sent_requests, [](const MockNetwork::SentRequest& r) {
+        return r.request.endpoint == "batch";
+    }));
 }
 
 TEST_CASE("Poll: the sync cursor advances only after the batch is handled", "[core][poll]") {
