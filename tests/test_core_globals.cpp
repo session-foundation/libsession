@@ -1,11 +1,15 @@
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
+#include <future>
 #include <session/core.hpp>
+#include <string>
 
 #include "test_helper.hpp"
 
 using namespace session;
 using namespace session::core;
 using namespace oxenc::literals;
+using namespace std::literals;
 
 TEST_CASE("Globals: set/get round-trip", "[core][globals]") {
     TempCore c{};
@@ -131,4 +135,36 @@ TEST_CASE("Globals: defer_account leaves the account unresolved", "[core][global
 
     std::error_code ec;
     std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("Core: destroyed promptly once its database is interrupted mid-statement", "[core]") {
+    TempCore core;
+    // A statement on Core's loop that runs far longer than this test waits, unless stopped: as a
+    // large receive or a migration would be when the app is about to be suspended.
+    std::promise<void> started;
+    std::promise<std::string> ended;
+    core->call_soon([&] {
+        auto c = core->database().conn();
+        started.set_value();
+        try {
+            c.prepared_get<int64_t>(
+                    "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n "
+                    "LIMIT 4000000000) SELECT count(*) FROM n");
+            ended.set_value("finished");
+        } catch (const std::exception& e) {
+            ended.set_value(e.what());
+        }
+    });
+    started.get_future().wait();
+
+    core->database().interrupt_handle()->interrupt();
+    auto stopped = ended.get_future();
+    REQUIRE(stopped.wait_for(5s) == std::future_status::ready);
+    CHECK(stopped.get() != "finished");
+
+    // The final config dump is refused by the interrupted database; the queue still has to stop
+    // for the members to go safely, and it must not wait for anything.
+    auto before = std::chrono::steady_clock::now();
+    core.core.reset();
+    CHECK(std::chrono::steady_clock::now() - before < 2s);
 }
