@@ -1,3 +1,9 @@
+libsession-util (1.9.4-2+2) unstable; urgency=medium
+
+  * Rebuild against current sid libraries
+
+ -- Jason Rhinelander <jason@session.foundation>  Sat, 21 Nov 2026 16:47:48 -0400
+
 libsession-util (1.9.4-2+1) unstable; urgency=medium
 
   * Rebuild for sid downgrade of libsimdutf
