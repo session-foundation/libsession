@@ -1,0 +1,156 @@
+From: Jason Rhinelander <jason@imaginary.ca>
+Date: Sat, 21 Nov 2026 18:54:38 -0400
+Subject: Include the libquic headers each file uses
+
+libquic 1.14 drops the oxen/quic.hpp umbrella header, so the files that
+included it, and the ones that only compiled through what it pulled in,
+now include the libquic, oxenc and standard headers they use directly.
+
+These are the source changes of Morgan Pretty's a12da176 on dev,
+without its session-router submodule bump, for building 1.9.4 against
+a system libquic 1.14.
+---
+ include/session/network/routing/onion_request_router.hpp | 1 +
+ include/session/network/service_node.hpp                 | 2 +-
+ include/session/network/session_network.hpp              | 2 +-
+ include/session/network/snode_pool.hpp                   | 1 +
+ include/session/network/transport/quic_transport.hpp     | 4 ++++
+ src/network/request_queue.cpp                            | 1 -
+ src/network/service_node.cpp                             | 2 +-
+ src/network/snode_pool.cpp                               | 4 +++-
+ src/network/transport/quic_transport.cpp                 | 2 ++
+ src/onionreq/response_parser.cpp                         | 1 +
+ 10 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/include/session/network/routing/onion_request_router.hpp b/include/session/network/routing/onion_request_router.hpp
+index da17f3c..30e7f77 100644
+--- a/include/session/network/routing/onion_request_router.hpp
++++ b/include/session/network/routing/onion_request_router.hpp
+@@ -7,6 +7,7 @@
+ #include <string>
+ #include <thread>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ #include "session/network/backends/session_file_server.hpp"
+diff --git a/include/session/network/service_node.hpp b/include/session/network/service_node.hpp
+index 6f26e8c..55f25e4 100644
+--- a/include/session/network/service_node.hpp
++++ b/include/session/network/service_node.hpp
+@@ -4,7 +4,7 @@
+ #include <oxenc/hex.h>
+ 
+ #include <nlohmann/json.hpp>
+-#include <oxen/quic.hpp>
++#include <oxen/quic/address.hpp>
+ 
+ #include "session/network/service_node.h"
+ #include "session/network/swarm.hpp"
+diff --git a/include/session/network/session_network.hpp b/include/session/network/session_network.hpp
+index cb1ce20..634c7d6 100644
+--- a/include/session/network/session_network.hpp
++++ b/include/session/network/session_network.hpp
+@@ -3,7 +3,7 @@
+ #include <filesystem>
+ #include <limits>
+ #include <optional>
+-#include <oxen/quic.hpp>
++#include <oxen/quic/loop.hpp>
+ 
+ #include "session/network/backends/session_file_server.hpp"
+ #include "session/network/network_config.hpp"
+diff --git a/include/session/network/snode_pool.hpp b/include/session/network/snode_pool.hpp
+index 4ebd252..87f8980 100644
+--- a/include/session/network/snode_pool.hpp
++++ b/include/session/network/snode_pool.hpp
+@@ -5,6 +5,7 @@
+ #include <functional>
+ #include <memory>
+ #include <optional>
++#include <oxen/quic/loop.hpp>
+ #include <vector>
+ 
+ #include "session/network/key_types.hpp"
+diff --git a/include/session/network/transport/quic_transport.hpp b/include/session/network/transport/quic_transport.hpp
+index 990a352..1b1d939 100644
+--- a/include/session/network/transport/quic_transport.hpp
++++ b/include/session/network/transport/quic_transport.hpp
+@@ -3,6 +3,10 @@
+ #include <atomic>
+ #include <functional>
+ #include <optional>
++#include <oxen/quic/address.hpp>
++#include <oxen/quic/connection_ids.hpp>
++#include <oxen/quic/endpoint.hpp>
++#include <oxen/quic/loop.hpp>
+ #include <set>
+ #include <string>
+ #include <vector>
+diff --git a/src/network/request_queue.cpp b/src/network/request_queue.cpp
+index ee64dcf..814a774 100644
+--- a/src/network/request_queue.cpp
++++ b/src/network/request_queue.cpp
+@@ -5,7 +5,6 @@
+ 
+ #include <oxen/log.hpp>
+ #include <oxen/log/format.hpp>
+-#include <oxen/quic.hpp>
+ #include <oxen/quic/utils.hpp>
+ 
+ using namespace oxen;
+diff --git a/src/network/service_node.cpp b/src/network/service_node.cpp
+index 4335e34..d4dcd97 100644
+--- a/src/network/service_node.cpp
++++ b/src/network/service_node.cpp
+@@ -3,7 +3,7 @@
+ #include <fmt/ranges.h>
+ 
+ #include <oxen/log/format.hpp>
+-#include <oxen/quic.hpp>
++#include <oxen/quic/ip.hpp>
+ #include <oxen/quic/utils.hpp>
+ 
+ using namespace oxen;
+diff --git a/src/network/snode_pool.cpp b/src/network/snode_pool.cpp
+index 6614c85..9a020a0 100644
+--- a/src/network/snode_pool.cpp
++++ b/src/network/snode_pool.cpp
+@@ -11,9 +11,11 @@
+ #include <limits>
+ #include <oxen/log.hpp>
+ #include <oxen/log/format.hpp>
+-#include <oxen/quic.hpp>
++#include <oxen/quic/ip.hpp>
++#include <oxen/quic/loop.hpp>
+ #include <oxen/quic/utils.hpp>
+ #include <type_traits>
++#include <unordered_set>
+ 
+ #include "session/file.hpp"
+ #include "session/hash.hpp"
+diff --git a/src/network/transport/quic_transport.cpp b/src/network/transport/quic_transport.cpp
+index d63d3c7..d7c0d8f 100644
+--- a/src/network/transport/quic_transport.cpp
++++ b/src/network/transport/quic_transport.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include <oxen/log.hpp>
+ #include <oxen/log/format.hpp>
++#include <oxen/quic/btstream.hpp>
++#include <oxen/quic/connection.hpp>
+ #include <oxen/quic/gnutls_crypto.hpp>
+ 
+ #include "session/ed25519.hpp"
+diff --git a/src/onionreq/response_parser.cpp b/src/onionreq/response_parser.cpp
+index 89230ae..b50f22c 100644
+--- a/src/onionreq/response_parser.cpp
++++ b/src/onionreq/response_parser.cpp
+@@ -1,6 +1,7 @@
+ #include "session/onionreq/response_parser.hpp"
+ 
+ #include <oxenc/base64.h>
++#include <oxenc/bt_serialize.h>
+ #include <oxenc/endian.h>
+ #include <sodium/core.h>
+ 

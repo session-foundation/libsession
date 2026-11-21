@@ -1,0 +1,38 @@
+From: Morgan Pretty <morgan.t.pretty@gmail.com>
+Date: Thu, 5 Nov 2026 11:38:02 +1100
+Subject: Include <variant> where std::variant and std::visit are used
+
+These came through oxen/quic.hpp before.  libc++ still pulls <variant>
+in by other routes, but libstdc++ against the system liboxenquic does
+not, so the Debian and Ubuntu builds failed.
+
+(cherry picked from commit 4339312100f33b2cc389f2e2484a48a153e8c0ca)
+---
+ include/session/network/session_network_types.hpp | 1 +
+ src/network/session_network_internal.cpp          | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/include/session/network/session_network_types.hpp b/include/session/network/session_network_types.hpp
+index efecd7e..d62724e 100644
+--- a/include/session/network/session_network_types.hpp
++++ b/include/session/network/session_network_types.hpp
+@@ -5,6 +5,7 @@
+ #include <span>
+ #include <string>
+ #include <unordered_map>
++#include <variant>
+ #include <vector>
+ 
+ #include "session/network/key_types.hpp"
+diff --git a/src/network/session_network_internal.cpp b/src/network/session_network_internal.cpp
+index ec93e21..dbeb676 100644
+--- a/src/network/session_network_internal.cpp
++++ b/src/network/session_network_internal.cpp
+@@ -3,6 +3,7 @@
+ #include <numeric>
+ #include <oxen/quic/address.hpp>
+ #include <string>
++#include <variant>
+ #include <vector>
+ 
+ #include "session/network/service_node.hpp"
