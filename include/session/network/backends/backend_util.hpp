@@ -1,5 +1,7 @@
 #pragma once
 
+#include <fmt/format.h>
+
 #include <iostream>
 #include <string_view>
 #include <vector>

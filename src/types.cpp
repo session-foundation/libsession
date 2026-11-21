@@ -1,8 +1,11 @@
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <session/types.h>
 
 #include <cstdarg>
+#include <cstdlib>
+#include <cstring>
 #include <session/types.hpp>
+#include <stdexcept>
 
 namespace session {
 span_u8 span_u8_alloc_or_throw(size_t size) {

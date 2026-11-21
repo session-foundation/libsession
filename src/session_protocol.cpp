@@ -1,4 +1,4 @@
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <oxenc/endian.h>
 #include <oxenc/hex.h>
 #include <session/config/groups/keys.h>
