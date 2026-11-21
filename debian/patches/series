@@ -1,1 +1,2 @@
 0001-Fix-missing-direct-linking-to-libzstd.patch
+0002-Fix-includes-for-fmt-12-and-GCC-16.patch
