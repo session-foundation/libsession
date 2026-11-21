@@ -1,2 +1,5 @@
 0001-Fix-missing-direct-linking-to-libzstd.patch
 0002-Fix-includes-for-fmt-12-and-GCC-16.patch
+0003-Include-the-libquic-headers-each-file-uses.patch
+0004-Include-variant-where-std-variant-and-std-visit-are-.patch
+0005-Include-ngtcp2.h-for-NGTCP2_ERR_HANDSHAKE_TIMEOUT.patch

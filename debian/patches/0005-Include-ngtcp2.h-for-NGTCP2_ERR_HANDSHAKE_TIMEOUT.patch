@@ -1,0 +1,23 @@
+From: Jason Rhinelander <jason@imaginary.ca>
+Date: Sat, 21 Nov 2026 18:56:53 -0400
+Subject: Include ngtcp2.h for NGTCP2_ERR_HANDSHAKE_TIMEOUT
+
+The onion request router compares close codes against ngtcp2's
+handshake timeout error, which only compiled while something else
+happened to pull in ngtcp2's header.
+---
+ src/network/routing/onion_request_router.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/network/routing/onion_request_router.cpp b/src/network/routing/onion_request_router.cpp
+index 0c379b1..0033828 100644
+--- a/src/network/routing/onion_request_router.cpp
++++ b/src/network/routing/onion_request_router.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <event2/event.h>
+ #include <fmt/ranges.h>
++#include <ngtcp2/ngtcp2.h>
+ 
+ #include <chrono>
+ #include <exception>
