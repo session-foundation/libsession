@@ -235,10 +235,28 @@ void Core::_update_polling() {
     // A one-shot Core asks for what it needs itself; see the one_shot option.
     if (_one_shot)
         return;
-    if (_network && !_poll_timer)
+    if (_network && !_receiving_paused && !_poll_timer)
         _poll_timer = _jq.add_timer(_poll_interval, [this] { _poll(); });
-    else if (!_network)
+    else if (!_network || _receiving_paused)
         _remove_timer(_poll_timer);
+}
+
+void Core::set_receiving(bool on) {
+    _jq.call([this, on] {
+        if (_receiving_paused == !on)
+            return;
+        _receiving_paused = !on;
+        if (_receiving_paused) {
+            log::info(cat, "Receiving paused");
+            // Calls `_update_polling`, which now removes the poll timer rather than restarting it.
+            _drop_subscription("receiving paused");
+            _remove_timer(_poll_timer);
+            return;
+        }
+        log::info(cat, "Receiving resumed");
+        _update_polling();
+        _poll();
+    });
 }
 
 void Core::set_poll_interval(std::chrono::milliseconds interval) {
@@ -556,6 +574,10 @@ void Core::_swarm_response(
 void Core::_poll() {
     if (!_network) {
         log::debug(cat, "Not polling: no network attached");
+        return;
+    }
+    if (_receiving_paused) {
+        log::debug(cat, "Not polling: receiving is paused");
         return;
     }
 
@@ -987,8 +1009,8 @@ void Core::_maybe_subscribe(const network::service_node& node) {
     // check rather than a turn of the loop.
     call([this, node] {
         // Already have one, or are waiting on one: a subscription is with a single node, and
-        // there is no reason to move while it works.
-        if (_sub_node)
+        // there is no reason to move while it works.  None while receiving is paused.
+        if (_sub_node || _receiving_paused)
             return;
 
         auto* net = _network.get();
@@ -1210,6 +1232,11 @@ void Core::_drop_subscription(std::string_view why) {
 }
 
 void Core::_handle_server_push(std::string_view endpoint, std::span<const std::byte> body) {
+    // The node keeps pushing until its connection closes; see set_receiving.
+    if (_receiving_paused) {
+        log::debug(cat, "Ignoring a pushed message: receiving is paused");
+        return;
+    }
     if (endpoint != NOTIFY_ENDPOINT) {
         log::debug(cat, "Ignoring pushed '{}': not a notification", endpoint);
         return;

@@ -498,6 +498,9 @@ class Core {
 
     std::optional<network::service_node> _sub_node;
     bool _subscribed = false;
+    // Set by `set_receiving(false)`: no poll timer, no subscription, and pushed messages ignored.
+    // Loop state, as the timers are.
+    bool _receiving_paused = false;
     quic::TimerID _sub_timer;
     quic::TimerID _probe_timer;
 
@@ -734,6 +737,21 @@ class Core {
     /// (the swarm cursor only advances once a batch has been handled, and message handlers are
     /// already required to tolerate seeing a message twice).
     void set_poll_interval(std::chrono::milliseconds interval);
+
+    /// Stops or restarts fetching new messages, for an application that hands receiving to another
+    /// process for a while: an iOS app leaving the screen, whose notification extension handles
+    /// what arrives until the app is back.
+    ///
+    /// Paused, there is no poll timer and no subscription, and a message the subscribed node still
+    /// pushes over its connection is ignored: dropping a subscription does not tell the node, which
+    /// pushes until the connection closes.  Nothing is lost by ignoring it, because the swarm
+    /// cursor only advances once a message has been handled, so the first poll after resuming
+    /// fetches it.  A poll already in flight when receiving pauses is still handled.  Sends,
+    /// uploads and config pushes carry on.
+    ///
+    /// Resuming polls at once, then every `set_poll_interval`, and subscribes again as usual.
+    /// Callable from any thread; marshalled onto the loop, as `set_poll_interval` is.
+    void set_receiving(bool on);
 
     /// Fetches the account's own UserProfile config from the whole swarm at once, rather than
     /// waiting for the next poll to ask one member.

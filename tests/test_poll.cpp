@@ -223,6 +223,34 @@ TEST_CASE("Poll: a one-shot Core never starts polling", "[core][poll]") {
     }));
 }
 
+TEST_CASE(
+        "Poll: nothing is polled while receiving is paused, and resuming polls at once",
+        "[core][poll]") {
+    TempCore core;
+    auto* mock_net = attach_mock_network(*core);
+    auto polls = [&] {
+        return std::ranges::count_if(
+                mock_net->sent_requests,
+                [](const MockNetwork::SentRequest& r) { return r.request.endpoint == "batch"; });
+    };
+
+    core->set_receiving(false);
+    TestHelper::drain(*core);
+    mock_net->sent_requests.clear();
+
+    // Short enough that a Core still receiving would have polled several times over.
+    core->set_poll_interval(10ms);
+    std::this_thread::sleep_for(150ms);
+    TestHelper::drain(*core);
+    CHECK(polls() == 0);
+
+    // Not a whole interval later: the app is back and wants what arrived meanwhile.
+    core->set_poll_interval(1h);
+    core->set_receiving(true);
+    TestHelper::drain(*core);
+    CHECK(polls() == 1);
+}
+
 TEST_CASE("Poll: the sync cursor advances only after the batch is handled", "[core][poll]") {
     // Attached below, once there is a Core to own it; the callback that reads it does not run
     // until then either.
