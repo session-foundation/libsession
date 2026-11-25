@@ -2,3 +2,4 @@
 0002-Include-the-libquic-headers-each-file-uses.patch
 0003-Include-variant-where-std-variant-and-std-visit-are-.patch
 0004-Include-ngtcp2.h-for-NGTCP2_ERR_HANDSHAKE_TIMEOUT.patch
+0005-Fix-includes-for-fmt-12-and-GCC-16.patch

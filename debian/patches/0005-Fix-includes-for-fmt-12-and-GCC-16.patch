@@ -1,0 +1,90 @@
+From: Jason Rhinelander <jason@imaginary.ca>
+Date: Sat, 21 Nov 2026 17:04:46 -0400
+Subject: Fix includes for fmt 12 and GCC 16
+
+fmt 12 made fmt/core.h equivalent to fmt/base.h, which doesn't declare
+fmt::format, so files using it now include fmt/format.h.  GCC 16's
+libstdc++ no longer pulls in <cstdlib>, <cstring> or <stdexcept>
+transitively, which types.cpp relied on.
+---
+ include/session/network/backends/backend_util.hpp | 2 ++
+ include/session/parse_error.hpp                   | 2 +-
+ src/json_parser.hpp                               | 2 +-
+ src/pro_backend.cpp                               | 2 +-
+ src/session_protocol.cpp                          | 2 +-
+ src/types.cpp                                     | 5 ++++-
+ 6 files changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/include/session/network/backends/backend_util.hpp b/include/session/network/backends/backend_util.hpp
+index 5a2a9d2..b0b71ae 100644
+--- a/include/session/network/backends/backend_util.hpp
++++ b/include/session/network/backends/backend_util.hpp
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <fmt/format.h>
++
+ #include <iostream>
+ #include <string_view>
+ #include <vector>
+diff --git a/include/session/parse_error.hpp b/include/session/parse_error.hpp
+index 7af204e..9547e96 100644
+--- a/include/session/parse_error.hpp
++++ b/include/session/parse_error.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-#include <fmt/core.h>
++#include <fmt/format.h>
+ 
+ #include <stdexcept>
+ #include <string>
+diff --git a/src/json_parser.hpp b/src/json_parser.hpp
+index 9ec65b6..c018118 100644
+--- a/src/json_parser.hpp
++++ b/src/json_parser.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-#include <fmt/core.h>
++#include <fmt/format.h>
+ #include <oxenc/hex.h>
+ 
+ #include <chrono>
+diff --git a/src/pro_backend.cpp b/src/pro_backend.cpp
+index 9ee5013..1bd92e2 100644
+--- a/src/pro_backend.cpp
++++ b/src/pro_backend.cpp
+@@ -1,4 +1,4 @@
+-#include <fmt/core.h>
++#include <fmt/format.h>
+ #include <oxenc/hex.h>
+ #include <session/export.h>
+ #include <session/pro_backend.h>
+diff --git a/src/session_protocol.cpp b/src/session_protocol.cpp
+index 0f9d50c..d4e19cc 100644
+--- a/src/session_protocol.cpp
++++ b/src/session_protocol.cpp
+@@ -1,4 +1,4 @@
+-#include <fmt/core.h>
++#include <fmt/format.h>
+ #include <oxenc/endian.h>
+ #include <oxenc/hex.h>
+ #include <session/config/groups/keys.h>
+diff --git a/src/types.cpp b/src/types.cpp
+index 230dee6..78de692 100644
+--- a/src/types.cpp
++++ b/src/types.cpp
+@@ -1,8 +1,11 @@
+-#include <fmt/core.h>
++#include <fmt/format.h>
+ #include <session/types.h>
+ 
+ #include <cstdarg>
++#include <cstdlib>
++#include <cstring>
+ #include <session/types.hpp>
++#include <stdexcept>
+ 
+ namespace session {
+ span_u8 span_u8_alloc_or_throw(size_t size) {
