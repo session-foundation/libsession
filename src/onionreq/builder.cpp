@@ -89,9 +89,8 @@ Builder::Builder(
 }
 
 void Builder::add_hop(std::span<const unsigned char> remote_key) {
-    hops_.push_back(
-            {network::ed25519_pubkey::from_bytes(remote_key),
-             network::compute_x25519_pubkey(remote_key)});
+    auto ed25519_key = network::ed25519_pubkey::from_bytes(remote_key);
+    hops_.push_back({ed25519_key, network::compute_x25519_pubkey(ed25519_key)});
 }
 
 void Builder::set_destination(network_destination destination) {
