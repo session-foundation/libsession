@@ -92,7 +92,9 @@ target_link_libraries(test_libs INTERFACE
     session::SQLite
     sessiondep::libsodium
     nlohmann_json::nlohmann_json
-    oxen::logging)
+    oxen::logging
+    # test_session_encrypt uses session::mlkem768 directly.
+    session-router::core)
 
 target_link_libraries(test_libs INTERFACE
     libsession::network

@@ -117,8 +117,8 @@ target_link_libraries(crypto
     sessiondep::nettle
     sessiondep::simdutf
     sessiondep::libutf8proc
-    # Implements session::mlkem768, which include/session/crypto/mlkem768.hpp declares.
-    session-router-cryptography
+    # session::mlkem768
+    session-router::core
     nlohmann_json::nlohmann_json
     libsession::protos
 )
@@ -169,6 +169,8 @@ target_link_libraries(
     sessiondep::libsodium
     nlohmann_json::nlohmann_json
     oxen::quic
+    # session::mlkem768
+    session-router::core
 )
 
 target_link_libraries(config
@@ -209,9 +211,9 @@ target_link_libraries(network
     PUBLIC
     crypto
     oxen::quic
-    session-router::core
     nlohmann_json::nlohmann_json
     PRIVATE
+    session-router::core
     sessiondep::libsodium
     sessiondep::nettle
     date::date
