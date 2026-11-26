@@ -1135,15 +1135,9 @@ TEST_CASE("Push decide: generic and silent failures", "[push_notifications]") {
     // clear.
     CHECK_FALSE(d.decide({Handled::undecryptable, std::nullopt, std::nullopt}));
 
-    // In the inbox but unreadable: shown when ours and we lack the keys, silent when no key of ours
-    // opens it, which anyone can cause.
+    // In the inbox but unreadable: silent whatever the reason, since a sender can choose each one.
     using F = core::MessageDecryptFailure;
-    for (auto why : {F::no_pfs_key, F::unknown_version}) {
-        auto n = d.decide({Handled::unreadable, dm_payload, std::nullopt, why});
-        REQUIRE(n);
-        CHECK(n->kind == NotificationContent::Kind::generic);
-    }
-    for (auto why : {F::decrypt_failed, F::bad_format})
+    for (auto why : {F::no_pfs_key, F::unknown_version, F::decrypt_failed, F::bad_format})
         CHECK_FALSE(d.decide({Handled::unreadable, dm_payload, std::nullopt, why}));
     for (auto outcome : {Handled::not_found, Handled::fetch_failed}) {
         auto n = d.decide({outcome, dm_payload, std::nullopt});
@@ -1240,10 +1234,7 @@ TEST_CASE(
     CHECK(h.outcome == push::Handled::unreadable);
     CHECK(h.unreadable_because == core::MessageDecryptFailure::no_pfs_key);
     CHECK_FALSE(h.message);
-
-    auto n = x.notifications.decide(h, "You");
-    REQUIRE(n);
-    CHECK(n->kind == push::NotificationContent::Kind::generic);
+    CHECK_FALSE(x.notifications.decide(h, "You"));
 }
 
 TEST_CASE(

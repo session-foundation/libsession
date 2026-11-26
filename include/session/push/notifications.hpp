@@ -321,12 +321,12 @@ class Notifications {
     /// the request is removed.  `open` is the conversation on screen, which gets no notification.
     /// Mentions-only is a group setting and reads as "all" on a one-to-one conversation.
     ///
-    /// Generic: a push whose payload would not decode, a one-to-one message that had to be fetched
-    /// and could not be, and one that will not decrypt for want of keys or because it is of a
-    /// version this build cannot read.  Silent, and logged: a payload that will not decrypt, which
-    /// came under a subscription this database does not hold (another account's, or one from before
-    /// the device was cleared), and a one-to-one message that will not decrypt or parse with the
-    /// keys we have, which anyone can store in an account's inbox.  Everything else is silent too:
+    /// Generic: a push whose payload would not decode, and a one-to-one message that had to be
+    /// fetched and could not be.  Silent, and logged: a payload that will not decrypt, which came
+    /// under a subscription this database does not hold (another account's, or one from before the
+    /// device was cleared), and a one-to-one message we could not read for any reason, since anyone
+    /// can store in an account's inbox and choose the reason; a message from a newer client, or
+    /// under keys a rotation has not yet brought, goes unannounced.  Everything else is silent too:
     /// configs, control messages (none of which Client stores), our own messages, and pushes for
     /// swarms we do not hold.
     ///

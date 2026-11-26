@@ -103,6 +103,19 @@ SELECT COALESCE(ct.nickname, a.name) FROM accounts a LEFT JOIN contacts ct ON ct
         return out;
     }
 
+    std::string_view unreadable_reason(std::optional<core::MessageDecryptFailure> why) {
+        using F = core::MessageDecryptFailure;
+        if (!why)
+            return "no reason given";
+        switch (*why) {
+            case F::no_pfs_key: return "no key matches";
+            case F::decrypt_failed: return "decrypt failed";
+            case F::bad_format: return "bad format";
+            case F::unknown_version: return "unknown version";
+        }
+        return "unknown reason";
+    }
+
 }  // namespace
 
 std::optional<NotificationContent> Notifications::decide(
@@ -117,23 +130,17 @@ std::optional<NotificationContent> Notifications::decide(
             return std::nullopt;
         case Handled::malformed: return generic();
 
-        // A one-to-one message we know exists and could not read: shown when it is ours and we
-        // lack what reads it, and silent when no key of ours opens it, since anyone can store
-        // something in an account's inbox.
+        // A one-to-one message we know exists and could not read.  Anyone can store in an
+        // account's inbox and choose every reason, the version byte and the key indicator among
+        // them, so none is shown: a message from a newer client, or under keys a rotation has not
+        // yet brought, goes unannounced until the app reads it.
         case Handled::unreadable:
-            if (!handled.payload || handled.payload->ns != config::Namespace::Default)
-                return std::nullopt;
-            if (handled.unreadable_because == core::MessageDecryptFailure::decrypt_failed ||
-                handled.unreadable_because == core::MessageDecryptFailure::bad_format) {
+            if (handled.payload && handled.payload->ns == config::Namespace::Default)
                 log::info(
                         cat,
-                        "Silenced a pushed message that does not decrypt or parse: {}",
-                        handled.unreadable_because == core::MessageDecryptFailure::bad_format
-                                ? "bad format"
-                                : "decrypt failed");
-                return std::nullopt;
-            }
-            return generic();
+                        "Silenced a pushed message we could not read: {}",
+                        unreadable_reason(handled.unreadable_because));
+            return std::nullopt;
 
         case Handled::not_found:
         case Handled::fetch_failed:
