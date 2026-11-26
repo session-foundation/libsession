@@ -222,15 +222,15 @@ def linux(
         })
     return workflow(name, "linux/" + arch, steps, clone = clone)
 
-def clang(version):
+def clang(version, distro = "Debian sid", image = "debian-sid-clang"):
     return linux(
-        "Debian sid: clang-%d" % version,
-        "debian-sid-clang",
+        "%s: clang-%d" % (distro, version),
+        image,
         deps = ["clang-%d" % version] + lib_deps,
         cmake = {"CMAKE_C_COMPILER": "clang-%d" % version, "CMAKE_CXX_COMPILER": "clang++-%d" % version},
     )
 
-def full_llvm(version, cxx = None):
+def full_llvm(version, cxx = None, distro = "Debian sid", image = "debian-sid-clang"):
     cmake = {
         "CMAKE_C_COMPILER": "clang-%d" % version,
         "CMAKE_CXX_COMPILER": "clang++-%d" % version,
@@ -245,8 +245,8 @@ def full_llvm(version, cxx = None):
     if cxx:
         cmake["CMAKE_CXX_STANDARD"] = cxx
     return linux(
-        "Debian sid: llvm-%d" % version + ("" if cxx == None else ": C++%d" % cxx),
-        "debian-sid-clang",
+        "%s: llvm-%d" % (distro, version) + ("" if cxx == None else ": C++%d" % cxx),
+        image,
         deps = [
             "clang-%d" % version,
             "lld-%d" % version,
@@ -417,10 +417,10 @@ def main(ctx):
         linux("Debian sid: C++23", "debian-sid", cmake = {"CMAKE_CXX_STANDARD": 23}),
         full_llvm(23, cxx = 23),
 
-        clang(19),
-        full_llvm(19),
         linux("Debian stable (i386)", "debian-stable/i386"),
         linux("Debian 13", "debian-trixie", checks = [tests(), schema_history], clone = full_clone),
+        clang(19, "Debian 13", "debian-trixie"),
+        full_llvm(19, distro = "Debian 13", image = "debian-trixie"),
         linux("Debian 12", "debian-bookworm", meson = "bookworm-backports"),
         linux("Ubuntu latest", "ubuntu-rolling"),
         linux("Ubuntu LTS", "ubuntu-lts"),
