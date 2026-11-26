@@ -274,3 +274,50 @@ TEST_CASE("blake2b_pers integer args are little-endian", "[hash][blake2b][endian
         CHECK(blake2b_pers<32>(pers, v) == blake2b_pers<32>(pers, le));
     }
 }
+
+TEST_CASE("blake2b keys longer than 64 bytes are truncated", "[hash][blake2b]") {
+    using session::hash::blake2b_hasher;
+
+    std::vector<std::byte> key(80);
+    for (size_t i = 0; i < key.size(); i++)
+        key[i] = static_cast<std::byte>(i);
+
+    auto full = blake2b_hasher<32>{key, std::nullopt}.update("TestMessage"_bytes).finalize();
+    auto first64 = blake2b_hasher<32>{std::span{key}.first(64), std::nullopt}
+                           .update("TestMessage"_bytes)
+                           .finalize();
+    CHECK(full == first64);
+}
+
+TEST_CASE("SHA-512 and HMAC-SHA-256 known-answer tests", "[hash][sha512][hmac_sha256]") {
+    using session::hash::hmac_sha256;
+    using session::hash::sha512;
+
+    // The integer arguments are the little-endian encodings of the text they stand in for, so the
+    // known answers also pin make_hashable's byte order when mixed with containers in one call.
+
+    // FIPS 180-2 "abc"
+    constexpr auto abc_sha512 =
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+            "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f";
+    std::array<std::byte, 64> h512;
+    sha512(h512, "abc"_bytes);
+    CHECK(oxenc::to_hex(h512) == abc_sha512);
+    sha512(h512, std::byte{'a'}, uint16_t{0x6362});
+    CHECK(oxenc::to_hex(h512) == abc_sha512);
+    sha512(h512, uint16_t{0x6261}, std::string_view{"c"});
+    CHECK(oxenc::to_hex(h512) == abc_sha512);
+
+    // RFC 4231 test case 2
+    constexpr auto jefe_hmac = "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+    session::b32 mac;
+    hmac_sha256(mac, "Jefe"_bytes, "what do ya want for nothing?"_bytes);
+    CHECK(oxenc::to_hex(mac) == jefe_hmac);
+    hmac_sha256(
+            mac,
+            std::string_view{"Jefe"},
+            uint32_t{0x74616877},
+            " do ya want "_bytes,
+            std::string{"for nothing?"});
+    CHECK(oxenc::to_hex(mac) == jefe_hmac);
+}
