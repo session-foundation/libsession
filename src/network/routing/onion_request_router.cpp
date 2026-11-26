@@ -8,7 +8,9 @@
 #include <fstream>
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
+#include <oxen/quic/result.hpp>
 #include <ranges>
+#include <unordered_set>
 
 #include "session/file.hpp"
 #include "session/hash.hpp"
@@ -1324,7 +1326,7 @@ void OnionRequestRouter::_on_edge_connectivity_response(
                 edge_node.remote_pubkey.short_string());
 
         // The "handshake timeout" error already records a node failure, so don't record another
-        if (error_code && *error_code != static_cast<uint64_t>(NGTCP2_ERR_HANDSHAKE_TIMEOUT))
+        if (error_code && *error_code != quic::CONN_HANDSHAKE_TIMEOUT)
             if (auto snode_pool = _snode_pool.lock())
                 snode_pool->record_node_failure(edge_node);
 

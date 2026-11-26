@@ -3,6 +3,7 @@
 #include <atomic>
 #include <functional>
 #include <optional>
+#include <oxen/quic/connection_ids.hpp>
 #include <oxen/quic/loop.hpp>
 #include <set>
 #include <string>
@@ -14,7 +15,6 @@
 
 namespace oxen::quic {
 class Endpoint;
-struct ConnectionID;
 }  // namespace oxen::quic
 
 namespace session::network {

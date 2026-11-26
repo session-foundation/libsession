@@ -1,6 +1,7 @@
 #include "session/onionreq/response_parser.hpp"
 
 #include <oxenc/base64.h>
+#include <oxenc/bt_serialize.h>
 #include <oxenc/endian.h>
 #include <sodium/core.h>
 

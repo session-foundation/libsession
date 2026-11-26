@@ -8,6 +8,7 @@
 #include <session/client.hpp>
 #include <session/hash.hpp>
 #include <session/network/backends/session_file_server.hpp>
+#include <session/random.hpp>
 #include <session/sqlite.hpp>
 
 #include "live_utils.hpp"
@@ -62,7 +63,7 @@ TEST_CASE(
     auto file = std::filesystem::temp_directory_path() / "live_attachment_send.bin";
     // Large enough that the upload reports progress before its outcome, not only the outcome.
     std::vector<std::byte> contents(2 * 1024 * 1024);
-    randombytes_buf(contents.data(), contents.size());
+    random::fill(contents);
     {
         std::ofstream out{file, std::ios::binary};
         out.write(reinterpret_cast<const char*>(contents.data()), contents.size());

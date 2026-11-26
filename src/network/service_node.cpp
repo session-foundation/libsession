@@ -3,7 +3,7 @@
 #include <fmt/ranges.h>
 
 #include <oxen/log/format.hpp>
-#include <oxen/quic.hpp>
+#include <oxen/quic/ip.hpp>
 #include <oxen/quic/utils.hpp>
 
 using namespace oxen;

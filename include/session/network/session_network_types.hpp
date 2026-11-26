@@ -5,6 +5,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "session/attachments.hpp"
