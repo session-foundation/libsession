@@ -27,6 +27,22 @@ namespace {
     // extension open the same database, and both need these.
     constexpr auto KEY_ENC_KEY = "push_enc_key"sv;
     constexpr auto KEY_SUBSCRIPTION = "push_subscription"sv;
+    // The service and token of a subscribe sent and not yet answered: the server can accept one
+    // whose answer never arrives (a timeout, or the Client destroyed), and an unsubscribe has to
+    // undo that too.
+    constexpr auto KEY_ATTEMPT = "push_subscription_attempt"sv;
+
+    std::optional<std::pair<std::string, std::string>> load_attempt(core::Core& core) {
+        auto text = core.globals.get_text(KEY_ATTEMPT);
+        if (!text)
+            return std::nullopt;
+        try {
+            auto j = nlohmann::json::parse(*text);
+            return std::pair{j.at("service").get<std::string>(), j.at("token").get<std::string>()};
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    }
 
     constexpr auto ENDPOINT_SUBSCRIBE = "subscribe"sv;
     constexpr auto ENDPOINT_UNSUBSCRIBE = "unsubscribe"sv;
@@ -321,6 +337,8 @@ void Notifications::subscribe(Device device, result_function<SubscribeResult> cb
 
         nlohmann::json requests = nlohmann::json::array();
         requests.push_back(subscribe_request(*core, device, namespaces, /*data=*/true, key));
+        core->globals.set(
+                KEY_ATTEMPT, nlohmann::json{{"service", service}, {"token", device.token}}.dump());
 
         send(*core,
              server,
@@ -336,6 +354,7 @@ void Notifications::subscribe(Device device, result_function<SubscribeResult> cb
 
                  store_recorded(
                          *core, Recorded{service, device.token, namespaces, true, clock_now_ms()});
+                 core->globals.erase(KEY_ATTEMPT);
                  log::info(cat, "Subscribed to push notifications through {}", service);
 
                  // The old token's subscription would otherwise linger at the push server until
@@ -363,8 +382,16 @@ void Notifications::unsubscribe(result_function<bool> cb) {
     auto* core = &_client.core;
     auto* client = &_client;
     core->call([core, client, server = _server, cb = std::move(cb)]() mutable {
-        auto previous = load_recorded(*core);
-        if (!previous)
+        // What is recorded, or else a subscribe whose answer never came, which the server may have
+        // accepted all the same.
+        auto recorded = load_recorded(*core);
+        auto attempt = load_attempt(*core);
+        std::optional<std::pair<std::string, std::string>> target;
+        if (recorded)
+            target.emplace(recorded->service, recorded->token);
+        else if (attempt)
+            target = attempt;
+        if (!target)
             return ClientAccess::report(*client, cb, Expected<bool>{true});
         if (!core->network() || !core->globals.have_account())
             return ClientAccess::report(
@@ -374,7 +401,7 @@ void Notifications::unsubscribe(result_function<bool> cb) {
                             Error{client::err::network_unavailable, "no network or no account"}}});
 
         nlohmann::json requests = nlohmann::json::array();
-        requests.push_back(unsubscribe_request(*core, previous->service, previous->token));
+        requests.push_back(unsubscribe_request(*core, target->first, target->second));
         send(*core,
              server,
              ENDPOINT_UNSUBSCRIBE,
@@ -384,6 +411,7 @@ void Notifications::unsubscribe(result_function<bool> cb) {
                      return ClientAccess::report(
                              *client, cb, Expected<bool>{unexpected{std::move(*error)}});
                  core->globals.erase(KEY_SUBSCRIPTION);
+                 core->globals.erase(KEY_ATTEMPT);
                  ClientAccess::report(*client, cb, Expected<bool>{true});
              });
     });

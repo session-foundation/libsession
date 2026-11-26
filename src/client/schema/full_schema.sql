@@ -498,13 +498,14 @@ CREATE INDEX message_attachments_cached ON message_attachments(cached) WHERE cac
 -- The messages a notification has been posted for, by whichever process sharing this database
 -- posted it: the claim that keeps an application and its notification extension from both posting
 -- one for the same message, whichever of them received it first.  push::Notifications::claim reads
--- and writes it; it lives in Client's schema because push has none of its own.  A row goes with its
--- message, or sooner: push prunes rows that can no longer matter, keeping each conversation's
--- newest.
+-- and writes it; it lives in Client's schema because push has none of its own.  A row outlives its
+-- message, so that the notification is still reported for taking down once the message is deleted
+-- outright; push prunes rows that can no longer matter, keeping each conversation's newest.
 CREATE TABLE notified (
-    message INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    message INTEGER PRIMARY KEY,        -- messages.id, never reused; no foreign key (see above)
+    hash TEXT,                          -- the message's swarm hash, which names its notification
     at INTEGER NOT NULL,                -- ms since epoch
-    -- When it was reported for taking down, its message having been read or deleted; ms since
-    -- epoch.  Only ever set on a row about to be pruned or kept as its conversation's newest.
+    -- When it was first reported for taking down, its message having been read or deleted; ms
+    -- since epoch.
     removed INTEGER
 ) STRICT;

@@ -101,6 +101,10 @@ struct HandledPush {
     /// What is stored for the message once handling is done, as for `FetchedMessage::message`:
     /// set for a message the Client keeps, however it arrived.
     std::optional<client::Message> message;
+
+    /// Why the message would not decrypt, for `unreadable`: whether it was ours and we lack the
+    /// keys, or not something any key of ours opens.
+    std::optional<core::MessageDecryptFailure> unreadable_because = std::nullopt;
 };
 
 /// The kind of a message's first attachment, for the platform's attachment placeholder ("📷
@@ -209,6 +213,9 @@ class Notifications {
     /// without the message.
     static constexpr auto FETCH_RETRY_DELAY = 2s;
 
+    /// The most rounds `fetch_message` asks in, the deadline allowing.
+    static constexpr int FETCH_ROUNDS = 4;
+
     /// How old a subscription may get before `subscribe` renews it anyway.  The push server drops a
     /// subscription whose signature is over 14 days old; renewing daily, on any run of the app,
     /// keeps people who rarely open it subscribed.
@@ -282,12 +289,19 @@ class Notifications {
     /// A claim lasts until it can no longer matter -- its notification taken down, or
     /// CLAIM_LIFETIME gone by -- except that a conversation's newest claim lasts as long as its
     /// message, which is what keeps a message request to one notification; `stale` prunes them.
-    /// Throws if no such message exists.  Blocks until done; callable from any thread.
+    /// A claim outlives its message, so that its notification is still reported for taking down
+    /// once the message is deleted outright.  False if no such message exists.  Blocks until done;
+    /// callable from any thread.
     bool claim(int64_t message_id);
 
     /// How long a claim is kept: the longest a one-to-one message stays in a swarm, and so the
     /// longest it can be delivered a second time and need deduplicating.
     static constexpr auto CLAIM_LIFETIME = std::chrono::days{14};
+
+    /// How long `stale` keeps reporting a notification after it first did: the process that took
+    /// it down can be stopped before it has (a notification extension at its time limit), and a
+    /// take-down of one already gone does nothing.
+    static constexpr auto REPORT_STALE_FOR = std::chrono::days{1};
 
     /// Shared by every generic notification as both identifier and thread.
     static constexpr std::string_view GENERIC_ID = "generic";
@@ -307,8 +321,12 @@ class Notifications {
     /// the request is removed.  `open` is the conversation on screen, which gets no notification.
     /// Mentions-only is a group setting and reads as "all" on a one-to-one conversation.
     ///
-    /// Generic: a push whose payload would not decrypt or decode, and a one-to-one message that
-    /// had to be fetched and could not be, or that did not decrypt.  Everything else is silent:
+    /// Generic: a push whose payload would not decode, a one-to-one message that had to be fetched
+    /// and could not be, and one that will not decrypt for want of keys or because it is of a
+    /// version this build cannot read.  Silent, and logged: a payload that will not decrypt, which
+    /// came under a subscription this database does not hold (another account's, or one from before
+    /// the device was cleared), and a one-to-one message that will not decrypt or parse with the
+    /// keys we have, which anyone can store in an account's inbox.  Everything else is silent too:
     /// configs, control messages (none of which Client stores), our own messages, and pushes for
     /// swarms we do not hold.
     ///
@@ -327,10 +345,10 @@ class Notifications {
             std::optional<client::ConversationId> open = std::nullopt);
 
     /// The identifiers of shown notifications whose messages have since been read or deleted, to
-    /// take down; each is reported once.  Also prunes claims that can no longer matter (see
-    /// `claim`).  Call after `handle`, and whenever read state changes --
-    /// which, for what was read on another device, `handle` fetches.  Blocks; callable from any
-    /// thread.
+    /// take down; each is reported until REPORT_STALE_FOR has passed since it first was.  Also
+    /// prunes claims that can no longer matter (see `claim`).  Call after `handle`, and whenever
+    /// read state changes -- which, for what was read on another device, `handle` fetches.  Blocks;
+    /// callable from any thread.
     std::vector<std::string> stale();
 
     /// Namespaces subscribed without message data whose pushes `handle` fetches for, because what

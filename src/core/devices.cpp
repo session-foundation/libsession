@@ -1490,7 +1490,10 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
         }
     }
 
-    if (!is_final)
+    // A one-shot Core (a notification extension's) has no handlers to fire, and clearing the rows
+    // here would leave the application's Core, which does, never knowing of the link request or
+    // the removal: the rows stay pending for it.
+    if (!is_final || core.one_shot())
         return;
 
     // Fire deferred callbacks for all devices with a pending processing state.  We collect first

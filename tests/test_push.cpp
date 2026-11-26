@@ -153,7 +153,7 @@ TEST_CASE("Push fetch: the first member holding it ends the fetch", "[push_notif
                   member_of(sent[1])) == "h-target");
 }
 
-TEST_CASE("Push fetch: asks again once when no member has it yet", "[push_notifications]") {
+TEST_CASE("Push fetch: asks again while no member has it yet", "[push_notifications]") {
     Setup s{3};
     s.fetch("h-target", 10s);
     for (auto& r : take_retrieves(*s.net))
@@ -171,9 +171,18 @@ TEST_CASE("Push fetch: asks again once when no member has it yet", "[push_notifi
         CHECK(s.outcomes() == std::vector{FetchResult::found});
     }
 
-    SECTION("and stops after that one retry") {
-        for (auto& r : take_retrieves(*s.net))
-            s.reply(r, answer({}));
+    SECTION("and stops after its last round") {
+        // FETCH_ROUNDS in all, this being the second.
+        for (int round = 2; round <= Notifications::FETCH_ROUNDS; round++) {
+            auto again = take_retrieves(*s.net);
+            REQUIRE(again.size() == 3);
+            for (auto& r : again)
+                s.reply(r, answer({}));
+            if (round < Notifications::FETCH_ROUNDS) {
+                CHECK(s.results.empty());
+                s.wait(PAST_THE_RETRY);
+            }
+        }
         CHECK(s.outcomes() == std::vector{FetchResult::not_found});
 
         s.wait(PAST_THE_RETRY);
@@ -698,6 +707,25 @@ TEST_CASE("Push subscribe: unsubscribing", "[push_notifications]") {
     CHECK(take_sent_to(*s.net, "subscribe").size() == 1);
 }
 
+TEST_CASE(
+        "Push subscribe: unsubscribing undoes a subscribe whose answer never came",
+        "[push_notifications]") {
+    Subscriber s;
+    // Sent, and perhaps accepted by the server, but its answer never arrives.
+    s.subscribe("token-2");
+    REQUIRE(take_sent_to(*s.net, "subscribe").size() == 1);
+
+    std::vector<Expected<bool>> results;
+    s.notifications->unsubscribe([&](auto r) { results.push_back(std::move(r)); });
+    TestHelper::drain(s.c->core);
+    auto sent = take_sent_to(*s.net, "unsubscribe");
+    REQUIRE(sent.size() == 1);
+    CHECK(body_of(sent[0])[0]["service_info"]["token"] == "token-2");
+    s.reply(sent[0], R"([{"success": true, "removed": true}])");
+    REQUIRE(results.size() == 1);
+    CHECK(*results[0]);
+}
+
 TEST_CASE("Push subscribe: the encryption key is kept", "[push_notifications]") {
     TempClient c;
     auto key = Notifications{*c}.encryption_key();
@@ -812,12 +840,14 @@ TEST_CASE("Push handle: a push without data", "[push_notifications]") {
         auto sent = take_retrieves(*x.net);
         REQUIRE(sent.size() == 1);
         CHECK(retrieve_params(sent[0])["namespace"] == 21);
-        // Empty both times: the first round and its retry.
+        // Empty every round, FETCH_ROUNDS of them.
         x.reply(sent[0], answer({}));
-        x.wait(PAST_THE_RETRY);
-        auto again = take_retrieves(*x.net);
-        REQUIRE(again.size() == 1);
-        x.reply(again[0], answer({}));
+        for (int round = 2; round <= Notifications::FETCH_ROUNDS; round++) {
+            x.wait(PAST_THE_RETRY);
+            auto again = take_retrieves(*x.net);
+            REQUIRE(again.size() == 1);
+            x.reply(again[0], answer({}));
+        }
         CHECK(x.only().outcome == push::Handled::not_found);
     }
 
@@ -905,7 +935,8 @@ TEST_CASE(
     CHECK_FALSE(from_app.claim(id));
     CHECK_FALSE(from_extension.claim(id));
 
-    CHECK_THROWS(from_app.claim(id + 1000));
+    // No such message: nothing to claim.
+    CHECK_FALSE(from_app.claim(id + 1000));
 }
 
 // ── Deciding what to show ───────────────────────────────────────────────────────────────────────
@@ -1072,12 +1103,25 @@ TEST_CASE("Push decide: generic and silent failures", "[push_notifications]") {
     push::Payload config_payload;
     config_payload.ns = config::Namespace::UserGroups;
 
-    for (auto outcome : {Handled::undecryptable, Handled::malformed}) {
-        auto n = d.decide({outcome, std::nullopt, std::nullopt});
+    auto malformed = d.decide({Handled::malformed, std::nullopt, std::nullopt});
+    REQUIRE(malformed);
+    CHECK(malformed->kind == NotificationContent::Kind::generic);
+    CHECK(malformed->id == Notifications::GENERIC_ID);
+
+    // Under a subscription this database does not hold: another account's, or one from before a
+    // clear.
+    CHECK_FALSE(d.decide({Handled::undecryptable, std::nullopt, std::nullopt}));
+
+    // In the inbox but unreadable: shown when ours and we lack the keys, silent when no key of ours
+    // opens it, which anyone can cause.
+    using F = core::MessageDecryptFailure;
+    for (auto why : {F::no_pfs_key, F::unknown_version}) {
+        auto n = d.decide({Handled::unreadable, dm_payload, std::nullopt, why});
         REQUIRE(n);
         CHECK(n->kind == NotificationContent::Kind::generic);
-        CHECK(n->id == Notifications::GENERIC_ID);
     }
+    for (auto why : {F::decrypt_failed, F::bad_format})
+        CHECK_FALSE(d.decide({Handled::unreadable, dm_payload, std::nullopt, why}));
     for (auto outcome : {Handled::not_found, Handled::fetch_failed}) {
         auto n = d.decide({outcome, dm_payload, std::nullopt});
         REQUIRE(n);
@@ -1106,9 +1150,34 @@ TEST_CASE(
     auto stale = d.notifications.stale();
     std::ranges::sort(stale);
     CHECK(stale == std::vector<std::string>{"h-a", "h-b"});
-    // Once each, and still claimed: never shown again.
-    CHECK(d.notifications.stale().empty());
     CHECK_FALSE(d.decide(a));
+
+    // Reported again for a while, in case whoever took them down was stopped first...
+    auto again = d.notifications.stale();
+    std::ranges::sort(again);
+    CHECK(again == stale);
+
+    // ...and not once that while is up.
+    d.c->core.call_get([&] {
+        d.c->core.database().conn().prepared_exec(
+                "UPDATE notified SET removed = ?",
+                epoch_ms(clock_now_ms() - Notifications::REPORT_STALE_FOR - 1h));
+    });
+    CHECK(d.notifications.stale().empty());
+}
+
+TEST_CASE(
+        "Push stale: a deleted conversation's notifications are reported", "[push_notifications]") {
+    Decider d;
+    SenderKeys alice;
+    approve(*d.c, alice.session_id);
+    auto a = d.arrived(alice, "one", "h-a");
+    REQUIRE(d.decide(a));
+
+    // Deleting it deletes its messages outright, and the claim outlives them.
+    d.c->conversation(client::ConversationId::dm(alice.session_id), await)
+            ->delete_conversation(await);
+    CHECK(d.notifications.stale() == std::vector<std::string>{"h-a"});
 }
 
 // ── A message that arrives but will not decrypt ─────────────────────────────────────────────────
@@ -1146,6 +1215,7 @@ TEST_CASE(
     // Still no key that opens it.
     auto h = x.only();
     CHECK(h.outcome == push::Handled::unreadable);
+    CHECK(h.unreadable_because == core::MessageDecryptFailure::no_pfs_key);
     CHECK_FALSE(h.message);
 
     auto n = x.notifications.decide(h, "You");
@@ -1160,8 +1230,11 @@ TEST_CASE(
 
     SECTION("carried by the push") {
         x.handle(x.push_for(0, to_vector<std::byte>("not a message"sv)));
-        CHECK(x.only().outcome == push::Handled::unreadable);
+        auto h = x.only();
+        CHECK(h.outcome == push::Handled::unreadable);
         CHECK(take_retrieves(*x.net).empty());
+        // Anyone can store one of these in the inbox, so it shows nothing.
+        CHECK_FALSE(x.notifications.decide(h, "You"));
     }
 
     SECTION("fetched") {
@@ -1193,10 +1266,17 @@ TEST_CASE("Push stale: claims are pruned once they cannot matter", "[push_notifi
     REQUIRE(d.decide(r1));
     REQUIRE(claims() == 3);
 
-    SECTION("taken down: all but each conversation's newest go") {
+    SECTION("taken down: all but each conversation's newest go, once no longer reported") {
         d.c->conversation(client::ConversationId::dm(alice.session_id), await)->mark_read(await);
         d.c->conversation(client::ConversationId::dm(stranger.session_id), await)->mark_read(await);
         CHECK(d.notifications.stale().size() == 3);
+        CHECK(claims() == 3);
+        d.c->core.call_get([&] {
+            d.c->core.database().conn().prepared_exec(
+                    "UPDATE notified SET removed = ?",
+                    epoch_ms(clock_now_ms() - Notifications::REPORT_STALE_FOR - 1h));
+        });
+        CHECK(d.notifications.stale().empty());
         CHECK(claims() == 2);
 
         // The request's claim survives, so its next message still does not notify.

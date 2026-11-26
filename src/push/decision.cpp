@@ -110,14 +110,30 @@ std::optional<NotificationContent> Notifications::decide(
         std::string_view you,
         std::optional<client::ConversationId> open) {
     switch (handled.outcome) {
+        // Under a subscription this database does not hold: another account's, or one left from
+        // before the device was cleared.  The push server drops it in time.
         case Handled::undecryptable:
+            log::info(cat, "Silenced a push that does not decrypt with this database's key");
+            return std::nullopt;
         case Handled::malformed: return generic();
 
-        // A one-to-one message we know exists and could not read.
+        // A one-to-one message we know exists and could not read: shown when it is ours and we
+        // lack what reads it, and silent when no key of ours opens it, since anyone can store
+        // something in an account's inbox.
         case Handled::unreadable:
-            if (handled.payload && handled.payload->ns == config::Namespace::Default)
-                return generic();
-            return std::nullopt;
+            if (!handled.payload || handled.payload->ns != config::Namespace::Default)
+                return std::nullopt;
+            if (handled.unreadable_because == core::MessageDecryptFailure::decrypt_failed ||
+                handled.unreadable_because == core::MessageDecryptFailure::bad_format) {
+                log::info(
+                        cat,
+                        "Silenced a pushed message that does not decrypt or parse: {}",
+                        handled.unreadable_because == core::MessageDecryptFailure::bad_format
+                                ? "bad format"
+                                : "decrypt failed");
+                return std::nullopt;
+            }
+            return generic();
 
         case Handled::not_found:
         case Handled::fetch_failed:
@@ -224,29 +240,43 @@ std::vector<std::string> Notifications::stale() {
         auto tx = c.begin_immediate();
         std::vector<int64_t> gone;
         std::vector<std::string> ids;
-        for (auto&& [message, hash] : c.prepared_results<int64_t, std::optional<std::string>>(R"(
-SELECT n.message, m.swarm_hash
-  FROM notified n JOIN messages m ON m.id = n.message JOIN conversations c ON c.id = m.conversation
- WHERE n.removed IS NULL AND (m.deleted IS NOT NULL OR m.timestamp <= c.last_read)
-)")) {
-            gone.push_back(message);
+        auto now = epoch_ms(clock_now_ms());
+        auto report_since =
+                now -
+                std::chrono::duration_cast<std::chrono::milliseconds>(REPORT_STALE_FOR).count();
+        // A message gone altogether is stale too: its conversation deleted, cleared or declined.
+        // One reported already is reported again until REPORT_STALE_FOR is up, in case whoever
+        // took it down was stopped first.
+        for (auto&& [message, hash, removed] :
+             c.prepared_results<int64_t, std::optional<std::string>, std::optional<int64_t>>(
+                     R"(
+SELECT n.message, n.hash, n.removed
+  FROM notified n LEFT JOIN messages m ON m.id = n.message
+       LEFT JOIN conversations c ON c.id = m.conversation
+ WHERE (n.removed IS NULL OR n.removed >= ?)
+   AND (m.id IS NULL OR m.deleted IS NOT NULL OR m.timestamp <= c.last_read)
+)",
+                     report_since)) {
+            if (!removed)
+                gone.push_back(message);
             ids.push_back(notification_id(hash, message));
         }
-        auto now = epoch_ms(clock_now_ms());
         for (auto message : gone)
             c.prepared_exec("UPDATE notified SET removed = ? WHERE message = ?", now, message);
 
-        // Claims that can no longer matter go: one taken down, whose message is read or deleted and
-        // so would never be shown again anyway, and one older than any message stays in a swarm to
-        // be delivered a second time.  Each conversation's newest claim stays regardless: it is
-        // what holds a message request to the one notification for its first message.
+        // Claims that can no longer matter go: one taken down long enough ago to have stopped
+        // being reported, whose message is read or deleted and so would never be shown again
+        // anyway, and one older than any message stays in a swarm to be delivered a second time.
+        // Each conversation's newest claim stays regardless while its message does: it is what
+        // holds a message request to the one notification for its first message.
         c.prepared_exec(
                 R"(
 DELETE FROM notified
- WHERE (removed IS NOT NULL OR at < ?)
+ WHERE (removed < ?1 OR at < ?2)
    AND message NOT IN (SELECT MAX(n.message) FROM notified n JOIN messages m ON m.id = n.message
                         GROUP BY m.conversation)
 )",
+                report_since,
                 now - std::chrono::duration_cast<std::chrono::milliseconds>(CLAIM_LIFETIME)
                                 .count());
         tx.commit();

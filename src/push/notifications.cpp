@@ -200,10 +200,13 @@ namespace {
         if (op->concluded || --op->outstanding > 0)
             return;
 
-        // Every member of this round has answered without it.  Ask again once, after giving the
-        // swarm a moment to propagate, if the deadline leaves room for that and a request after it.
+        // Every member of this round has answered without it.  Ask again, after giving the swarm a
+        // moment to propagate, while the deadline leaves room for that and a request after it: a
+        // push can arrive well before the message has spread through the swarm, and a message from
+        // our own other device that is never found shows as the generic notification.
         auto retry_at = std::chrono::steady_clock::now() + Notifications::FETCH_RETRY_DELAY;
-        if (op->attempts < 2 && retry_at + MIN_ROUND_BUDGET < op->deadline) {
+        if (op->attempts < Notifications::FETCH_ROUNDS &&
+            retry_at + MIN_ROUND_BUDGET < op->deadline) {
             op->core->call_later(Notifications::FETCH_RETRY_DELAY, [op] { start_round(op); });
             return;
         }
@@ -267,12 +270,12 @@ namespace {
             std::chrono::steady_clock::time_point deadline,
             Handled delivered,
             result_function<HandledPush> cb) {
-        auto unreadable = [&client](Payload p, result_function<HandledPush> cb) {
+        auto unreadable = [&client, why](Payload p, result_function<HandledPush> cb) {
             ClientAccess::report(
                     client,
                     cb,
                     Expected<HandledPush>{
-                            HandledPush{Handled::unreadable, std::move(p), std::nullopt}});
+                            HandledPush{Handled::unreadable, std::move(p), std::nullopt, why}});
         };
 
         if (why != core::MessageDecryptFailure::no_pfs_key ||
@@ -356,9 +359,12 @@ bool Notifications::claim(int64_t message_id) {
     auto& core = _client.core;
     return core.call_get([&core, message_id] {
         return core.database().conn().prepared_exec(
-                       "INSERT INTO notified (message, at) VALUES (?, ?) ON CONFLICT DO NOTHING",
-                       message_id,
-                       epoch_ms(clock_now_ms())) > 0;
+                       R"(
+INSERT INTO notified (message, hash, at) SELECT id, swarm_hash, ? FROM messages WHERE id = ?
+    ON CONFLICT DO NOTHING
+)",
+                       epoch_ms(clock_now_ms()),
+                       message_id) > 0;
     });
 }
 
