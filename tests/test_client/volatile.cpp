@@ -127,3 +127,50 @@ TEST_CASE("Client: read state for a conversation we do not have is ignored", "[c
     CHECK_FALSE(c->conversation(id, await));
     CHECK(c->conversations(await).empty());
 }
+
+TEST_CASE("Client: a read point far ahead of our clock is held near it", "[client][volatile]") {
+    TempClient c;
+    SenderKeys them;
+    auto id = ConversationId::dm(them.session_id);
+    auto hex = oxenc::to_hex(them.session_id);
+    approve(*c, them.session_id);
+
+    // One message from a clock a month ahead, read up to by its own timestamp, as an app does.
+    auto ahead = clock_now_ms() + 30 * 24h;
+    deliver(*c, them, "from the future", ahead, "h1");
+    c->conversation(id, await)->mark_read(ahead, await);
+
+    // It stays unread until its time comes: the read point stops short of it...
+    CHECK(c->conversation(id, await)->unread() == 1);
+    auto entry = in_configs(*c, [&](auto& cfg) { return cfg.convo_info_volatile().get_1to1(hex); });
+    REQUIRE(entry);
+    CHECK(entry->last_read < ahead.time_since_epoch().count());
+
+    // ...and stops within minutes of now, past which arrivals count again.  (The lead is five
+    // minutes; ten is clear of it.)
+    deliver(*c, them, "soon", clock_now_ms() + 10min, "h2");
+    CHECK(c->conversation(id, await)->unread() == 2);
+}
+
+TEST_CASE(
+        "Client: a read point far ahead from another device is held near our clock",
+        "[client][volatile]") {
+    TempClient c;
+    SenderKeys them;
+    auto id = ConversationId::dm(them.session_id);
+    auto hex = oxenc::to_hex(them.session_id);
+    approve(*c, them.session_id);
+    deliver(*c, them, "one", recently(10s), "h1");
+
+    auto ahead = volatile_from_another_device(*c.client, [&](config::ConvoInfoVolatile& theirs) {
+        auto e = theirs.get_or_construct_1to1(hex);
+        e.last_read = (clock_now_ms() + 30 * 24h).time_since_epoch().count();
+        theirs.set(e);
+    });
+    merge_volatile(*c.client, ahead);
+    REQUIRE(c->conversation(id, await)->unread() == 0);
+
+    // Held within minutes of now: the lead is five minutes, and ten is clear of it.
+    deliver(*c, them, "two", clock_now_ms() + 10min, "h2");
+    CHECK(c->conversation(id, await)->unread() == 1);
+}

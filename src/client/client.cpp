@@ -2165,6 +2165,21 @@ AnyConversation Client::_create_conversation(const ConversationId& id) {
     return *_conversation(id);
 }
 
+namespace {
+    // How far ahead of our clock a conversation's read point may be.  The read point is a sender's
+    // timestamp, and an arrival counts as unread only if it is newer, so one message from a clock
+    // far ahead would otherwise park it there and have every later message arrive read until the
+    // clock caught up -- on every device, since it only moves forwards.  Bounded, reading such a
+    // message costs at most this long of arrivals counted read, and the message itself stays
+    // unread.  Short, then, but longer than the drift between two clocks that both take the
+    // network's time, so that an ordinary message is never left unread after being read.
+    constexpr auto READ_POINT_LEAD = 5min;
+
+    int64_t read_point_ceiling() {
+        return epoch_ms(clock_now_ms() + READ_POINT_LEAD);
+    }
+}  // namespace
+
 void Client::_mark_read(const ConversationId& id, std::optional<sys_ms> up_to) {
     int changed = 0;
     {
@@ -2189,6 +2204,7 @@ void Client::_mark_read(const ConversationId& id, std::optional<sys_ms> up_to) {
                 return;
             target = *newest;
         }
+        target = std::min(target, read_point_ceiling());
 
         // Moving last_read changes what counts as unread without touching any message, so the
         // triggers cannot see it; recompute here, where it is rare, rather than per list query.
@@ -3423,7 +3439,8 @@ SET last_read = ?2,
 WHERE id = ?1 AND last_read < ?2
 )"_format(UNREAD),
                                         *convo,
-                                        entry.last_read) > 0;
+                                        // Bounded as our own reads are: see READ_POINT_LEAD.
+                                        std::min(entry.last_read, read_point_ceiling())) > 0;
 
             // The flag is an ordinary setting, though: someone marking a conversation unread on
             // another device is telling us to, and there is no ordering to preserve.
