@@ -254,6 +254,10 @@ def full_llvm(version, cxx = None, distro = "Debian sid", image = "debian-sid-cl
             "libc++abi-%d-dev" % version,
         ] + lib_deps,
         system = libcxx_system_deps,
+        # The checks run in a container of their own, which needs libc++'s runtime to load the
+        # test binaries.  The runtime package's name differs between LLVM versions (libc++1-19,
+        # but plain libc++1 from 21), so it comes in as a dependency of the -dev package.
+        test_deps = test_deps + ["libc++-%d-dev" % version],
         cmake = cmake,
     )
 
