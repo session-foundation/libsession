@@ -33,6 +33,9 @@ namespace opt {
 
     /// Can be used to override the default (mainnet) netid that the network will populate it's
     /// internal caches from, 'devnet' allows for specifying a custom server.
+    ///
+    /// Testnet and devnet also turn subnet diversity off (see `disable_subnet_diversity`): their
+    /// nodes are all run by one party, whatever their addresses.
     struct netid {
         enum class Target {
             mainnet,
@@ -244,7 +247,9 @@ namespace opt {
     };
 
     /// Can be used to prevent the code from excluding nodes within the same `/24` subnet from being
-    /// included in the same path when building onion request or session router paths.
+    /// included in the same path when building onion request or session router paths.  Implied by a
+    /// testnet or devnet `netid`; on mainnet, a cache that spans too few subnets falls back to
+    /// sharing them only after refreshing from a trusted source (see `SnodePool`).
     struct disable_subnet_diversity {};
 
     struct retry_delay {
@@ -317,7 +322,10 @@ namespace opt {
     };
 
     /// Can be used to specify a path to a snode pool cache file that should be used if we are
-    /// unable to bootstrap.
+    /// unable to bootstrap, or to refresh a cache that spans too few subnets from the seed nodes.
+    ///
+    /// The file must be a pool of the network `netid` names: it carries no network of its own, so
+    /// nothing checks this.  A caller with no pool for that network should leave this unset.
     struct fallback_snode_pool_path {
         fs::path path;
         fallback_snode_pool_path(fs::path p) : path{p} {}

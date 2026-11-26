@@ -25,6 +25,13 @@ void Config::handle_config_opt(opt::netid netid_) {
     netid = netid_.target;
     seed_nodes = std::move(netid_.seed_nodes);
 
+    // Every testnet node is ours, whatever its address, and devnet nodes are a developer's own, so
+    // spreading a path across subnets protects nothing there - and their few subnets would only
+    // leave paths unbuildable.  Mainnet keeps it, with the pool's fallback for a cache that
+    // cannot satisfy it.
+    if (netid != opt::netid::Target::mainnet)
+        enforce_subnet_diversity = false;
+
     switch (netid_.target) {
         case opt::netid::Target::mainnet:
             log::debug(
