@@ -44,8 +44,6 @@ macro(add_libsession_util_library name)
         OUTPUT_NAME session-${name}
         SOVERSION ${LIBSESSION_LIBVERSION})
 
-    libsession_static_bundle(${name})
-
     list(APPEND export_targets ${name})
 endmacro()
 
@@ -318,7 +316,6 @@ else()
     endif()
 endif()
 add_library(version STATIC version.c)
-libsession_static_bundle(version)
 target_include_directories(version PRIVATE ../include)
 target_link_libraries(common INTERFACE version)
 
