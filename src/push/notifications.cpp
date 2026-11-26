@@ -202,8 +202,8 @@ namespace {
 
         // Every member of this round has answered without it.  Ask again, after giving the swarm a
         // moment to propagate, while the deadline leaves room for that and a request after it: a
-        // push can arrive well before the message has spread through the swarm, and a message from
-        // our own other device that is never found shows as the generic notification.
+        // push can arrive well before the message has spread through the swarm, and a message never
+        // found shows nothing.
         auto retry_at = std::chrono::steady_clock::now() + Notifications::FETCH_RETRY_DELAY;
         if (op->attempts < Notifications::FETCH_ROUNDS &&
             retry_at + MIN_ROUND_BUDGET < op->deadline) {

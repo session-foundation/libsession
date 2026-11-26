@@ -151,7 +151,8 @@ std::optional<NotificationContent> Notifications::decide(
                 return std::nullopt;
             // Members answered and none had it.  A sender chooses how long what they store lasts,
             // down to seconds, and one too large for the push is fetched afterwards, so anyone can
-            // make one gone by then; a real message is kept for days.
+            // make one gone by then.  A real message is kept for days, but one that has not reached
+            // the members asked by the deadline goes unannounced too.
             if (handled.outcome == Handled::not_found) {
                 log::info(cat, "Silenced a pushed message no member had when asked");
                 return std::nullopt;
