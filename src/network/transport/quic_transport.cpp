@@ -351,6 +351,7 @@ void QuicTransport::_establish_connection(
                 oxen::quic::opt::handshake_timeout{
                         tunnelled ? _config.tunnel_handshake_timeout : _config.handshake_timeout},
                 oxen::quic::opt::keep_alive{_config.keep_alive},
+                _config.congestion_control,
                 // libquic hands these a live Connection, so they run inline on the loop rather than
                 // as jobs of ours.  ~QuicTransport destroys the endpoint on the loop before the
                 // members below are touched, so there is no window in which this can fire late.

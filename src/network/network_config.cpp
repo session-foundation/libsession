@@ -272,6 +272,24 @@ void Config::handle_config_opt(opt::quic_max_udp_payload qmup) {
     log::debug(cat, "Network config max QUIC UDP payload set to {} bytes", qmup.size);
 }
 
+void Config::handle_config_opt(opt::quic_congestion_control qcc) {
+    quic_congestion_control = qcc;
+
+    switch (qcc) {
+        case opt::quic_congestion_control::bbr:
+            log::debug(cat, "Network config quic congestion control set to BBR");
+            break;
+
+        case opt::quic_congestion_control::cubic:
+            log::debug(cat, "Network config quic congestion control set to cubic");
+            break;
+
+        case opt::quic_congestion_control::reno:
+            log::debug(cat, "Network config quic congestion control set to Reno");
+            break;
+    }
+}
+
 // MARK: Onion Request Router Options
 
 void Config::handle_config_opt(opt::onionreq_path_strike_threshold pst) {

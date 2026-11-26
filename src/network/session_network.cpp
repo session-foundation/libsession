@@ -105,7 +105,8 @@ namespace {
         return {main_config.quic_handshake_timeout,
                 main_config.quic_tunnel_handshake_timeout,
                 main_config.quic_keep_alive,
-                main_config.quic_max_udp_payload};
+                main_config.quic_max_udp_payload,
+                main_config.quic_congestion_control};
     }
 
     config::DirectRouter build_direct_router_config(
