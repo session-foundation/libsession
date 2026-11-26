@@ -1,5 +1,6 @@
 #include <oxenc/hex.h>
 
+#include <algorithm>
 #include <nlohmann/json.hpp>
 #include <oxen/log.hpp>
 #include <session/client/error_codes.hpp>
@@ -382,16 +383,16 @@ void Notifications::unsubscribe(result_function<bool> cb) {
     auto* core = &_client.core;
     auto* client = &_client;
     core->call([core, client, server = _server, cb = std::move(cb)]() mutable {
-        // What is recorded, or else a subscribe whose answer never came, which the server may have
-        // accepted all the same.
-        auto recorded = load_recorded(*core);
-        auto attempt = load_attempt(*core);
-        std::optional<std::pair<std::string, std::string>> target;
-        if (recorded)
-            target.emplace(recorded->service, recorded->token);
-        else if (attempt)
-            target = attempt;
-        if (!target)
+        // What is recorded, and a subscribe whose answer never came, which the server may have
+        // accepted all the same: one for a new token, sent while an older one is recorded, leaves
+        // both at the server.
+        std::vector<std::pair<std::string, std::string>> targets;
+        if (auto recorded = load_recorded(*core))
+            targets.emplace_back(recorded->service, recorded->token);
+        if (auto attempt = load_attempt(*core);
+            attempt && std::ranges::find(targets, *attempt) == targets.end())
+            targets.push_back(*attempt);
+        if (targets.empty())
             return ClientAccess::report(*client, cb, Expected<bool>{true});
         if (!core->network() || !core->globals.have_account())
             return ClientAccess::report(
@@ -401,7 +402,8 @@ void Notifications::unsubscribe(result_function<bool> cb) {
                             Error{client::err::network_unavailable, "no network or no account"}}});
 
         nlohmann::json requests = nlohmann::json::array();
-        requests.push_back(unsubscribe_request(*core, target->first, target->second));
+        for (const auto& [service, token] : targets)
+            requests.push_back(unsubscribe_request(*core, service, token));
         send(*core,
              server,
              ENDPOINT_UNSUBSCRIBE,

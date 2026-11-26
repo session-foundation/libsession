@@ -726,6 +726,29 @@ TEST_CASE(
     CHECK(*results[0]);
 }
 
+TEST_CASE(
+        "Push subscribe: unsubscribing undoes both a recorded subscription and an unanswered one",
+        "[push_notifications]") {
+    Subscriber s;
+    s.subscribed("token-old");
+    // A new token's subscribe, sent while the old one is recorded, whose answer never comes.
+    s.subscribe("token-new");
+    REQUIRE(take_sent_to(*s.net, "subscribe").size() == 1);
+
+    std::vector<Expected<bool>> results;
+    s.notifications->unsubscribe([&](auto r) { results.push_back(std::move(r)); });
+    TestHelper::drain(s.c->core);
+    auto sent = take_sent_to(*s.net, "unsubscribe");
+    REQUIRE(sent.size() == 1);
+    auto body = body_of(sent[0]);
+    REQUIRE(body.size() == 2);
+    CHECK(body[0]["service_info"]["token"] == "token-old");
+    CHECK(body[1]["service_info"]["token"] == "token-new");
+    s.reply(sent[0], R"([{"success": true, "removed": true}, {"success": true, "removed": true}])");
+    REQUIRE(results.size() == 1);
+    CHECK(*results[0]);
+}
+
 TEST_CASE("Push subscribe: the encryption key is kept", "[push_notifications]") {
     TempClient c;
     auto key = Notifications{*c}.encryption_key();
