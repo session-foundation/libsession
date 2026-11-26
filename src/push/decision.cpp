@@ -147,11 +147,18 @@ std::optional<NotificationContent> Notifications::decide(
             // A poll may have brought it in regardless.
             if (handled.message)
                 break;
-            // A one-to-one message we know exists and could not get.  TODO: a group's, naming the
-            // group, once Client holds groups.
-            if (handled.payload && handled.payload->ns == config::Namespace::Default)
-                return generic();
-            return std::nullopt;
+            if (!handled.payload || handled.payload->ns != config::Namespace::Default)
+                return std::nullopt;
+            // Members answered and none had it.  A sender chooses how long what they store lasts,
+            // down to seconds, and one too large for the push is fetched afterwards, so anyone can
+            // make one gone by then; a real message is kept for days.
+            if (handled.outcome == Handled::not_found) {
+                log::info(cat, "Silenced a pushed message no member had when asked");
+                return std::nullopt;
+            }
+            // A one-to-one message we could not ask for.  TODO: a group's, naming the group, once
+            // Client holds groups.
+            return generic();
 
         case Handled::nothing_to_do:
         case Handled::not_ours: return std::nullopt;

@@ -1139,12 +1139,14 @@ TEST_CASE("Push decide: generic and silent failures", "[push_notifications]") {
     using F = core::MessageDecryptFailure;
     for (auto why : {F::no_pfs_key, F::unknown_version, F::decrypt_failed, F::bad_format})
         CHECK_FALSE(d.decide({Handled::unreadable, dm_payload, std::nullopt, why}));
-    for (auto outcome : {Handled::not_found, Handled::fetch_failed}) {
-        auto n = d.decide({outcome, dm_payload, std::nullopt});
-        REQUIRE(n);
-        CHECK(n->kind == NotificationContent::Kind::generic);
+    // Fetched: generic when no member answered, silent when members answered without it, which a
+    // sender can arrange.
+    auto failed = d.decide({Handled::fetch_failed, dm_payload, std::nullopt});
+    REQUIRE(failed);
+    CHECK(failed->kind == NotificationContent::Kind::generic);
+    CHECK_FALSE(d.decide({Handled::not_found, dm_payload, std::nullopt}));
+    for (auto outcome : {Handled::not_found, Handled::fetch_failed})
         CHECK_FALSE(d.decide({outcome, config_payload, std::nullopt}));
-    }
 }
 
 TEST_CASE(
