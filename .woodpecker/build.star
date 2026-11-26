@@ -431,8 +431,14 @@ def main(ctx):
 
         # The one build that compiles every dependency itself rather than taking the distro's, on
         # the oldest distro we support: what the release artifacts do, and the only thing that
-        # notices when a dependency we vendor stops building.
-        linux("Ubuntu 22.04 (static deps)", "ubuntu-jammy", cmake = {"BUILD_STATIC_DEPS": True}, meson = "pip"),
+        # notices when a dependency we vendor stops building.  Static libraries as well, because
+        # shared ones cannot take static dependencies (see the top-level CMakeLists.txt).
+        linux(
+            "Ubuntu 22.04 (static deps)",
+            "ubuntu-jammy",
+            cmake = {"BUILD_STATIC_DEPS": True, "BUILD_SHARED_LIBS": False},
+            meson = "pip",
+        ),
 
         # ARM builds; armhf builds in a 32-bit image on the arm64 agents.
         linux("Debian sid (ARM64)", "debian-sid", arch = "arm64", jobs = 4),

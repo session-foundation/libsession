@@ -70,6 +70,17 @@ endif()
 # defaults to the same value as BUILD_SHARED_LIBS (i.e. static by default).
 set(BUILD_STATIC_DEPS ${static_default} CACHE BOOL "Build all dependencies statically rather than trying to link to them on the system")
 
+# Each of our shared libraries, and anything linking them, is a separate final link, so every one of
+# them that uses a static dependency gets its own copy: gnutls ends up in libsession-crypto.so and
+# again in an executable that links oxen::quic through libsession-network.so.  The copies export the
+# same symbols, so in one process they bind to each other's globals: the second gnutls finds its
+# ASN.1 tables already filled in by the first and fails to initialize.
+if(BUILD_SHARED_LIBS AND BUILD_STATIC_DEPS)
+    message(FATAL_ERROR "BUILD_SHARED_LIBS is incompatible with BUILD_STATIC_DEPS: shared libraries "
+        "need shared (system) dependencies.  Configure with -DBUILD_STATIC_DEPS=OFF, or build static "
+        "libraries.")
+endif()
+
 include(cmake/session-deps/Deps.cmake)
 
 option(STATIC_BUNDLE "Build a single static .a containing everything (both code and dependencies)" OFF)
