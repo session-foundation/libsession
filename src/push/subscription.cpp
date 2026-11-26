@@ -50,12 +50,12 @@ namespace {
 
     constexpr auto REQUEST_TIMEOUT = 20s;
 
-    // What was last subscribed, as recorded once the push server accepted it.
+    // What was last subscribed, as recorded once the push server accepted both subscriptions.
     struct Recorded {
         std::string service;
         std::string token;
-        std::vector<int16_t> namespaces;
-        bool data;
+        std::vector<int16_t> with_data;
+        std::vector<int16_t> without_data;
         sys_ms at;
     };
 
@@ -65,11 +65,18 @@ namespace {
             return std::nullopt;
         try {
             auto j = nlohmann::json::parse(*text);
+            // A record of a single subscription, with data for every namespace, has neither list.
+            // Its token is still needed to unsubscribe it, and lists that match nothing make the
+            // next subscribe send both.
+            auto list = [&j](const char* key) {
+                return j.contains(key) ? j[key].get<std::vector<int16_t>>()
+                                       : std::vector<int16_t>{};
+            };
             return Recorded{
                     j.at("service").get<std::string>(),
                     j.at("token").get<std::string>(),
-                    j.at("namespaces").get<std::vector<int16_t>>(),
-                    j.at("data").get<bool>(),
+                    list("with_data"),
+                    list("without_data"),
                     from_epoch_ms(j.at("at").get<int64_t>())};
         } catch (const std::exception& e) {
             // Unreadable is as good as absent: the next subscribe simply sends.
@@ -82,16 +89,18 @@ namespace {
         nlohmann::json j{
                 {"service", r.service},
                 {"token", r.token},
-                {"namespaces", r.namespaces},
-                {"data", r.data},
+                {"with_data", r.with_data},
+                {"without_data", r.without_data},
                 {"at", epoch_ms(r.at)}};
         core.globals.set(KEY_SUBSCRIPTION, j.dump());
     }
 
-    std::vector<int16_t> namespace_values(const std::vector<config::Namespace>& namespaces) {
+    // The account's namespaces that are, or are not, subscribed with data, in ascending order.
+    std::vector<int16_t> namespace_values(bool with_data) {
         std::vector<int16_t> out;
-        for (auto ns : namespaces)
-            out.push_back(static_cast<int16_t>(ns));
+        for (auto ns : Notifications::account_namespaces())
+            if (Notifications::subscribed_with_data(ns) == with_data)
+                out.push_back(static_cast<int16_t>(ns));
         return out;
     }
 
@@ -307,6 +316,10 @@ std::vector<config::Namespace> Notifications::account_namespaces() {
     return out;
 }
 
+bool Notifications::subscribed_with_data(config::Namespace ns) {
+    return ns == config::Namespace::Default;
+}
+
 void Notifications::subscribe(Device device, result_function<SubscribeResult> cb, bool force) {
     auto* core = &_client.core;
     auto* client = &_client;
@@ -325,56 +338,73 @@ void Notifications::subscribe(Device device, result_function<SubscribeResult> cb
                     Expected<SubscribeResult>{unexpected{
                             Error{client::err::network_unavailable, "no network or no account"}}});
 
-        auto namespaces = namespace_values(account_namespaces());
+        auto with_data = namespace_values(true);
+        auto without_data = namespace_values(false);
         auto service = std::string{to_string(device.service)};
         auto previous = load_recorded(*core);
 
         bool current = previous && previous->service == service &&
-                       previous->token == device.token && previous->namespaces == namespaces &&
+                       previous->token == device.token && previous->with_data == with_data &&
+                       previous->without_data == without_data &&
                        clock_now_ms() - previous->at < RENEW_AFTER;
         if (current && !force)
             return ClientAccess::report(
                     *client, cb, Expected<SubscribeResult>{SubscribeResult::unchanged});
 
-        nlohmann::json requests = nlohmann::json::array();
-        requests.push_back(subscribe_request(*core, device, namespaces, /*data=*/true, key));
         core->globals.set(
                 KEY_ATTEMPT, nlohmann::json{{"service", service}, {"token", device.token}}.dump());
 
+        auto failed = [client](result_function<SubscribeResult>& cb, Error error) {
+            log::warning(cat, "Push subscription failed: {}", error.message);
+            ClientAccess::report(
+                    *client, cb, Expected<SubscribeResult>{unexpected{std::move(error)}});
+        };
+
+        auto accepted = [core, client, server, device, service, with_data, without_data, previous](
+                                result_function<SubscribeResult>& cb) {
+            store_recorded(
+                    *core,
+                    Recorded{service, device.token, with_data, without_data, clock_now_ms()});
+            core->globals.erase(KEY_ATTEMPT);
+            log::info(cat, "Subscribed to push notifications through {}", service);
+
+            // The old token's subscriptions would otherwise linger at the push server until the
+            // push service tells it the token is dead.
+            if (previous && (previous->service != service || previous->token != device.token)) {
+                nlohmann::json old = nlohmann::json::array();
+                old.push_back(unsubscribe_request(*core, previous->service, previous->token));
+                send(*core, server, ENDPOINT_UNSUBSCRIBE, std::move(old), [](auto error) {
+                    if (error)
+                        log::info(
+                                cat, "Unsubscribing the old push token failed: {}", error->message);
+                });
+            }
+
+            ClientAccess::report(
+                    *client, cb, Expected<SubscribeResult>{SubscribeResult::subscribed});
+        };
+
+        nlohmann::json first = nlohmann::json::array();
+        first.push_back(subscribe_request(*core, device, without_data, /*data=*/false, key));
         send(*core,
              server,
              ENDPOINT_SUBSCRIBE,
-             std::move(requests),
-             [core, client, server, device, service, namespaces, previous, cb = std::move(cb)](
+             std::move(first),
+             [core, server, device, with_data, key, failed, accepted, cb = std::move(cb)](
                      std::optional<Error> error) mutable {
-                 if (error) {
-                     log::warning(cat, "Push subscription failed: {}", error->message);
-                     return ClientAccess::report(
-                             *client, cb, Expected<SubscribeResult>{unexpected{std::move(*error)}});
-                 }
-
-                 store_recorded(
-                         *core, Recorded{service, device.token, namespaces, true, clock_now_ms()});
-                 core->globals.erase(KEY_ATTEMPT);
-                 log::info(cat, "Subscribed to push notifications through {}", service);
-
-                 // The old token's subscription would otherwise linger at the push server until
-                 // the push service tells it the token is dead.
-                 if (previous &&
-                     (previous->service != service || previous->token != device.token)) {
-                     nlohmann::json old = nlohmann::json::array();
-                     old.push_back(unsubscribe_request(*core, previous->service, previous->token));
-                     send(*core, server, ENDPOINT_UNSUBSCRIBE, std::move(old), [](auto error) {
-                         if (error)
-                             log::info(
-                                     cat,
-                                     "Unsubscribing the old push token failed: {}",
-                                     error->message);
-                     });
-                 }
-
-                 ClientAccess::report(
-                         *client, cb, Expected<SubscribeResult>{SubscribeResult::subscribed});
+                 if (error)
+                     return failed(cb, std::move(*error));
+                 nlohmann::json second = nlohmann::json::array();
+                 second.push_back(subscribe_request(*core, device, with_data, /*data=*/true, key));
+                 send(*core,
+                      server,
+                      ENDPOINT_SUBSCRIBE,
+                      std::move(second),
+                      [failed, accepted, cb = std::move(cb)](std::optional<Error> error) mutable {
+                          if (error)
+                              return failed(cb, std::move(*error));
+                          accepted(cb);
+                      });
              });
     });
 }
@@ -385,7 +415,8 @@ void Notifications::unsubscribe(result_function<bool> cb) {
     core->call([core, client, server = _server, cb = std::move(cb)]() mutable {
         // What is recorded, and a subscribe whose answer never came, which the server may have
         // accepted all the same: one for a new token, sent while an older one is recorded, leaves
-        // both at the server.
+        // both at the server.  An unsubscribe without `data` removes both of a token's
+        // subscriptions.
         std::vector<std::pair<std::string, std::string>> targets;
         if (auto recorded = load_recorded(*core))
             targets.emplace_back(recorded->service, recorded->token);

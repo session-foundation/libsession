@@ -242,25 +242,33 @@ class Notifications {
     /// polls, less any excluded with a reason (see the definition), in ascending order.
     static std::vector<config::Namespace> account_namespaces();
 
-    /// Subscribes this device to pushes for the account, or renews its subscription.
+    /// Whether this device's pushes for `ns` carry the message itself.  Only the namespaces whose
+    /// messages become notifications do.  The rest are subscribed without data: their pushes carry
+    /// no body, and `handle` fetches what one stands for where that matters now (see
+    /// `fetch_on_push`).
+    static bool subscribed_with_data(config::Namespace ns);
+
+    /// Subscribes this device to pushes for the account, or renews its subscriptions.
+    ///
+    /// A device holds two subscriptions to the account: one with message data, for the namespaces
+    /// `subscribed_with_data` names, and one without, for the rest.  The one without is sent first
+    /// and the one with data only once it is accepted: a push server that keeps a single
+    /// subscription per device and account keeps whichever it wrote last, and that has to be the
+    /// one that carries messages.
     ///
     /// Sends only when needed: when there is no subscription, when `device` or the namespaces
-    /// differ from the one recorded, or when the last one is older than RENEW_AFTER -- or always,
-    /// with `force`.  So it is cheap to call on every run of the application, including background
-    /// ones.  A changed token also unsubscribes the old one, best effort: the push service has
-    /// usually stopped honouring it anyway.
+    /// differ from those recorded, or when the last subscribe is older than RENEW_AFTER -- or
+    /// always, with `force`.  So it is cheap to call on every run of the application, including
+    /// background ones.  A changed token also unsubscribes the old one, best effort: the push
+    /// service has usually stopped honouring it anyway.
     ///
     /// `cb` gets `subscribed` or `unchanged`, or an error: `client::err::network_unavailable`
     /// without a network or account, `err::rejected` with the push server's reason, or
-    /// `err::request_failed`.  Called through the Client's dispatcher, like its other results.
-    ///
-    /// TODO: two registrations per device, one with message data for the namespaces that become
-    /// notifications and one without for the rest, so that the push server never receives data it
-    /// would only withhold.  The push server accepts one registration per device and account today,
-    /// so this sends one, with data for every namespace.
+    /// `err::request_failed`.  Nothing is recorded unless both were accepted.  Called through the
+    /// Client's dispatcher, like its other results.
     void subscribe(Device device, result_function<SubscribeResult> cb, bool force = false);
 
-    /// Removes this device's subscription, if it has one.  `cb` gets true once the push server has
+    /// Removes this device's subscriptions, if it has any.  `cb` gets true once the push server has
     /// accepted the removal (or there was nothing to remove), or an error as for `subscribe`.
     void unsubscribe(result_function<bool> cb);
 

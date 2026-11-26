@@ -499,12 +499,22 @@ struct Subscriber {
         TestHelper::drain(c->core);
     }
 
-    /// Subscribes with `token` and accepts it.
+    /// Accepts the subscribe without data that `subscribe` sent first, and returns the one with
+    /// data that follows it.
+    MockNetwork::SentRequest accept_first() {
+        auto first = take_sent_to(*net, "subscribe");
+        REQUIRE(first.size() == 1);
+        reply(first[0], accepted());
+        auto second = take_sent_to(*net, "subscribe");
+        REQUIRE(second.size() == 1);
+        return std::move(second[0]);
+    }
+
+    /// Subscribes with `token` and accepts both subscriptions.
     void subscribed(std::string token) {
         subscribe(std::move(token));
-        auto sent = take_sent_to(*net, "subscribe");
-        REQUIRE(sent.size() == 1);
-        reply(sent[0], accepted());
+        auto second = accept_first();
+        reply(second, accepted());
         REQUIRE(results.back().has_value());
         REQUIRE(*results.back() == push::SubscribeResult::subscribed);
     }
@@ -512,43 +522,130 @@ struct Subscriber {
 
 }  // namespace
 
-TEST_CASE("Push subscribe: a signed request for the account's namespaces", "[push_notifications]") {
+TEST_CASE(
+        "Push subscribe: messages with data and everything else without, in that order",
+        "[push_notifications]") {
     Subscriber s;
     s.subscribe("token-1");
-
-    auto sent = take_sent_to(*s.net, "subscribe");
-    REQUIRE(sent.size() == 1);
-    auto& dest = std::get<network::ServerDestination>(sent[0].request.destination);
-    CHECK(dest.host == "push.getsession.org");
-    CHECK(dest.method == "POST");
-    // The X25519 form of the server's Ed25519 key, which is what the server decrypts with.
-    CHECK(dest.x25519_pubkey.hex() ==
-          "b84ed40471d669340d823291f9a625272d4533c26fb031bc53f827e0b1afae0b");
-
-    auto body = body_of(sent[0]);
-    REQUIRE(body.is_array());
-    REQUIRE(body.size() == 1);
-    auto& req = body[0];
-    CHECK(req["pubkey"] == s.c->core.globals.session_id_hex());
-    CHECK(req["service"] == "apns");
-    CHECK(req["service_info"]["token"] == "token-1");
-    CHECK(req["data"] == true);
     auto key = s.notifications->encryption_key();
-    CHECK(req["enc_key"] == oxenc::to_hex(key.begin(), key.end()));
 
-    // Everything the account polls but its own published keys (-21), in ascending order.
-    CHECK(req["namespaces"] == std::vector<int16_t>{0, 2, 3, 4, 5, 21});
+    auto check_request = [&](MockNetwork::SentRequest& sent,
+                             bool data,
+                             const std::vector<int16_t>& namespaces,
+                             std::string_view signed_ns) {
+        auto& dest = std::get<network::ServerDestination>(sent.request.destination);
+        CHECK(dest.host == "push.getsession.org");
+        CHECK(dest.method == "POST");
+        // The X25519 form of the server's Ed25519 key, which is what the server decrypts with.
+        CHECK(dest.x25519_pubkey.hex() ==
+              "b84ed40471d669340d823291f9a625272d4533c26fb031bc53f827e0b1afae0b");
 
-    CHECK(signature_valid(
-            req,
-            "MONITOR{}{}10,2,3,4,5,21"_format(
-                    req["pubkey"].get<std::string>(), req["sig_ts"].get<int64_t>())));
+        auto body = body_of(sent);
+        REQUIRE(body.is_array());
+        REQUIRE(body.size() == 1);
+        auto& req = body[0];
+        CHECK(req["pubkey"] == s.c->core.globals.session_id_hex());
+        CHECK(req["service"] == "apns");
+        CHECK(req["service_info"]["token"] == "token-1");
+        CHECK(req["data"] == data);
+        CHECK(req["enc_key"] == oxenc::to_hex(key.begin(), key.end()));
+        CHECK(req["namespaces"] == namespaces);
+        CHECK(signature_valid(
+                req,
+                "MONITOR{}{}{}{}"_format(
+                        req["pubkey"].get<std::string>(),
+                        req["sig_ts"].get<int64_t>(),
+                        data ? "1" : "0",
+                        signed_ns)));
+    };
+
+    // Everything the account polls but messages and its own published keys (-21), first, so that
+    // a push server keeping one subscription per device keeps the one with data, sent after it.
+    auto first = take_sent_to(*s.net, "subscribe");
+    REQUIRE(first.size() == 1);
+    check_request(first[0], false, {2, 3, 4, 5, 21}, "2,3,4,5,21");
+
+    s.reply(first[0], accepted());
+    CHECK(s.results.empty());
+    auto second = take_sent_to(*s.net, "subscribe");
+    REQUIRE(second.size() == 1);
+    check_request(second[0], true, {0}, "0");
 
     CHECK(s.results.empty());
-    s.reply(sent[0], accepted());
+    s.reply(second[0], accepted());
     REQUIRE(s.results.size() == 1);
     REQUIRE(s.results[0].has_value());
     CHECK(*s.results[0] == push::SubscribeResult::subscribed);
+}
+
+TEST_CASE(
+        "Push subscribe: the one with data waits on the one without, and is not recorded alone",
+        "[push_notifications]") {
+    Subscriber s;
+    s.subscribe("token-1");
+
+    SECTION("the first refused: the second is never sent") {
+        auto first = take_sent_to(*s.net, "subscribe");
+        REQUIRE(first.size() == 1);
+        s.reply(first[0], R"([{"error": 3, "message": "invalid signature"}])");
+        CHECK(take_sent_to(*s.net, "subscribe").empty());
+        REQUIRE(s.results.size() == 1);
+        REQUIRE_FALSE(s.results[0].has_value());
+        CHECK(s.results[0].error().code == push::err::rejected);
+    }
+
+    SECTION("the second refused") {
+        auto second = s.accept_first();
+        s.reply(second, R"([{"error": 3, "message": "invalid signature"}])");
+        REQUIRE(s.results.size() == 1);
+        REQUIRE_FALSE(s.results[0].has_value());
+        CHECK(s.results[0].error().code == push::err::rejected);
+    }
+
+    // Nothing was recorded, so the next attempt sends both again, starting with the first.
+    CHECK_FALSE(s.c->core.globals.get_text("push_subscription"));
+    s.subscribe("token-1");
+    auto again = take_sent_to(*s.net, "subscribe");
+    REQUIRE(again.size() == 1);
+    CHECK(body_of(again[0])[0]["data"] == false);
+}
+
+TEST_CASE(
+        "Push subscribe: a recorded single subscription is replaced, and can still be removed",
+        "[push_notifications]") {
+    Subscriber s;
+    // As recorded when one subscription, with data, covered every namespace.
+    auto single = [] {
+        return nlohmann::json{
+                {"service", "apns"},
+                {"token", "token-1"},
+                {"namespaces", {0, 2, 3, 4, 5, 21}},
+                {"data", true},
+                {"at", epoch_ms(clock_now_ms())}}
+                .dump();
+    };
+
+    SECTION("subscribing sends both, though the record is recent") {
+        s.c->core.globals.set("push_subscription", single());
+        s.subscribe("token-1");
+        auto second = s.accept_first();
+        s.reply(second, accepted());
+        REQUIRE(s.results.size() == 1);
+        CHECK(*s.results[0] == push::SubscribeResult::subscribed);
+        // The same token, so nothing to unsubscribe.
+        CHECK(take_sent_to(*s.net, "unsubscribe").empty());
+    }
+
+    SECTION("unsubscribing removes it by its token") {
+        s.c->core.globals.set("push_subscription", single());
+        std::vector<Expected<bool>> results;
+        s.notifications->unsubscribe([&](auto r) { results.push_back(std::move(r)); });
+        TestHelper::drain(s.c->core);
+        auto sent = take_sent_to(*s.net, "unsubscribe");
+        REQUIRE(sent.size() == 1);
+        CHECK(body_of(sent[0])[0]["service_info"]["token"] == "token-1");
+        CHECK_FALSE(body_of(sent[0])[0].contains("data"));
+    }
 }
 
 TEST_CASE(
@@ -579,12 +676,11 @@ TEST_CASE(
 
     SECTION("a new token, which also unsubscribes the old one") {
         s.subscribe("token-2");
-        auto sent = take_sent_to(*s.net, "subscribe");
-        REQUIRE(sent.size() == 1);
-        CHECK(body_of(sent[0])[0]["service_info"]["token"] == "token-2");
+        auto second = s.accept_first();
+        CHECK(body_of(second)[0]["service_info"]["token"] == "token-2");
         CHECK(take_sent_to(*s.net, "unsubscribe").empty());
 
-        s.reply(sent[0], accepted());
+        s.reply(second, accepted());
         auto old = take_sent_to(*s.net, "unsubscribe");
         REQUIRE(old.size() == 1);
         auto req = body_of(old[0])[0];
@@ -647,6 +743,9 @@ TEST_CASE(
     CHECK(body_of(again[0]) == body_of(sent[0]));
 
     s.reply(again[0], R"([{"success": true, "added": true}])");
+    auto second = take_sent_to(*s.net, "subscribe");
+    REQUIRE(second.size() == 1);
+    s.reply(second[0], R"([{"success": true, "added": true}])");
     REQUIRE(s.results.size() == 1);
     REQUIRE(s.results[0].has_value());
     CHECK(*s.results[0] == push::SubscribeResult::subscribed);
