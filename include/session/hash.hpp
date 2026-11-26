@@ -2,15 +2,10 @@
 
 #include <oxenc/common.h>
 #include <oxenc/endian.h>
-#include <sodium/crypto_auth_hmacsha256.h>
-#include <sodium/crypto_generichash_blake2b.h>
-#include <sodium/crypto_hash_sha512.h>
-#include <sodium/crypto_pwhash.h>
-#include <sodium/crypto_xof_shake256.h>
-#include <sodium/utils.h>
 
 #include <array>
 #include <cassert>
+#include <initializer_list>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -95,28 +90,67 @@ namespace detail {
             return swapped;
         }
     }
-    // Initializes a SHAKE-256 (or SHA3-256) keccak state with the given domain suffix byte and
-    // absorbs all of `args` into it.  The domain byte distinguishes the hash function:
-    //   - 0x1F = SHAKE-256 (crypto_xof_shake256_DOMAIN_STANDARD)
-    //   - 0x06 = SHA3-256
-    // See the sha3_256 API doc comment for the explanation of why this works.
-    template <HashInput... T>
-        requires(sizeof...(T) > 0)
-    void keccak_absorb(crypto_xof_shake256_state& st, unsigned char domain, const T&... args) {
-        crypto_xof_shake256_init_with_domain(&st, domain);
-        auto update = [&st](std::span<const unsigned char> arg) {
-            crypto_xof_shake256_update(&st, arg.data(), arg.size());
-        };
-        (update(make_hashable(args)), ...);
-    }
-    template <HashInput... T>
-        requires(sizeof...(T) > 0)
-    void update_all(crypto_generichash_blake2b_state& st, const T&... args) {
-        auto update_hash = [&st](std::span<const unsigned char> arg) {
-            crypto_generichash_blake2b_update(&st, arg.data(), arg.size());
-        };
-        (update_hash(make_hashable(args)), ...);
-    }
+
+    // Each `parts` list below may refer to temporaries of the caller's full-expression, so it must
+    // be consumed before the call returns and never stored.
+
+    // `st` stands in for libsodium's crypto_generichash_blake2b_state so that this header need not
+    // include libsodium; src/hash.cpp checks that its size and alignment match.
+    class blake2b_hasher_base {
+        alignas(64) unsigned char st[384];
+
+      protected:
+        // Keys longer than 64 bytes are truncated to 64.
+        blake2b_hasher_base(
+                size_t outlen,
+                std::span<const unsigned char> key,
+                std::optional<std::span<const std::byte, 16>> pers);
+        ~blake2b_hasher_base();
+
+        blake2b_hasher_base(const blake2b_hasher_base&) = delete;
+        blake2b_hasher_base& operator=(const blake2b_hasher_base&) = delete;
+
+        void update(std::initializer_list<std::span<const unsigned char>> parts);
+        void finalize(std::span<unsigned char> out);
+    };
+
+    // Keccak domain suffix bytes; see the sha3_256 API doc comment for why the domain byte alone
+    // distinguishes SHAKE-256 from SHA3-256.
+    inline constexpr unsigned char SHAKE256_DOMAIN = 0x1F;
+    inline constexpr unsigned char SHA3_256_DOMAIN = 0x06;
+
+    // `st` stands in for libsodium's crypto_xof_shake256_state so that this header need not include
+    // libsodium; src/hash.cpp checks that its size and alignment match.
+    class keccak_base {
+        alignas(16) unsigned char st[256];
+
+      public:
+        explicit keccak_base(unsigned char domain);
+        ~keccak_base();
+
+        keccak_base(const keccak_base&) = delete;
+        keccak_base& operator=(const keccak_base&) = delete;
+
+        void absorb(std::initializer_list<std::span<const unsigned char>> parts);
+        void squeeze(std::span<unsigned char> out);
+    };
+
+    void sha512(
+            std::span<unsigned char, 64> out,
+            std::initializer_list<std::span<const unsigned char>> parts);
+
+    void hmac_sha256(
+            std::span<unsigned char, 32> out,
+            std::span<const unsigned char> key,
+            std::initializer_list<std::span<const unsigned char>> parts);
+
+    void argon2(
+            std::span<unsigned char> out,
+            std::span<const char> password,
+            std::span<const std::byte, 16> salt,
+            unsigned long long opslimit,
+            size_t memlimit,
+            int alg);
 
 }  // namespace detail
 
@@ -126,6 +160,16 @@ concept HashOutputContainer =
         std::ranges::contiguous_range<T> && !std::is_const_v<std::ranges::range_value_t<T>> &&
         oxenc::basic_char<std::ranges::range_value_t<T>> &&
         detail::container_extent_v<T> != std::dynamic_extent && detail::container_extent_v<T> >= 1;
+
+namespace detail {
+
+    template <HashOutputContainer Out>
+    std::span<unsigned char, container_extent_v<Out>> output_bytes(Out& out) {
+        return std::span<unsigned char, container_extent_v<Out>>{
+                to_unsigned(std::ranges::data(out)), std::ranges::size(out)};
+    }
+
+}  // namespace detail
 
 template <typename T>
 concept Blake2BOutputContainer = HashOutputContainer<T> && detail::container_extent_v<T> <= 64;
@@ -170,13 +214,9 @@ inline constexpr std::span<std::byte, 0> nullkey{};
 ///
 template <size_t N>
     requires(N >= 1 && N <= 64)
-struct blake2b_hasher {
-    crypto_generichash_blake2b_state st;
-
+struct blake2b_hasher : private detail::blake2b_hasher_base {
     /// No-key, no-pers constructor.
-    blake2b_hasher() {
-        crypto_generichash_blake2b_init_salt_personal(&st, nullptr, 0, N, nullptr, nullptr);
-    }
+    blake2b_hasher() : blake2b_hasher_base{N, {}, std::nullopt} {}
 
     /// Key + optional personalisation constructor.  Pass `nullkey` as key for pers-only;
     /// pass `std::nullopt` as pers for key-only.
@@ -184,22 +224,8 @@ struct blake2b_hasher {
     /// Dynamic-extent keys are silently truncated to 64 bytes (the blake2b key size limit);
     /// static-extent keys are guaranteed ≤ 64 at compile time by the Blake2BKey concept.
     template <Blake2BKey Key>
-    blake2b_hasher(const Key& key, std::optional<std::span<const std::byte, 16>> pers) {
-        crypto_generichash_blake2b_init_salt_personal(
-                &st,
-                reinterpret_cast<const unsigned char*>(std::ranges::data(key)),
-                std::min<size_t>(std::ranges::size(key), 64),
-                N,
-                /*salt=*/nullptr,
-                pers ? reinterpret_cast<const unsigned char*>(pers->data()) : nullptr);
-    }
-
-    ~blake2b_hasher() { sodium_memzero(&st, sizeof(st)); }
-
-    blake2b_hasher(const blake2b_hasher&) = delete;
-    blake2b_hasher& operator=(const blake2b_hasher&) = delete;
-    blake2b_hasher(blake2b_hasher&&) = delete;
-    blake2b_hasher& operator=(blake2b_hasher&&) = delete;
+    blake2b_hasher(const Key& key, std::optional<std::span<const std::byte, 16>> pers) :
+            blake2b_hasher_base{N, detail::make_hashable(key), pers} {}
 
     /// Feeds one or more contiguous byte containers or integer values into the hash state, in
     /// argument order.  Integer values are written as raw bytes in little-endian encoding (i.e.
@@ -208,7 +234,7 @@ struct blake2b_hasher {
     template <HashInput... T>
         requires(sizeof...(T) > 0)
     blake2b_hasher& update(const T&... args) {
-        detail::update_all(st, args...);
+        blake2b_hasher_base::update({detail::make_hashable(args)...});
         return *this;
     }
 
@@ -216,8 +242,7 @@ struct blake2b_hasher {
     template <HashOutputContainer Out>
         requires(detail::container_extent_v<Out> == N)
     void finalize(Out& out) {
-        crypto_generichash_blake2b_final(
-                &st, reinterpret_cast<unsigned char*>(std::ranges::data(out)), N);
+        blake2b_hasher_base::finalize(detail::output_bytes(out));
     }
 
     /// Return-value finalize: returns a `std::array<std::byte, N>`.
@@ -352,30 +377,17 @@ std::array<std::byte, N> blake2b_pers(std::span<const std::byte, 16> pers, const
 ///     sq(out_a);
 ///     sq(out_b);
 ///
-struct [[nodiscard]] shake256 {
-    crypto_xof_shake256_state st;
-
+struct [[nodiscard]] shake256 : private detail::keccak_base {
     template <HashInput... T>
         requires(sizeof...(T) > 0)
-    explicit shake256(const T&... args) {
-        detail::keccak_absorb(st, crypto_xof_shake256_DOMAIN_STANDARD, args...);
+    explicit shake256(const T&... args) : keccak_base{detail::SHAKE256_DOMAIN} {
+        absorb({detail::make_hashable(args)...});
     }
-
-    ~shake256() { sodium_memzero(&st, sizeof(st)); }
-
-    shake256(const shake256&) = delete;
-    shake256& operator=(const shake256&) = delete;
-    shake256(shake256&&) = delete;
-    shake256& operator=(shake256&&) = delete;
 
     template <HashOutputContainer... Outs>
         requires(sizeof...(Outs) > 0)
     shake256& operator()(Outs&&... outs) {
-        (crypto_xof_shake256_squeeze(
-                 &st,
-                 reinterpret_cast<unsigned char*>(std::ranges::data(outs)),
-                 std::ranges::size(outs)),
-         ...);
+        (keccak_base::squeeze(detail::output_bytes(outs)), ...);
         return *this;
     }
 
@@ -404,9 +416,9 @@ struct [[nodiscard]] shake256 {
 ///   - SHA3-256:  0x06  (FIPS 202 §6.1 hash suffix '01', plus the leading '1' of the Keccak
 ///                       multi-rate padding '10*1', making the combined byte '0000 0110')
 ///
-/// Because the sponge parameters are identical, crypto_xof_shake256_init_with_domain(&st, 0x06)
-/// followed by absorbing input and squeezing 32 bytes is exactly SHA3-256.  This is the intended
-/// use of init_with_domain, not a workaround.
+/// Because the sponge parameters are identical, initialising libsodium's SHAKE-256 state with
+/// crypto_xof_shake256_init_with_domain(&st, 0x06), then absorbing input and squeezing 32 bytes, is
+/// exactly SHA3-256.  This is the intended use of init_with_domain, not a workaround.
 ///
 /// The temporary keccak state is zeroed before this function returns.
 ///
@@ -416,10 +428,9 @@ struct [[nodiscard]] shake256 {
 template <HashOutputContainer Out, HashInput... T>
     requires(detail::container_extent_v<Out> == 32 && sizeof...(T) > 0)
 void sha3_256(Out& out, const T&... args) {
-    crypto_xof_shake256_state st;
-    detail::keccak_absorb(st, 0x06, args...);
-    crypto_xof_shake256_squeeze(&st, reinterpret_cast<unsigned char*>(std::ranges::data(out)), 32);
-    sodium_memzero(&st, sizeof(st));
+    detail::keccak_base keccak{detail::SHA3_256_DOMAIN};
+    keccak.absorb({detail::make_hashable(args)...});
+    keccak.squeeze(detail::output_bytes(out));
 }
 template <size_t N, HashInput... T>
     requires(N == 32 && sizeof...(T) > 0)
@@ -447,16 +458,9 @@ struct identity_hasher {
 /// contiguous byte containers or integer values, computes the SHA-512 hash of their concatenation
 /// (in argument order), and writes the result into the output container.
 template <HashOutputContainer Out, HashInput... T>
-    requires(detail::container_extent_v<Out> == crypto_hash_sha512_BYTES && sizeof...(T) > 0)
+    requires(detail::container_extent_v<Out> == 64 && sizeof...(T) > 0)
 void sha512(Out& out, const T&... args) {
-    crypto_hash_sha512_state st;
-    crypto_hash_sha512_init(&st);
-    auto update = [&st](std::span<const unsigned char> arg) {
-        crypto_hash_sha512_update(&st, arg.data(), arg.size());
-    };
-    (update(detail::make_hashable(args)), ...);
-    crypto_hash_sha512_final(&st, reinterpret_cast<unsigned char*>(std::ranges::data(out)));
-    sodium_memzero(&st, sizeof(st));
+    detail::sha512(detail::output_bytes(out), {detail::make_hashable(args)...});
 }
 
 // ─── HMAC-SHA-256 ────────────────────────────────────────────────────────────
@@ -465,27 +469,20 @@ void sha512(Out& out, const T&... args) {
 /// container), and any number of contiguous byte containers or integer values, computes the
 /// HMAC-SHA-256 of their concatenation and writes the result into the output container.
 template <HashOutputContainer Out, ByteContainer Key, HashInput... T>
-    requires(detail::container_extent_v<Out> == crypto_auth_hmacsha256_BYTES && sizeof...(T) > 0)
+    requires(detail::container_extent_v<Out> == 32 && sizeof...(T) > 0)
 void hmac_sha256(Out& out, const Key& key, const T&... args) {
-    crypto_auth_hmacsha256_state st;
-    crypto_auth_hmacsha256_init(
-            &st,
-            reinterpret_cast<const unsigned char*>(std::ranges::data(key)),
-            std::ranges::size(key));
-    auto update = [&st](std::span<const unsigned char> arg) {
-        crypto_auth_hmacsha256_update(&st, arg.data(), arg.size());
-    };
-    (update(detail::make_hashable(args)), ...);
-    crypto_auth_hmacsha256_final(&st, reinterpret_cast<unsigned char*>(std::ranges::data(out)));
-    sodium_memzero(&st, sizeof(st));
+    detail::hmac_sha256(
+            detail::output_bytes(out),
+            detail::make_hashable(key),
+            {detail::make_hashable(args)...});
 }
 
 // ─── Argon2id (password hashing / KDF) ───────────────────────────────────────
 
-inline constexpr size_t ARGON2_SALTBYTES = crypto_pwhash_SALTBYTES;
-inline constexpr unsigned long long ARGON2_OPSLIMIT_MODERATE = crypto_pwhash_OPSLIMIT_MODERATE;
-inline constexpr size_t ARGON2_MEMLIMIT_MODERATE = crypto_pwhash_MEMLIMIT_MODERATE;
-inline constexpr int ARGON2ID13 = crypto_pwhash_ALG_ARGON2ID13;
+inline constexpr size_t ARGON2_SALTBYTES = 16;
+inline constexpr unsigned long long ARGON2_OPSLIMIT_MODERATE = 3;
+inline constexpr size_t ARGON2_MEMLIMIT_MODERATE = 268435456;
+inline constexpr int ARGON2ID13 = 2;
 
 /// Derives a key from a password using Argon2id (libsodium crypto_pwhash).
 /// Throws std::runtime_error if the derivation fails (e.g. out of memory).
@@ -494,12 +491,12 @@ inline constexpr int ARGON2ID13 = crypto_pwhash_ALG_ARGON2ID13;
 /// - `out`      -- writable byte container to receive the derived key (between 16 and 4294967295
 ///                 bytes).
 /// - `password` -- the password/input data.
-/// - `salt`     -- the 16-byte Argon2 salt (`crypto_pwhash_SALTBYTES`).
-/// - `opslimit` -- CPU cost parameter (e.g. `crypto_pwhash_OPSLIMIT_MODERATE`).
-/// - `memlimit` -- memory cost parameter (e.g. `crypto_pwhash_MEMLIMIT_MODERATE`).
-/// - `alg`      -- algorithm selector (e.g. `crypto_pwhash_ALG_ARGON2ID13`).
+/// - `salt`     -- the 16-byte Argon2 salt (`ARGON2_SALTBYTES`).
+/// - `opslimit` -- CPU cost parameter (e.g. `ARGON2_OPSLIMIT_MODERATE`).
+/// - `memlimit` -- memory cost parameter (e.g. `ARGON2_MEMLIMIT_MODERATE`).
+/// - `alg`      -- algorithm selector (e.g. `ARGON2ID13`).
 template <HashOutputContainer Out>
-    requires(detail::container_extent_v<Out> >= crypto_pwhash_BYTES_MIN)
+    requires(detail::container_extent_v<Out> >= 16)
 void argon2(
         Out& out,
         std::span<const char> password,
@@ -507,16 +504,7 @@ void argon2(
         unsigned long long opslimit,
         size_t memlimit,
         int alg) {
-    if (0 != crypto_pwhash(
-                     reinterpret_cast<unsigned char*>(std::ranges::data(out)),
-                     std::ranges::size(out),
-                     password.data(),
-                     password.size(),
-                     reinterpret_cast<const unsigned char*>(salt.data()),
-                     opslimit,
-                     memlimit,
-                     alg))
-        throw std::runtime_error{"crypto_pwhash failed (out of memory?)"};
+    detail::argon2(detail::output_bytes(out), password, salt, opslimit, memlimit, alg);
 }
 
 }  // namespace session::hash
