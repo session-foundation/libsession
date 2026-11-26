@@ -63,6 +63,7 @@ add_libsession_util_library(crypto
     crypto/ed25519.cpp
     crypto/x25519.cpp
     curve25519.cpp
+    encrypt.cpp
     hash.cpp
     multi_encrypt.cpp
     random.cpp
