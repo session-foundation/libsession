@@ -7,7 +7,24 @@
 #include "session/util.hpp"
 #include "utils.hpp"
 
+// Each of these must find _b2b_pers on its own, so they precede the file-wide using-directive
+// below, which would otherwise hide a lookup failure.
+namespace b2b_pers_via_hash_literals {
+using namespace session::hash_literals;
+static_assert("0123456789abcdef"_b2b_pers.size() == 16);
+}  // namespace b2b_pers_via_hash_literals
+namespace b2b_pers_via_hash {
+using namespace session::hash;
+static_assert("0123456789abcdef"_b2b_pers.size() == 16);
+}  // namespace b2b_pers_via_hash
+
 using namespace session::literals;
+
+// session::literals and session::hash_literals both in effect must not be ambiguous.
+namespace b2b_pers_via_both {
+using namespace session::hash_literals;
+static_assert("0123456789abcdef"_b2b_pers.size() == 16);
+}  // namespace b2b_pers_via_both
 
 TEST_CASE("Hash generation", "[hash][hash]") {
     // Intentionally exercising the deprecated hash::hash() to verify it still works.

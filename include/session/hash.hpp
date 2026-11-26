@@ -509,13 +509,22 @@ void argon2(
 
 }  // namespace session::hash
 
-namespace session { inline namespace literals {
+namespace session { inline namespace literals { inline namespace hash_literals {
 
     /// User-defined literal for a 16-byte personalization value for use with BLAKE2b.
     /// Enforces the 16-byte length at compile time via the requires clause.  Returns a
-    /// fixed-extent span so it passes directly to blake2b_pers / blake2b_key_pers.  Example:
+    /// fixed-extent span so it passes directly to blake2b_pers / blake2b_key_pers.
     ///
-    ///     using namespace session::literals;  // or `using namespace session;`
+    /// Like the standard library's sub-literal namespaces (e.g. `std::literals::chrono_literals`),
+    /// it can be brought in with any of:
+    ///
+    ///     using namespace session::literals;       // every session literal
+    ///     using namespace session::hash_literals;  // only the hash literals
+    ///     using namespace session::hash;           // along with the rest of session::hash
+    ///
+    /// `using namespace session;` also brings it in, and code inside namespace `session` needs no
+    /// using-directive at all.  Example:
+    ///
     ///     constexpr auto PERS_XYZ = "XYZ-XYZ-XYZ-WXYZ"_b2b_pers;
     ///
     template <BytesLiteral Lit>
@@ -524,4 +533,8 @@ namespace session { inline namespace literals {
         return operator""_bytes < Lit>();
     }
 
-}}  // namespace session::literals
+}}}  // namespace session::literals::hash_literals
+
+namespace session::hash {
+using namespace literals::hash_literals;
+}
