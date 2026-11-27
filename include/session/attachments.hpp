@@ -5,6 +5,7 @@
 #include <fstream>
 #include <functional>
 #include <span>
+#include <variant>
 #include <vector>
 
 #include "session/sodium_array.hpp"
@@ -517,12 +518,12 @@ class SeekableDecryptor {
 
 /// API: crypto/attachment::Encryptor
 ///
-/// Streaming two-phase encryptor for attachments.  Encryption is deterministic: the same seed and
-/// data always produce the same key, nonce, and ciphertext, which allows the file server to
-/// deduplicate identical uploads.
+/// Streaming two-phase encryptor for attachments.  With the seed-based constructor encryption is
+/// deterministic: the same seed and data always produce the same key, nonce, and ciphertext, which
+/// allows the file server to deduplicate identical uploads.
 ///
-/// **Phase 1 (key derivation):** Construct the object and call `update()` with the plaintext data
-/// (in any number of pieces).  This hashes the data to derive the encryption key and nonce.
+/// **Phase 1 (key derivation):** Construct the object and call `update_key()` with the plaintext
+/// data (in any number of pieces).  This hashes the data to derive the encryption key and nonce.
 /// Normally this is the file contents itself (so that the same file always produces the same
 /// encryption key); however, feeding different data (e.g. random bytes) is permitted for
 /// non-deterministic encryption where deduplication is not desired.  No encrypted output is
@@ -537,6 +538,12 @@ class SeekableDecryptor {
 /// phase 1, seeks back, and returns an Encryptor ready for `next()` calls with the file as the
 /// data source.
 class Encryptor {
+  public:
+    /// How phase 2 reads data that is not in memory: it is called with a buffer to fill and must
+    /// fill it completely; returning fewer bytes than requested signals the end of the data.
+    using read_callback = std::function<size_t(std::span<std::byte> buffer)>;
+
+  private:
     alignas(64) std::byte hash_st_data[384];  // crypto_generichash_blake2b_state
     cleared_array<std::byte, ENCRYPT_HEADER + ENCRYPT_KEY_SIZE> nonce_key;
     std::byte ss_st_data[52];  // crypto_secretstream_xchacha20poly1305_state
@@ -549,7 +556,8 @@ class Encryptor {
     bool key_given = false;
 
     // Phase 2 state
-    std::function<size_t(std::span<std::byte> buffer)> source;
+    // Where phase 2 reads from: a caller's read callback, or what is left of in-memory data.
+    std::variant<read_callback, std::span<const std::byte>> source;
     size_t encrypt_size = 0;
     size_t encrypted_so_far = 0;
     size_t padding = 0;
@@ -565,7 +573,20 @@ class Encryptor {
     // Produces the next chunk of encrypted output into out_buf.  Returns false when done.
     bool produce_next();
 
+    // Fills `buf` from `source`, returning how much it wrote.
+    size_t pull(std::span<std::byte> buf);
+
+    // Everything start_encryption() does apart from storing where the data comes from.
+    cleared_b32 begin_encryption(bool allow_large, std::optional<size_t> encrypt_size);
+
   public:
+    // Not copyable: a copy would share a file source's read position with the original, and
+    // duplicate the key material.
+    Encryptor(const Encryptor&) = delete;
+    Encryptor& operator=(const Encryptor&) = delete;
+    Encryptor(Encryptor&&) = default;
+    Encryptor& operator=(Encryptor&&) = default;
+
     /// Returns the data size: during phase 1 this is the number of bytes fed to update_key();
     /// after start_encryption() this is the target plaintext size for phase 2 (either the
     /// phase 1 total, or the override if one was given to start_encryption()).
@@ -610,17 +631,23 @@ class Encryptor {
     /// `allow_large` permits data larger than MAX_REGULAR_SIZE.
     ///
     /// `encrypt_size` overrides the expected plaintext size for phase 2.  If omitted, the size
-    /// from phase 1 (sum of update() calls) is used.
+    /// from phase 1 (sum of update_key() calls) is used.
     ///
-    /// `source` is a pull-based data source for phase 2: it is called with a buffer to fill and
-    /// must fill it completely; returning fewer bytes than requested signals the end of data.
-    /// Phase 2 is then driven by next() calls which pull from this source.
+    /// `source` supplies the plaintext for phase 2, which is then driven by next() calls that pull
+    /// from it.
     ///
-    /// Returns the decryption key (in a cleared buffer).
+    /// Returns the decryption key (in a cleared buffer).  If this throws, the encryptor is
+    /// unchanged, so one still in phase 1 can be started again.
     cleared_b32 start_encryption(
-            std::function<size_t(std::span<std::byte> buffer)> source,
+            read_callback source,
             bool allow_large = false,
             std::optional<size_t> encrypt_size = std::nullopt);
+
+    /// Transition from phase 1 to phase 2, encrypting `data` from memory.  `data` is not copied:
+    /// it must stay valid until next() has returned the last chunk.  Its size is the plaintext
+    /// size, whatever phase 1 was fed.  If this throws, the encryptor is unchanged, so one still in
+    /// phase 1 can be started again.
+    cleared_b32 start_encryption(std::span<const std::byte> data, bool allow_large = false);
 
     /// Pull the next chunk of encrypted output.  Returns a non-owning span that is valid until
     /// the next call to next().  Returns an empty span when all data has been encrypted.
@@ -640,7 +667,7 @@ class Encryptor {
             bool allow_large = false,
             std::function<void(int64_t bytes_read, int64_t total_size)> progress = nullptr);
 
-    /// Factory: constructs an Encryptor, runs load_from_file, and returns the ready Encryptor
+    /// Factory: constructs an Encryptor, runs load_key_from_file, and returns the ready Encryptor
     /// along with the decryption key.
     static std::pair<Encryptor, cleared_b32> from_file(
             std::span<const std::byte> seed,

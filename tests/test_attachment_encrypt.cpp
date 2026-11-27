@@ -582,6 +582,13 @@ static std::vector<std::byte> slice(std::span<const std::byte> data, uint64_t po
     return {s.begin(), s.end()};
 }
 
+static std::vector<std::byte> drain(attachment::Encryptor& enc) {
+    std::vector<std::byte> out;
+    for (auto chunk = enc.next(); !chunk.empty(); chunk = enc.next())
+        out.insert(out.end(), chunk.begin(), chunk.end());
+    return out;
+}
+
 TEST_CASE("Seekable attachment decryption", "[attachments][files][seekable]") {
 
     // 4200000 is large enough that its padding spans several chunks.
@@ -748,15 +755,7 @@ TEST_CASE("Streaming Encryptor", "[attachments][encryptor]") {
             return avail;
         });
 
-        // Collect all encrypted output
-        std::vector<std::byte> encrypted;
-        while (true) {
-            auto chunk = enc.next();
-            if (chunk.empty())
-                break;
-            encrypted.insert(encrypted.end(), chunk.begin(), chunk.end());
-        }
-
+        auto encrypted = drain(enc);
         CHECK(encrypted.size() == attachment::encrypted_size(DATA_SIZE));
 
         // Decrypt with the streaming Decryptor and verify round-trip
@@ -768,6 +767,42 @@ TEST_CASE("Streaming Encryptor", "[attachments][encryptor]") {
         REQUIRE(dec.finalize());
         REQUIRE(decrypted.size() == data.size());
         CHECK(!!(decrypted == data));
+    }
+
+    SECTION("encryption from memory") {
+        attachment::Encryptor enc{seed, attachment::Domain::ATTACHMENT};
+        enc.update_key(data);
+        auto key = enc.start_encryption(data);
+
+        auto encrypted = drain(enc);
+        CHECK(encrypted.size() == attachment::encrypted_size(DATA_SIZE));
+        auto decrypted = attachment::decrypt(encrypted, key);
+        REQUIRE(decrypted.size() == data.size());
+        CHECK(!!(decrypted == data));
+    }
+
+    SECTION("a refused start can be retried") {
+        attachment::Encryptor enc{seed, attachment::Domain::ATTACHMENT};
+        enc.update_key(data);
+        CHECK_THROWS_AS(
+                enc.start_encryption(attachment::Encryptor::read_callback{}),
+                std::invalid_argument);
+        CHECK_THROWS_AS(
+                enc.start_encryption(
+                        [](std::span<std::byte>) -> size_t { return 0; },
+                        false,
+                        attachment::MAX_REGULAR_SIZE + 1),
+                std::invalid_argument);
+
+        auto key = enc.start_encryption(data);
+        auto encrypted = drain(enc);
+        CHECK(attachment::decrypt(encrypted, key) == data);
+
+        // Identical to an encryption that was never refused, so nothing of phase 1 was consumed.
+        auto [expected, expected_key] =
+                attachment::encrypt(seed, data, attachment::Domain::ATTACHMENT);
+        CHECK(encrypted == expected);
+        CHECK(key == expected_key);
     }
 
     SECTION("from_file factory") {
@@ -784,14 +819,7 @@ TEST_CASE("Streaming Encryptor", "[attachments][encryptor]") {
         auto [enc, key] = attachment::Encryptor::from_file(
                 seed, attachment::Domain::ATTACHMENT, tmp.path, true);
 
-        std::vector<std::byte> encrypted;
-        while (true) {
-            auto chunk = enc.next();
-            if (chunk.empty())
-                break;
-            encrypted.insert(encrypted.end(), chunk.begin(), chunk.end());
-        }
-
+        auto encrypted = drain(enc);
         CHECK(encrypted.size() == attachment::encrypted_size(DATA_SIZE));
 
         // Decrypt and verify
@@ -926,21 +954,8 @@ TEST_CASE("Attachment encryption -- a key of our own", "[attachments][fixed-key]
 
     auto encrypt_with = [&](std::span<const std::byte> data) {
         attachment::Encryptor enc{cache_key};
-        size_t pos = 0;
-        enc.start_encryption(
-                [&](std::span<std::byte> buf) -> size_t {
-                    auto n = std::min(buf.size(), data.size() - pos);
-                    std::memcpy(buf.data(), data.data() + pos, n);
-                    pos += n;
-                    return n;
-                },
-                false,
-                data.size());
-
-        std::vector<std::byte> out;
-        for (auto chunk = enc.next(); !chunk.empty(); chunk = enc.next())
-            out.insert(out.end(), chunk.begin(), chunk.end());
-        return out;
+        enc.start_encryption(data);
+        return drain(enc);
     };
 
     auto encrypted = encrypt_with(plaintext);
@@ -971,6 +986,9 @@ TEST_CASE("Attachment encryption -- a key of our own", "[attachments][fixed-key]
     CHECK_THROWS_AS(
             enc.start_encryption([](std::span<std::byte>) -> size_t { return 0; }),
             std::invalid_argument);
+    // That refusal leaves it as it was, so it can still be started with a size.
+    enc.start_encryption(plaintext);
+    CHECK(attachment::decrypt(drain(enc), cache_key) == plaintext);
 }
 
 TEST_CASE("Display picture decryption -- the legacy GCM scheme", "[attachments][legacy-pic]") {
