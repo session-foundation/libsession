@@ -597,12 +597,11 @@ TEST_CASE(
                         signed_ns)));
     };
 
-    // Everything the account polls but messages, its own profile (2) and its own published keys
-    // (-21), first, so that a push server keeping one subscription per device keeps the one with
-    // data, sent after it.
+    // Everything the account polls but messages and its own published keys (-21), first, so that
+    // a push server keeping one subscription per device keeps the one with data, sent after it.
     auto first = take_sent_to(*s.net, "subscribe");
     REQUIRE(first.size() == 1);
-    check_request(first[0], false, {3, 4, 5, 21}, "3,4,5,21");
+    check_request(first[0], false, {2, 3, 4, 5, 21}, "2,3,4,5,21");
 
     s.reply(first[0], accepted());
     CHECK(s.results.empty());
@@ -990,10 +989,18 @@ TEST_CASE("Push handle: a message too large for the push is fetched", "[push_not
 TEST_CASE("Push handle: a push without data", "[push_notifications]") {
     Extension x;
 
-    SECTION("for a config that can wait for the next poll") {
-        x.handle(x.push_for(static_cast<int16_t>(config::Namespace::UserProfile), std::nullopt));
+    SECTION("for a namespace it does not fetch for") {
+        // Not subscribed today; stands for any namespace fetch_on_push leaves to the next poll.
+        x.handle(x.push_for(static_cast<int16_t>(config::Namespace::AccountPubkeys), std::nullopt));
         CHECK(x.only().outcome == push::Handled::nothing_to_do);
         CHECK(take_retrieves(*x.net).empty());
+    }
+
+    SECTION("for our own profile, which is fetched now") {
+        x.handle(x.push_for(static_cast<int16_t>(config::Namespace::UserProfile), std::nullopt));
+        auto sent = take_retrieves(*x.net);
+        REQUIRE(sent.size() == 1);
+        CHECK(retrieve_params(sent[0])["namespace"] == 2);
     }
 
     SECTION("for the device group, which is fetched now") {

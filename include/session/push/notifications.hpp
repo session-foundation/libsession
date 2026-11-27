@@ -276,8 +276,9 @@ class Notifications {
     /// with this device's key, then receives the message it carried, or fetches the message it
     /// could not carry, or fetches what a push without data stands for where that matters now (see
     /// `fetch_on_push`): the device group, whose change may be a key rotation or a link request;
-    /// the read state, so that notifications for what was read elsewhere can be removed; and
-    /// contacts and groups, so that a notification shows current names.
+    /// the read state, so that notifications for what was read elsewhere can be removed; contacts
+    /// and groups, so that a notification shows current names; and our own profile, so that a
+    /// change made on another device shows here straight away.
     ///
     /// Fetching is bounded by `deadline`; see `fetch_message`.  A message the push carried is
     /// received without touching the retrieve cursor, since a push is not a position in what any
@@ -362,7 +363,8 @@ class Notifications {
     std::vector<std::string> stale();
 
     /// Namespaces subscribed without message data whose pushes `handle` fetches for, because what
-    /// changed there affects what a notification can show or whether a later message can be read.
+    /// changed there affects what a notification can show, whether a later message can be read,
+    /// or what the app shows of our own profile.
     static bool fetch_on_push(config::Namespace ns);
 
     /// The namespace `handle` fetches before `ns`, when `ns` is encrypted with keys that arrive in

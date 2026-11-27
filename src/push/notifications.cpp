@@ -387,6 +387,10 @@ INSERT INTO notified (message, hash, at) SELECT id, swarm_hash, ? FROM messages 
 
 bool Notifications::fetch_on_push(config::Namespace ns) {
     switch (ns) {
+        // Our own profile: the display name, picture and settings the app shows.  A push is the
+        // fastest way a change reaches a device and still works in the background; the next poll
+        // can be a long way off.
+        case config::Namespace::UserProfile: return true;
         // A change to the device group may be a key rotation, without whose keys later messages
         // will not decrypt, or a link request the user is waiting on.
         case config::Namespace::Devices: return true;

@@ -310,10 +310,6 @@ std::vector<config::Namespace> Notifications::account_namespaces() {
         // private keys a device actually needs.
         if (ns == config::Namespace::AccountPubkeys)
             continue;
-        // Our own profile.  Nothing a notification shows or needs comes from it, so a push for it
-        // would wake the handler only to be dropped (see fetch_on_push); the next poll brings it.
-        if (ns == config::Namespace::UserProfile)
-            continue;
         out.push_back(ns);
     }
     std::ranges::sort(out);
