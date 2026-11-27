@@ -109,29 +109,16 @@ schema_history = {
     "commands": ["tests/schema_history_check.sh build/tests/schema-upgrade-check"],
 }
 
-# Every clone leaves the submodules to fetch_submodules, which fetches only the ones builds use.  The
-# default `partial` clone is treeless, which makes the checkout go back to the server for its trees;
-# a plain depth-1 fetch gets them in one go.
-def clone_with(settings):
-    s = {"recursive": False}
-    s.update(settings)
-    return [{"name": "clone", "image": "woodpeckerci/plugin-git:2", "settings": s}]
-
-shallow_clone = clone_with({"depth": 1, "partial": False})
-full_clone = clone_with({"depth": 0, "partial": False, "tags": True})
-
-# Needs git, so it goes after the apt install in the docker builds.
-fetch_submodules = ["./utils/ci/submodules.sh"]
-
-def workflow(name, platform, steps, when = None, clone = None):
+def workflow(name, platform, steps, when = None, clone_settings = None):
     wf = {
         "name": name,
         "labels": {"platform": platform, "backend": "local" if platform.startswith("darwin/") else "docker"},
         # The debian/* and ubuntu/* branches build packages, with CI configs of their own.
         "when": when or [{"event": events, "branch": {"exclude": ["debian/*", "ubuntu/*"]}}],
         "steps": steps,
-        "clone": clone or shallow_clone,
     }
+    if clone_settings:
+        wf["clone_settings"] = clone_settings
     return wf
 
 # nasm is for libjpeg-turbo's and dav1d's x86 assembly, without which session-deps refuses to build
@@ -221,7 +208,7 @@ def linux(
         jobs = 6,
         test_runner = "",
         checks = None,
-        clone = None,
+        clone_settings = None,
         meson = None):
     if cmake.get("BUILD_STATIC_DEPS"):
         system = []
@@ -232,7 +219,6 @@ def linux(
     steps = [build_step(
         image,
         apt_install(image, build_tools + m["pkgs"] + deps + system, session_repo, foreign_arch, m.get("apt_source")) +
-        fetch_submodules +
         m.get("commands", []) +
         build_commands(cmake, jobs),
     )]
@@ -246,7 +232,7 @@ def linux(
         if "environment" in check:
             step["environment"] = check["environment"]
         steps.append(step)
-    return workflow(name, "linux/" + arch, steps, clone = clone)
+    return workflow(name, "linux/" + arch, steps, clone_settings = clone_settings)
 
 def clang(version, distro = "Debian sid", image = "debian-sid-clang"):
     return linux(
@@ -329,7 +315,6 @@ def package(name, image, commands, directory, arch = "amd64", deps = gcc_deps, s
         build_step(
             image,
             apt_install(image, build_tools + m["pkgs"] + deps, session_repo, apt_source = m.get("apt_source")) +
-            fetch_submodules +
             m.get("commands", []) +
             ["export JOBS=6"] + commands,
         ),
@@ -366,13 +351,13 @@ def macos(name, arch, cmake = {}):
     opts = {"CMAKE_CXX_FLAGS": "-fcolor-diagnostics"}
     opts.update(cmake)
     return workflow(name, "darwin/" + arch, [
-        build_step("sh", mac_setup + fetch_submodules + build_commands(opts, 6)),
+        build_step("sh", mac_setup + build_commands(opts, 6)),
         {"name": "tests", "image": "sh", "commands": test_commands()},
     ])
 
 def macos_package(name, script, directory):
     return workflow(name, "darwin/arm64", [
-        build_step("sh", mac_setup + fetch_submodules + ["export JOBS=6", script]),
+        build_step("sh", mac_setup + ["export JOBS=6", script]),
         upload_step("sh", "cd %s && ../utils/ci/static-upload.sh" % directory),
     ])
 
@@ -442,7 +427,7 @@ def main(ctx):
                 "git --no-pager diff --exit-code --color || " +
                 "(printf '\\n\\n\\033[31;1mLint check failed; please run ./utils/format.sh\\033[0m\\n\\n'; exit 1)",
             ],
-        }]),
+        }], clone_settings = {"recursive": False}),
 
         workflow("API Documentation", "linux/amd64", [
             build_step(registry + "debian-stable", [
@@ -455,7 +440,7 @@ def main(ctx):
                 "make build-all",
             ], ccache_stats = False),
             upload_step(registry + "debian-stable", "cd docs/api && ../../utils/ci/docs-upload.sh"),
-        ], when = [{"event": "push", "branch": "dev"}]),
+        ], when = [{"event": "push", "branch": "dev"}], clone_settings = {"recursive": False}),
 
         linux("Debian sid", "debian-sid"),
 
@@ -495,7 +480,7 @@ def main(ctx):
         full_llvm(23, sanitize = True),
 
         linux("Debian stable (i386)", "debian-stable/i386"),
-        linux("Debian 13", "debian-trixie", checks = [tests(), schema_history], clone = full_clone),
+        linux("Debian 13", "debian-trixie", checks = [tests(), schema_history], clone_settings = {"shallow": False}),
         clang(19, "Debian 13", "debian-trixie"),
         full_llvm(19, distro = "Debian 13", image = "debian-trixie"),
         linux("Debian 12", "debian-bookworm", meson = "bookworm-backports"),

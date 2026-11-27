@@ -1,0 +1,17 @@
+# The submodules CI's clone step fetches (see clone/README.md in session-docker-ci).  Patterns work
+# as in .gitignore; skipping a submodule skips everything under it, and a submodule added upstream
+# is fetched until it is listed here.
+submodules:
+  # No CI build configures these.
+  skip:
+    - /cmake/session-deps/external/ios-cmake
+    - /external/**/Catch2
+    - googletest
+    - /external/protobuf/third_party/benchmark
+    - /external/session-router/gui
+    - /external/session-router/external/oxen-libquic/cmake/session-deps/external/ios-cmake
+    - /external/session-router/external/oxen-libquic/tests/CLI11
+    # Not oxen-mq itself, pybind11 or sqlite_orm: session-router's external/CMakeLists.txt runs
+    # check_submodule() on them unconditionally.
+    - /external/session-router/external/oxen-mq/cppzmq
+    - /external/session-router/external/oxen-mq/oxen-*
