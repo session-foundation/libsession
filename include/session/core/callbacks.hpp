@@ -215,6 +215,18 @@ struct callbacks {
     /// - changed -- the namespaces whose configs the merge altered.  Valid only for the duration of
     ///   the call.
     std::function<void(std::span<const config::Namespace> changed)> configs_changed;
+
+    /// Callback fired when `Configs::push_pending()` changes: a push of the account's configs has
+    /// become due, or the last one due has been answered or found unable to go.
+    ///
+    /// Fires on Core's loop, on a change only, and once per operation: a push moving from
+    /// scheduled to sent stays pending throughout and fires nothing.  Not fired while Core is being
+    /// constructed, so a push that construction itself schedules -- a new account's defaults -- is
+    /// not reported; read push_pending() once construction is done for the starting state.
+    ///
+    /// Parameters:
+    /// - pending -- the new value of push_pending().
+    std::function<void(bool pending)> config_push_changed;
 };
 
 }  // namespace session::core
