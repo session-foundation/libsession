@@ -26,6 +26,7 @@ namespace config {
         std::chrono::seconds keep_alive;
 
         std::optional<size_t> max_udp_payload;
+        std::optional<opt::quic_congestion_control> congestion_control;
     };
 }  // namespace config
 
@@ -104,7 +105,8 @@ class QuicTransport : public ITransport {
             const std::string& address_pubkey_hex,
             const std::string& initiating_req_id,
             std::optional<uint64_t> error_code,
-            std::optional<std::string> custom_error);
+            std::optional<std::string> custom_error,
+            std::optional<oxen::quic::ConnectionID> conn_id = std::nullopt);
 };
 
 }  // namespace session::network

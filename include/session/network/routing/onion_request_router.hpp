@@ -202,6 +202,7 @@ class OnionRequestRouter : public IRouter, public std::enable_shared_from_this<O
     void _start_setup();
     void _finish_setup();
     void _pre_build_paths_if_needed();
+    void _drop_struck_cached_edge_nodes();
     void _close_connections();
     void _update_status();
     void _send_request_internal(Request request, network_response_callback_t callback);

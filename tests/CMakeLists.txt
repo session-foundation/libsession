@@ -71,9 +71,11 @@ list(APPEND LIB_SESSION_UTESTS_SOURCES
     test_backed_session_open_group_server.cpp
     test_ip_country.cpp
     test_network_clock.cpp
+    test_network_config.cpp
     test_network_swarm.cpp
     test_onionreq.cpp
     test_onion_request_router.cpp
+    test_quic_transport.cpp
     test_snode_pool.cpp
     test_core_network.cpp
     test_poll.cpp
@@ -172,10 +174,3 @@ endif()
 
 add_executable(swarm-auth-test EXCLUDE_FROM_ALL swarm-auth-test.cpp)
 target_link_libraries(swarm-auth-test PRIVATE config)
-
-if(STATIC_BUNDLE)
-    add_executable(static-bundle-test static_bundle.cpp)
-    target_include_directories(static-bundle-test PUBLIC ../include)
-    target_link_libraries(static-bundle-test PRIVATE "${PROJECT_BINARY_DIR}/libsession-util.a" oxenc::oxenc oxen::quic)
-    add_dependencies(static-bundle-test session-util)
-endif()

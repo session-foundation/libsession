@@ -85,6 +85,7 @@ struct Config {
 
     std::chrono::seconds quic_keep_alive{10s};
     std::optional<size_t> quic_max_udp_payload;
+    std::optional<opt::quic_congestion_control> quic_congestion_control;
 
     template <typename... Opt>
         requires(sizeof...(Opt) > 0 && (opt::is_option<std::decay_t<Opt>> && ...))
@@ -143,6 +144,7 @@ struct Config {
     void handle_config_opt(opt::quic_tunnel_handshake_timeout qtht);
     void handle_config_opt(opt::quic_keep_alive qka);
     void handle_config_opt(opt::quic_max_udp_payload qmup);
+    void handle_config_opt(opt::quic_congestion_control qcc);
 
     // Onion request router options
     void handle_config_opt(opt::onionreq_path_strike_threshold pst);

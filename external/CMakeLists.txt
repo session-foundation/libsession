@@ -29,7 +29,6 @@ function(static_sessiondep_or_submodule)
 endfunction()
 
 session_dep(libsodium 1.0.21)
-libsession_static_bundle(sessiondep::libsodium)
 
 if(NOT TARGET oxenc::oxenc)
     set(OXENC_BUILD_TESTS OFF CACHE BOOL "")
@@ -83,7 +82,6 @@ set(SROUTER_JEMALLOC OFF CACHE BOOL "")
 
 # 1.1.1 is the first release with session::mlkem768 and installed headers.
 static_sessiondep_or_submodule(libsessionrouter-core 1.1.1 session-router session-router::core)
-libsession_static_bundle(session-router::core)
 
 # The session-router submodule has already provided oxen::quic; this is for a system session-router,
 # for which the check above has made sure this finds the system libquic.
@@ -130,7 +128,6 @@ sessiondep_or_submodule(protobuf-lite 3.21 protobuf protobuf::libprotobuf-lite)
 # configs get deduplicated at the swarm.
 set(BUILD_STATIC_libzstd ON CACHE BOOL "" FORCE)
 session_dep(libzstd 1.5)
-libsession_static_bundle(sessiondep::libzstd)
 
 if(NOT TARGET nlohmann_json::nlohmann_json)
     set(JSON_BuildTests OFF CACHE INTERNAL "")
@@ -140,24 +137,20 @@ endif()
 
 
 session_dep(simdutf 7)
-libsession_static_bundle(sessiondep::simdutf)
 
 # 8.13 added vips_operation_block_set(), which the loader whitelist in src/image/vips.cpp needs: a
 # system libvips may carry loaders (svg, pdf, tiff, ...) that our static build leaves out.
 session_dep(vips 8.13)
-libsession_static_bundle(sessiondep::vips)
 
 # libvips' own HEIF support cannot say which codec a HEIF file uses (it guesses from the brand),
 # so libsession::image asks libheif directly; 1.19 is the first with the grid tile API it needs.
 session_dep(libheif 1.19)
-libsession_static_bundle(sessiondep::libheif)
 
 if(SESSION_ENABLE_JPEGLI)
     # Always our own build, even when everything else comes from the system: distributions do not
     # package jpegli, and we want every client encoding JPEGs the same way whatever libvips it has.
     set(BUILD_STATIC_jpegli ON CACHE BOOL "" FORCE)
     session_dep(jpegli 0)
-    libsession_static_bundle(sessiondep::jpegli)
 endif()
 
 

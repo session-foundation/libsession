@@ -70,6 +70,17 @@ endif()
 # defaults to the same value as BUILD_SHARED_LIBS (i.e. static by default).
 set(BUILD_STATIC_DEPS ${static_default} CACHE BOOL "Build all dependencies statically rather than trying to link to them on the system")
 
+# Each of our shared libraries, and anything linking them, is a separate final link, so every one of
+# them that uses a static dependency gets its own copy: gnutls ends up in libsession-crypto.so and
+# again in an executable that links oxen::quic through libsession-network.so.  The copies export the
+# same symbols, so in one process they bind to each other's globals: the second gnutls finds its
+# ASN.1 tables already filled in by the first and fails to initialize.
+if(BUILD_SHARED_LIBS AND BUILD_STATIC_DEPS)
+    message(FATAL_ERROR "BUILD_SHARED_LIBS is incompatible with BUILD_STATIC_DEPS: shared libraries "
+        "need shared (system) dependencies.  Configure with -DBUILD_STATIC_DEPS=OFF, or build static "
+        "libraries.")
+endif()
+
 include(cmake/session-deps/Deps.cmake)
 
 option(STATIC_BUNDLE "Build a single static .a containing everything (both code and dependencies)" OFF)
@@ -78,9 +89,9 @@ if(STATIC_BUNDLE AND NOT BUILD_STATIC_DEPS)
     message(FATAL_ERROR "STATIC_BUNDLE requires BUILD_STATIC_DEPS to be enabled")
 endif()
 
-# A shared build has no static archives for our own libraries, and libsession_static_bundle()
-# silently skips non-static targets: the bundle would come out holding only the dependencies, which
-# only shows up as undefined libsession symbols when something links against it.
+# A shared build has no static archives for our own libraries, and the bundle walk only collects
+# static ones: the bundle would come out holding only the dependencies, which only shows up as
+# undefined libsession symbols when something links against it.
 if(STATIC_BUNDLE AND BUILD_SHARED_LIBS)
     message(FATAL_ERROR "STATIC_BUNDLE is incompatible with BUILD_SHARED_LIBS")
 endif()
@@ -188,7 +199,28 @@ if(STATIC_BUNDLE)
 
     include(combine_archives)
 
-    combine_archives(session-util libsession-static-bundle "${LIBSESSION_STATIC_BUNDLE_LIBS}")
+    # Threads::Threads comes from find_package() calls in subdirectories, which make it visible only
+    # there; the bundle walk has to be able to see it.
+    find_package(Threads REQUIRED)
+    libsession_static_bundle_libs(bundle_archives bundle_system_libs ${libsession_export_targets})
+    message(STATUS "Static bundle libsession-util.a combines: ${bundle_archives}")
+    message(STATUS "Static bundle libsession-util.a also needs: ${bundle_system_libs}")
+    combine_archives(session-util libsession-static-bundle ${bundle_archives})
+
+    # Links the bundle and only what the walk says it needs from the system, so that a library
+    # missing from the bundle fails here rather than in whatever consumes it.  Headers come from our
+    # targets' usage requirements, without linking them.
+    add_executable(static-bundle-test tests/static_bundle.cpp)
+    foreach(header_target network image)
+        target_include_directories(static-bundle-test PRIVATE
+            $<TARGET_PROPERTY:${header_target},INTERFACE_INCLUDE_DIRECTORIES>)
+        target_compile_definitions(static-bundle-test PRIVATE
+            $<TARGET_PROPERTY:${header_target},INTERFACE_COMPILE_DEFINITIONS>)
+    endforeach()
+    target_link_libraries(static-bundle-test PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/libsession-util.a" ${bundle_system_libs})
+    add_dependencies(static-bundle-test session-util)
+
     set(lib_folder lib)
     if(IOS)
         set(lib_folder "${lib_folder}-${ARCH}")

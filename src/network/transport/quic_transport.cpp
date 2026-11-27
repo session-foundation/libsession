@@ -8,6 +8,8 @@
 #include <oxen/quic/gnutls_crypto.hpp>
 #include <oxen/quic/opt.hpp>
 #include <oxen/quic/result.hpp>
+#include <string>
+#include <system_error>
 
 #include "session/crypto/ed25519.hpp"
 #include "session/network/session_network_types.hpp"
@@ -24,6 +26,14 @@ namespace {
     inline auto cat = log::Cat("quic-transport");
 
     static constexpr uint16_t ACTIVE_STREAM_PRUNE_LIMIT = 32;
+
+    // The errno is what says why a socket couldn't be opened, and a system_error's message
+    // doesn't always make it recoverable
+    std::string describe(const std::exception& e) {
+        if (const auto* se = dynamic_cast<const std::system_error*>(&e))
+            return "{} (errno {})"_format(se->what(), se->code().value());
+        return e.what();
+    }
 
     inline bool use_reserved_stream(RequestCategory category) {
         switch (category) {
@@ -66,7 +76,7 @@ QuicTransport::~QuicTransport() {
 void QuicTransport::suspend() {
     // Use 'call_get' to force this to be synchronous
     _jq.call_get([this] {
-        if (!_suspended)
+        if (_suspended)
             return;
 
         _suspended = true;
@@ -79,8 +89,21 @@ void QuicTransport::resume(bool /*automatically_reconnect*/) {
     // Use 'call_get' to force this to be synchronous
     _jq.call_get([this] {
         // Recreate the endpoint before updating the `_suspended` flag to avoid the chance that
-        // something will try to use it before we are ready
-        _recreate_endpoint();
+        // something will try to use it before we are ready.
+        //
+        // Opening its socket can fail, and an exception from here would escape `Network::resume`
+        // before the router resumes, into an app coming back to the foreground (on iOS it
+        // terminated the app).  Left without an endpoint, the transport creates one on its next
+        // connection attempt.
+        try {
+            _recreate_endpoint();
+        } catch (const std::exception& e) {
+            log::error(
+                    cat,
+                    "Unable to recreate the endpoint on resume, will retry on the next "
+                    "connection: {}",
+                    describe(e));
+        }
         _suspended = false;
         log::info(cat, "Resumed.");
     });
@@ -155,34 +178,41 @@ void QuicTransport::_recreate_endpoint() {
 }
 
 void QuicTransport::_close_connections() {
-    // Explicitly close all connections then reset the endpoint
+    // Taken out before the endpoint goes.  Resetting it destroys it on the spot (close_conns()
+    // only defers), and its destructor closes every connection with code 0 through the handler
+    // that fails whatever is pending on it - so left in place, our own close would reach each
+    // pending verification as an error code, which is what gets a node struck.  Answering copies
+    // also keeps a callback that calls back into the transport from changing the maps being walked.
+    auto verifications = std::exchange(_pending_verification_callbacks, {});
+    auto requests = std::exchange(_pending_requests, {});
+
     if (_endpoint)
         _endpoint->close_conns();
     _endpoint.reset();
-
-    // Cancel any pending verifications (they can't succeed once the connection is closed)
-    for (const auto& [pubkey, callbacks] : _pending_verification_callbacks)
-        for (const auto& callback : callbacks)
-            callback(false, -1);
-
-    // Cancel any pending requests (they can't succeed once the connection is closed)
-    for (const auto& [pubkey, pupkey_requests] : _pending_requests)
-        for (const auto& [info, callback] : pupkey_requests)
-            callback(
-                    false,
-                    false,
-                    ERROR_NETWORK_SUSPENDED,
-                    {content_type_plain_text},
-                    "QuickTransport is suspended.");
 
     // Clear all storage of requests, paths and connections so that we are in a fresh state on
     // relaunch
     _active_connection_ids.clear();
     _available_stream_ids.clear();
-    _pending_verification_callbacks.clear();
-    _pending_requests.clear();
-
     _update_status(ConnectionStatus::disconnected);
+
+    // Answered only now the transport is fully closed, so anything a callback asks of it fails
+    // cleanly, without an error code, rather than meeting half-closed state.  A verification gets
+    // no error code either: a close we asked for is no evidence against the node.
+    for (const auto& [pubkey, callbacks] : verifications)
+        for (const auto& callback : callbacks)
+            callback(false, std::nullopt);
+
+    for (const auto& [pubkey, pubkey_requests] : requests)
+        for (const auto& [info, callback] : pubkey_requests)
+            callback(
+                    false,
+                    false,
+                    (_suspended ? ERROR_NETWORK_SUSPENDED : ERROR_CONNECTION_CLOSED),
+                    {content_type_plain_text},
+                    (_suspended ? "QuickTransport is suspended."
+                                : "QuickTransport closed its connections."));
+
     log::info(cat, "Closed all connections.");
 }
 
@@ -298,7 +328,7 @@ void QuicTransport::_establish_connection(
         if (_suspended)
             throw std::runtime_error{"QuickTransport is suspended"};
         if (!_endpoint)
-            throw std::runtime_error{"Network is invalid"};
+            _recreate_endpoint();
 
         auto [conn_pk, conn_sk] = ed25519::keypair();
         auto creds = quic::GNUTLSCreds::make_from_ed_seckey(to_string_view(conn_sk));
@@ -321,6 +351,7 @@ void QuicTransport::_establish_connection(
                 oxen::quic::opt::handshake_timeout{
                         tunnelled ? _config.tunnel_handshake_timeout : _config.handshake_timeout},
                 oxen::quic::opt::keep_alive{_config.keep_alive},
+                _config.congestion_control,
                 // libquic hands these a live Connection, so they run inline on the loop rather than
                 // as jobs of ours.  ~QuicTransport destroys the endpoint on the loop before the
                 // members below are touched, so there is no window in which this can fire late.
@@ -406,12 +437,16 @@ void QuicTransport::_establish_connection(
                     }
                 },
                 [this, address_pubkey_hex, initiating_req_id](
-                        oxen::quic::Connection&, uint64_t error_code) {
+                        oxen::quic::Connection& conn, uint64_t error_code) {
                     _fail_connection(
-                            address_pubkey_hex, initiating_req_id, error_code, std::nullopt);
+                            address_pubkey_hex,
+                            initiating_req_id,
+                            error_code,
+                            std::nullopt,
+                            conn.reference_id());
                 });
     } catch (const std::exception& e) {
-        _fail_connection(address_pubkey_hex, initiating_req_id, std::nullopt, e.what());
+        _fail_connection(address_pubkey_hex, initiating_req_id, std::nullopt, describe(e));
     }
 }
 
@@ -539,13 +574,20 @@ void QuicTransport::_send_on_connection(
                 // Since the request completed it's round-trip if it isn't the "reserverd" stream
                 // (not used for general requests) then we can either add it back to the pool, or
                 // close it if there are more that the active stream price limit
+                //
+                // The connection can be gone by the time this runs, e.g. if the stream outlived it
+                // (libquic then fails the request from ~sent_request).  Then there is nothing to
+                // return to the pool or close, and any ids pooled for it are dead too.
                 if (stream_id != 0 && _endpoint) {
-                    auto conn = _endpoint->get_conn(conn_id);
-
-                    if (conn && conn->get_streams_available() <= ACTIVE_STREAM_PRUNE_LIMIT)
-                        _available_stream_ids[conn_id].insert(stream_id);
-                    else if (auto stream = conn->get_stream<oxen::quic::BTRequestStream>(stream_id))
-                        stream->close();
+                    if (auto conn = _endpoint->get_conn(conn_id)) {
+                        if (conn->get_streams_available() <= ACTIVE_STREAM_PRUNE_LIMIT)
+                            _available_stream_ids[conn_id].insert(stream_id);
+                        else if (
+                                auto stream =
+                                        conn->get_stream<oxen::quic::BTRequestStream>(stream_id))
+                            stream->close();
+                    } else
+                        _available_stream_ids.erase(conn_id);
                 }
 
                 if (resp.timed_out) {
@@ -591,7 +633,8 @@ void QuicTransport::_fail_connection(
         const std::string& address_pubkey_hex,
         const std::string& initiating_req_id,
         std::optional<uint64_t> error_code,
-        std::optional<std::string> custom_error) {
+        std::optional<std::string> custom_error,
+        std::optional<oxen::quic::ConnectionID> conn_id) {
     if (error_code == 0)
         log::info(
                 cat,
@@ -634,8 +677,16 @@ void QuicTransport::_fail_connection(
                 address_pubkey_hex,
                 custom_error.value_or("Unknown error"));
 
-    // Clear the connection and stream ids
-    if (auto id = _active_connection_ids.extract(address_pubkey_hex))
+    // Clear the connection and stream ids.  When the closed connection is known, only its own
+    // state goes: a newer connection to the same node can be established before an old one's close
+    // arrives, and clearing by pubkey alone would drop the new connection and orphan the old one's
+    // stream ids.
+    if (conn_id) {
+        _available_stream_ids.erase(*conn_id);
+        if (auto it = _active_connection_ids.find(address_pubkey_hex);
+            it != _active_connection_ids.end() && it->second == *conn_id)
+            _active_connection_ids.erase(it);
+    } else if (auto id = _active_connection_ids.extract(address_pubkey_hex))
         _available_stream_ids.erase(id.mapped());
 
     // Process any waiting verification requests

@@ -44,8 +44,6 @@ macro(add_libsession_util_library name)
         OUTPUT_NAME session-${name}
         SOVERSION ${LIBSESSION_LIBVERSION})
 
-    libsession_static_bundle(${name})
-
     list(APPEND export_targets ${name})
 endmacro()
 
@@ -113,6 +111,7 @@ target_link_libraries(crypto
     session::secure_buffer
     PRIVATE
     sessiondep::libsodium
+    sessiondep::libzstd
     # AES-CBC for legacy attachment decryption, which libsodium has no equivalent of: it exposes
     # AES only as GCM, and only where the hardware supports it.
     sessiondep::nettle
@@ -317,7 +316,6 @@ else()
     endif()
 endif()
 add_library(version STATIC version.c)
-libsession_static_bundle(version)
 target_include_directories(version PRIVATE ../include)
 target_link_libraries(common INTERFACE version)
 
