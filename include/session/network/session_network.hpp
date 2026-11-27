@@ -124,7 +124,8 @@ class Network {
     /// False for onion requests, and not as a matter of it being unimplemented: the storage server
     /// keys a subscription to the connection the request arrived on, which for an onion request is
     /// the last relay's rather than ours, so subscribing over one would register a relay as the
-    /// subscriber.  Anything relying on pushed messages has to keep polling in that mode.
+    /// subscriber.  Anything relying on pushed messages has to keep retrieving periodically in that
+    /// mode.
     bool supports_server_push() const { return config.router != opt::router::Type::onion_requests; }
 
     /// How requests reach their destination on this network.

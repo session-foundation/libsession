@@ -162,7 +162,7 @@ CREATE TABLE globals (
 --
 -- Every hash from a retrieve goes in, including messages we store nothing for -- typing indicators,
 -- payloads that do not parse, anything a namespace carries that this build ignores.  Recording only
--- what we kept would leave the cursor behind those, and we would fetch them again on every poll.
+-- what we kept would leave the cursor behind those, and every retrieve would fetch them again.
 --
 -- Deliberately no foreign key to the client's `messages`: this is Core's, and a bare Core has no
 -- such table.  It would also be the wrong fact -- a row here says a *node* still holds the message,

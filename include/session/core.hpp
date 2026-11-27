@@ -43,9 +43,11 @@
 /// The apparent exception proves it — Core does parse its own namespaces, the device group and the
 /// account keys, because that state *is* Core's rather than a conversation's.
 ///
-/// Core can drive its own network once one is attached with set_network(), after which it polls the
-/// account's swarms on a timer.  Without one it can still be fed inbound messages through
-/// receive_messages(), but it cannot send: a send with no network attached reports no_network.
+/// Core can drive its own network once one is attached with set_network(), after which it receives
+/// what the account's swarm stores for it: where the routing mode allows, by subscribing with a
+/// swarm member that then pushes new messages as they arrive, and otherwise by retrieving on a
+/// timer.  Without one it can still be fed inbound messages through receive_messages(), but it
+/// cannot send: a send with no network attached reports no_network.
 ///
 /// The typical intended flow for using the Core is to construct it early in the application and
 /// store it for the application duration:
@@ -249,7 +251,7 @@ struct predefined_seed {
 ///
 /// Between construction and that call the account has no identity, so anything needing one --
 /// session_id(), account_seed(), send_dm(), attaching a network -- throws no_account.  Nothing
-/// else in Core needs it that early: components initialise fine without it and polling does not
+/// else in Core needs it that early: components initialise fine without it and receiving does not
 /// start until a network is attached.
 struct defer_account {};
 
@@ -342,16 +344,22 @@ class Core {
     // migrations, and then calls init() on each sub-component.
     void init();
 
-    // Polling-related members and methods.
-    std::chrono::milliseconds _poll_interval = 20s;
+    // Receiving.  Without a subscription, what the swarm holds for us arrives only through a
+    // retrieve every `_retrieve_interval`; once one is held the node pushes instead, and the timer
+    // is removed.
+    std::chrono::milliseconds _retrieve_interval = 20s;
 
-    // Whether attaching a network polls at once rather than a whole interval later.  Off only in
-    // tests that drive every poll themselves, where one starting on its own would be noise.
-    bool _poll_on_attach = true;
-    quic::TimerID _poll_timer;
+    // Whether attaching a network starts receiving at once rather than a whole interval later.  Off
+    // only in tests that drive every retrieve themselves, where one starting on its own would be
+    // noise.
+    bool _receive_on_attach = true;
+    quic::TimerID _retrieve_timer;
     void _remove_timer(quic::TimerID& timer);
-    void _update_polling();
-    void _poll();
+    void _update_receiving();
+
+    // What attaching a network and the retrieve timer both call: sends a retrieve, unless there is
+    // no network or a subscription is already delivering.
+    void _start_receiving();
 
     /// The outcome of a swarm request.
     struct SwarmResponse {
@@ -422,15 +430,15 @@ class Core {
     // them.  Every round goes to the same node: the retrieve cursor is stored per (namespace,
     // node), so continuing against a different swarm member would resume from that member's
     // position.
-    void _send_poll(
+    void _send_retrieve(
             std::vector<config::Namespace> namespaces,
             int round,
             std::optional<network::service_node> node);
 
     // The batch of retrieves to send `node`, carrying that node's cursor for each namespace.
-    std::vector<std::byte> _build_poll_body(
+    std::vector<std::byte> _build_retrieve_body(
             const network::service_node& node, const std::vector<config::Namespace>& namespaces);
-    void _handle_poll_response(
+    void _handle_retrieve_response(
             network::service_node node,
             std::vector<config::Namespace> namespaces,
             std::string body,
@@ -462,18 +470,18 @@ class Core {
     // Swarm push subscription.  All of this is touched only on the loop.
     //
     // Having subscribed with a swarm member, that member pushes each new message to us instead of
-    // our asking for them, and the poll timer stops.  The subscription belongs to the connection,
-    // so it does not survive one being rebuilt and there is no notice from the far end when it
-    // lapses -- it simply stops pushing.  Hence: renew on a timer well inside the server's expiry,
-    // and treat losing the connection as having lost the subscription.
+    // our asking for them, and the periodic retrieves stop.  The subscription belongs to the
+    // connection, so it does not survive one being rebuilt and there is no notice from the far end
+    // when it lapses -- it simply stops pushing.  Hence: renew on a timer well inside the server's
+    // expiry, and treat losing the connection as having lost the subscription.
     //
     // `_sub_node` is not a preference to be restored.  It is only the member we happen to be
     // talking to, held for as long as its connection lasts because there is no reason to move; a
     // fresh one is chosen the ordinary way -- a new `get_swarm`, whatever it hands back first --
     // once this one is gone.
-    // The swarm member currently carrying our messages: the one being polled, or the one a
-    // subscription is held with.  Not a preference -- each poll re-picks at random, and this only
-    // stops moving because a subscription stops the polling.
+    // The swarm member currently carrying our messages: the one that answered the last retrieve, or
+    // the one a subscription is held with.  Not a preference -- each retrieve re-picks at random,
+    // and this only stops moving because a subscription stops the periodic retrieves.
     std::optional<network::service_node> _swarm_node;
 
     std::optional<network::service_node> _sub_node;
@@ -482,8 +490,8 @@ class Core {
     quic::TimerID _probe_timer;
 
     // Subscribes to `node` if a subscription is possible and we do not already have one.  Called
-    // when a poll of `node` drains, which is what makes it the node we subscribe with: it has an
-    // established connection and its cursors are current.
+    // when a retrieve from `node` drains, which is what makes it the node we subscribe with: it has
+    // an established connection and its cursors are current.
     void _maybe_subscribe(const network::service_node& node);
     void _send_subscribe(network::Network* net, network::service_node node);
 
@@ -496,7 +504,7 @@ class Core {
     // silent, not an error.  Temporary -- see the comment on the definition.
     void _subscription_probe();
 
-    // Gives up the subscription and returns to polling.
+    // Gives up the subscription and returns to periodic retrieves.
     void _drop_subscription(std::string_view why);
 
     // Feeds one pushed message in as though it had been retrieved.
@@ -633,15 +641,15 @@ class Core {
     /// needs it, and so does anything that has to re-establish swarm state across the swap.  Two
     /// things block it today:
     ///
-    /// - This calls `_update_polling()` on the caller's thread, which adds and removes the poll
-    ///   timer and writes its id, which is otherwise only touched on the loop.  `set_poll_interval`
-    ///   marshals onto the loop for exactly that reason.
+    /// - This calls `_update_receiving()` on the caller's thread, which adds and removes the
+    ///   retrieve timer and writes its id, which is otherwise only touched on the loop.
+    ///   `set_retrieve_interval` marshals onto the loop for exactly that reason.
     /// - Tearing down a Network *invokes* the callbacks it is holding: failing the requests queued
     ///   in its router and transport is part of `~Network`.  Those callbacks are Core's, they hold
-    ///   a raw `Network*` (see `_poll`), and a poll continuation among them will call back into a
-    ///   Network whose router has already been destroyed.
+    ///   a raw `Network*` (see `_swarm_attempt`), and a retrieve continuation among them will call
+    ///   back into a Network whose router has already been destroyed.
     ///
-    /// So a fix is not a `_loop.call` around this body: polling has to be stopped and in-flight
+    /// So a fix is not a `_loop.call` around this body: receiving has to be stopped and in-flight
     /// swarm work quiesced before the old Network is dropped.
     void set_network(std::unique_ptr<network::Network> network);
 
@@ -694,12 +702,18 @@ class Core {
     ///              PFS_KEY_NAK_DURATION (1h).
     PfsKeyStatus prefetch_pfs_keys(std::span<const std::byte, 33> session_id);
 
-    /// Sets the polling interval used when a network object is attached.  The default is 20s.
+    /// Sets the interval between retrieves from the account's swarm while a network is attached and
+    /// no subscription is held.  The default is 20s.
+    ///
+    /// Where the routing mode supports server pushes, the first retrieve that drains a swarm
+    /// member subscribes with it, and from then on that member pushes new messages and the
+    /// periodic retrieves stop, resuming if the subscription is dropped.  Where it does not (onion
+    /// requests), these retrieves are how messages arrive for as long as the network is attached.
     ///
     /// Takes effect by replacing the active timer, if there is one, and so restarts the interval:
-    /// the next poll is a full `interval` away rather than at the point the old timer would have
-    /// fired.  Attaching a network polls immediately and then every `interval`, so setting this
-    /// before `set_network()` costs no initial delay.
+    /// the next retrieve is a full `interval` away rather than at the point the old timer would
+    /// have fired.  Attaching a network retrieves immediately and then every `interval`, so setting
+    /// this before `set_network()` costs no initial delay.
     ///
     /// Callable from any thread and at any time: the work is marshalled onto the event loop, so it
     /// may not have taken effect by the time this returns.
@@ -707,22 +721,22 @@ class Core {
     /// The interval is deliberately the application's choice rather than something Core adapts,
     /// because what it trades away is not Core's to spend -- a desktop or terminal client wants
     /// new messages promptly, and a mobile one wants its battery.  Note that nothing serialises
-    /// polls against each other: an interval short enough that a poll can still be outstanding
-    /// when the next one fires gets overlapping requests, which is wasteful but not incorrect
-    /// (the swarm cursor only advances once a batch has been handled, and message handlers are
-    /// already required to tolerate seeing a message twice).
-    void set_poll_interval(std::chrono::milliseconds interval);
+    /// retrieves against each other: an interval short enough that a retrieve can still be
+    /// outstanding when the next one fires gets overlapping requests, which is wasteful but not
+    /// incorrect (the swarm cursor only advances once a batch has been handled, and message
+    /// handlers are already required to tolerate seeing a message twice).
+    void set_retrieve_interval(std::chrono::milliseconds interval);
 
     /// Fetches the account's own UserProfile config from the whole swarm at once, rather than
-    /// waiting for the next poll to ask one member.
+    /// waiting for the next retrieve to ask one member.
     ///
     /// **For the moment an account arrives on a device that has never had it** -- a restore, where
     /// nothing local can answer "what is this account called" and the app has a person waiting in
-    /// front of a progress indicator.  An ordinary poll asks a single member, once every
-    /// `set_poll_interval`, and the storage server does not promise a config has reached every
+    /// front of a progress indicator.  An ordinary retrieve asks a single member, once every
+    /// `set_retrieve_interval`, and the storage server does not promise a config has reached every
     /// member of a swarm: measured against mainnet, an account created minutes earlier took over a
-    /// minute of polling to come back, which is several members sampled one at a time before one of
-    /// them had it.  Both mobile clients work around exactly this, and say so in their own
+    /// minute of retrieves to come back, which is several members sampled one at a time before one
+    /// of them had it.  Both mobile clients work around exactly this, and say so in their own
     /// comments.
     ///
     /// Asks every member concurrently, and is deliberately asymmetric about what it will conclude
@@ -741,11 +755,12 @@ class Core {
     /// answered.
     ///
     /// **Answers keep being merged after `done`.**  One arriving late still came from our own
-    /// swarm, and dropping it would only leave the next ordinary poll to fetch it again.
+    /// swarm, and dropping it would only leave a later retrieve to fetch it again.
     ///
     /// `done` is called exactly once, on Core's job queue, with whether a config was merged.  Safe
-    /// to call without waiting on it: what it finds is merged into `configs` like anything a poll
-    /// brings in, and the retrieve cursor it records means the next poll carries on from there.
+    /// to call without waiting on it: what it finds is merged into `configs` like anything else
+    /// received, and the retrieve cursor it records means the next retrieve from that member
+    /// carries on from there.
     void fetch_user_profile(std::function<void(bool found)> done);
 
     /// Encrypt and send a direct message to the given recipient.
@@ -803,10 +818,10 @@ class Core {
     /// must not keep this beyond the point where the network could be replaced or dropped.
     network::Network* network() const { return _network.get(); }
 
-    /// The swarm member currently carrying our messages -- the one being polled, or the one a
-    /// subscription is held with -- or nullopt before there is one.
+    /// The swarm member currently carrying our messages -- the one that answered the last retrieve,
+    /// or the one a subscription is held with -- or nullopt before there is one.
     ///
-    /// Which member that is changes on its own: each poll picks a fresh one at random, and a
+    /// Which member that is changes on its own: each retrieve picks a fresh one at random, and a
     /// subscription holds one only for as long as its connection lasts.  Read it to show what is
     /// happening now, not to depend on it.
     std::optional<network::service_node> swarm_node() const { return _swarm_node; }
@@ -820,15 +835,15 @@ class Core {
 
     /// The event loop this account's work runs on.
     ///
-    /// Everything Core does off the caller's thread — polling, send completion, and therefore every
-    /// callback it fires — happens here.
+    /// Everything Core does off the caller's thread — receiving, send completion, and therefore
+    /// every callback it fires — happens here.
     ///
     /// The database itself does not need this: `sqlite::Database` is a pool that hands each thread
     /// its own connection, so a self-contained query is safe from anywhere.  What needs the loop is
     /// everything a component holds *beside* its tables — the cached account keys, the config
     /// objects, and the lazy construction of both — none of which is synchronised and all of which
-    /// polling touches.  `detail::CoreComponent` says which methods that covers, and they assert it
-    /// in a debug build.
+    /// receiving touches.  `detail::CoreComponent` says which methods that covers, and they assert
+    /// it in a debug build.
     ///
     /// A layer above Core that keeps its own tables dispatches its own work here for the same
     /// reason it would anywhere else: to serialise its own state, not the database's.

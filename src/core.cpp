@@ -86,9 +86,9 @@ void Core::init() {
 
     _comp_init.clear();
 
-    _update_polling();
+    _update_receiving();
 
-    // Last: from here a poll can run and another thread can hold this Core, so a component
+    // Last: from here a retrieve can run and another thread can hold this Core, so a component
     // touched from anywhere but the loop is misuse rather than construction.
     _constructed = true;
 }
@@ -118,11 +118,11 @@ Core::~Core() {
         _network->on_connection_lost = nullptr;
     }
 
-    // Before the Network goes, because a poll or a renew that fires while it is being torn down
+    // Before the Network goes, because a retrieve or a renew that fires while it is being torn down
     // would reach it; stopping `_jq` below cancels them too, but only once the Network is already
     // gone.  On the loop because the ids are only ever touched there.
     call_get([this] {
-        for (auto* timer : {&_poll_timer, &_sub_timer, &_probe_timer})
+        for (auto* timer : {&_retrieve_timer, &_sub_timer, &_probe_timer})
             _remove_timer(*timer);
     });
 
@@ -166,9 +166,9 @@ network::Network& Core::make_network(network::config::Config config) {
 }
 
 void Core::set_network(std::unique_ptr<network::Network> network) {
-    // Polling signs its retrieve requests with the account key, so attaching a network before the
-    // account has an identity would fail inside a background poll rather than here.  Refuse at the
-    // call site, where the ordering mistake actually is.
+    // Retrieves are signed with the account key, so attaching a network before the account has an
+    // identity would fail inside a background retrieve rather than here.  Refuse at the call site,
+    // where the ordering mistake actually is.
     if (network && !globals.have_account())
         throw no_account{};
 
@@ -190,7 +190,7 @@ void Core::set_network(std::unique_ptr<network::Network> network) {
         // flight.
         // The body is copied because it has to be: the span is the transport's buffer and is only
         // valid for the duration of this call, so anything deferred must own its bytes.  That cost
-        // is what a push is worth -- a poll response arrives the same way and is copied too.
+        // is what a push is worth -- a retrieve response arrives the same way and is copied too.
         //
         // Which node sent it is deliberately not checked: `_sub_node` is our loop's, and by the
         // time this runs the answer could have changed anyway.  It does not need to be, either --
@@ -223,13 +223,13 @@ void Core::set_network(std::unique_ptr<network::Network> network) {
         };
     }
 
-    _update_polling();
+    _update_receiving();
 
-    // The timer's first poll is a whole interval away, and until a poll the account sees nothing
-    // new and holds no subscription; so poll now as well.  Queued rather than run here, on the
-    // caller's thread.  Requests sent before the network is ready wait for it.
-    if (_network && _poll_on_attach)
-        _jq.call_soon([this] { _poll(); });
+    // The timer's first retrieve is a whole interval away, and until one completes the account sees
+    // nothing new and holds no subscription; so start receiving now as well.  Queued rather than
+    // run here, on the caller's thread.  Requests sent before the network is ready wait for it.
+    if (_network && _receive_on_attach)
+        _jq.call_soon([this] { _start_receiving(); });
 }
 
 void Core::_remove_timer(quic::TimerID& timer) {
@@ -237,33 +237,33 @@ void Core::_remove_timer(quic::TimerID& timer) {
         _jq.remove(t);
 }
 
-void Core::_update_polling() {
-    if (_network && !_poll_timer)
-        _poll_timer = _jq.add_timer(_poll_interval, [this] { _poll(); });
+void Core::_update_receiving() {
+    if (_network && !_retrieve_timer)
+        _retrieve_timer = _jq.add_timer(_retrieve_interval, [this] { _start_receiving(); });
     else if (!_network)
-        _remove_timer(_poll_timer);
+        _remove_timer(_retrieve_timer);
 }
 
-void Core::set_poll_interval(std::chrono::milliseconds interval) {
+void Core::set_retrieve_interval(std::chrono::milliseconds interval) {
     // Marshalled onto the loop rather than done here: this replaces the timer, and both
-    // `_poll_interval` and `_poll_timer` are otherwise only touched there.  `call` runs it inline
-    // when we are already on the loop thread, so this costs nothing in that case.
+    // `_retrieve_interval` and `_retrieve_timer` are otherwise only touched there.  `call` runs it
+    // inline when we are already on the loop thread, so this costs nothing in that case.
     //
     // On our own queue rather than the loop's, so that a interval change still in flight when Core
     // goes away is dropped rather than run against a half-destroyed one.
     _jq.call([this, interval] {
-        _poll_interval = interval;
-        _remove_timer(_poll_timer);
-        _update_polling();
+        _retrieve_interval = interval;
+        _remove_timer(_retrieve_timer);
+        _update_receiving();
     });
 }
 
 // Order matters: the batch's results are handled in this order, so a namespace whose contents
 // another one's depend on has to come first.  The configs lead because a message arriving in the
-// same poll may be from a contact those configs are what tells us about; among themselves,
+// same retrieve may be from a contact those configs are what tells us about; among themselves,
 // ConvoInfoVolatile comes last because it refers to conversations that Contacts and UserGroups
 // are what establish.
-static constexpr std::array POLL_NAMESPACES = {
+static constexpr std::array RECEIVE_NAMESPACES = {
         config::Namespace::UserProfile,
         config::Namespace::Contacts,
         config::Namespace::UserGroups,
@@ -272,9 +272,10 @@ static constexpr std::array POLL_NAMESPACES = {
         config::Namespace::Devices,
         config::Namespace::AccountPubkeys};
 
-// Ceiling on continuation rounds within one poll.  A well-behaved node exhausts a namespace in far
-// fewer; this exists so that a node whose `more` never goes false cannot poll indefinitely.
-static constexpr int POLL_MAX_ROUNDS = 20;
+// Ceiling on continuation rounds within one retrieve.  A well-behaved node exhausts a namespace in
+// far fewer; this exists so that a node whose `more` never goes false cannot keep a retrieve going
+// indefinitely.
+static constexpr int RETRIEVE_MAX_ROUNDS = 20;
 
 /// One namespace's slice of a batch retrieve response, decoded but not yet handled.
 ///
@@ -378,14 +379,14 @@ struct Core::ProfileFanOut {
     bool concluded = false;
 };
 
-// The namespaces we ask a storage server to push to us: the ones we poll, in ascending order,
+// The namespaces we ask a storage server to push to us: the ones we retrieve, in ascending order,
 // which is what the server requires (it rejects an unordered `n=` list).  Derived from
-// POLL_NAMESPACES rather than written out so that adding a namespace to the poll cannot leave the
-// subscription silently not covering it.
+// RECEIVE_NAMESPACES rather than written out so that adding a namespace to what we receive cannot
+// leave the subscription silently not covering it.
 static constexpr auto SUBSCRIBE_NAMESPACES = [] {
-    std::array<int16_t, POLL_NAMESPACES.size()> ns{};
-    for (size_t i = 0; i < POLL_NAMESPACES.size(); i++)
-        ns[i] = static_cast<int16_t>(POLL_NAMESPACES[i]);
+    std::array<int16_t, RECEIVE_NAMESPACES.size()> ns{};
+    for (size_t i = 0; i < RECEIVE_NAMESPACES.size(); i++)
+        ns[i] = static_cast<int16_t>(RECEIVE_NAMESPACES[i]);
     std::ranges::sort(ns);
     return ns;
 }();
@@ -602,14 +603,21 @@ void Core::_swarm_response(
     op->on_done({timeout, status, std::move(body), node});
 }
 
-void Core::_poll() {
+void Core::_start_receiving() {
     if (!_network) {
-        log::debug(cat, "Not polling: no network attached");
+        log::debug(cat, "Not retrieving: no network attached");
         return;
     }
 
-    log::debug(cat, "Polling swarm for {}", globals.session_id_hex());
-    _send_poll({POLL_NAMESPACES.begin(), POLL_NAMESPACES.end()}, 0, std::nullopt);
+    // Held, not merely asked for: until the node confirms, `_sub_node` is set but nothing is being
+    // pushed yet, and retrieving carries on so that a subscribe that fails loses nothing.
+    if (_subscribed) {
+        log::debug(cat, "Not retrieving: subscribed with {}", _sub_node->remote_pubkey.hex());
+        return;
+    }
+
+    log::debug(cat, "Retrieving from swarm for {}", globals.session_id_hex());
+    _send_retrieve({RECEIVE_NAMESPACES.begin(), RECEIVE_NAMESPACES.end()}, 0, std::nullopt);
 }
 
 void Core::fetch_user_profile(std::function<void(bool found)> done) {
@@ -633,7 +641,7 @@ void Core::fetch_user_profile(std::function<void(bool found)> done) {
             if (state->concluded)
                 return;
             if (swarm.empty()) {
-                // Not an error worth failing loudly over: the ordinary poll still runs, and this
+                // Not an error worth failing loudly over: ordinary receiving still runs, and this
                 // was only ever an attempt to get there sooner.  A swarm of one is still worth
                 // asking -- one member holding the config is the whole answer.
                 log::warning(cat, "Cannot fan out a profile fetch: no swarm members available");
@@ -706,8 +714,8 @@ std::vector<std::byte> Core::_profile_retrieve_body() {
 /// One member's answer, whenever it arrives -- including after the fetch has reported.
 ///
 /// **Every config that arrives is merged**, even one landing after `done` has been called: it came
-/// from a member of our own swarm, and dropping it would only leave the next ordinary poll to fetch
-/// it again.  What the end of the fetch decides is when `done` is called, not which answers count.
+/// from a member of our own swarm, and dropping it would only leave a later retrieve to fetch it
+/// again.  What the end of the fetch decides is when `done` is called, not which answers count.
 void Core::_handle_profile_response(
         const std::shared_ptr<ProfileFanOut>& state,
         const network::service_node& node,
@@ -757,8 +765,9 @@ void Core::_absorb_profile_answer(
         const network::ed25519_pubkey& node, std::span<const SwarmMessage> messages) {
     auto configs_held = configs.batch();
     // Final, even where the member said it was holding more.  This is a one-shot fetch rather than
-    // a poll that continues: the cursor recorded below is what lets the ordinary poll pick up
-    // anything left, and a handler told to wait for a final that never comes would wait for ever.
+    // a retrieve that continues: the cursor recorded below is what lets a later retrieve from this
+    // member pick up anything left, and a handler told to wait for a final that never comes would
+    // wait for ever.
     receive_messages(messages, config::Namespace::UserProfile, true);
     _record_swarm_cursor(node, config::Namespace::UserProfile, messages);
 }
@@ -779,7 +788,7 @@ void Core::_conclude_profile_fetch(ProfileFanOut& state) {
         state.done(state.found);
 }
 
-void Core::_send_poll(
+void Core::_send_retrieve(
         std::vector<config::Namespace> namespaces,
         int round,
         std::optional<network::service_node> node) {
@@ -787,13 +796,13 @@ void Core::_send_poll(
             globals.pubkey_x25519(),
             "batch",
             [this, namespaces](const network::service_node& n) {
-                return _build_poll_body(n, namespaces);
+                return _build_retrieve_body(n, namespaces);
             },
             [this, namespaces, round](SwarmResponse res) mutable {
                 if (!res.ok() || !res.body) {
                     log::warning(
                             cat,
-                            "Swarm poll request failed: {}",
+                            "Swarm retrieve request failed: {}",
                             res.timeout ? "timed out"
                             : res.body  ? *res.body
                                         : "request failed");
@@ -802,22 +811,23 @@ void Core::_send_poll(
 
                 // The member that actually answered, which is not necessarily the one the attempt
                 // started with.  Everything below records against it -- the retrieve cursors, and
-                // the subscription that a drained poll goes on to make.
+                // the subscription that a drained retrieve goes on to make.
                 _swarm_node = res.node;
 
-                _handle_poll_response(res.node, std::move(namespaces), std::move(*res.body), round);
+                _handle_retrieve_response(
+                        res.node, std::move(namespaces), std::move(*res.body), round);
             },
             std::move(node));
 }
 
-std::vector<std::byte> Core::_build_poll_body(
+std::vector<std::byte> Core::_build_retrieve_body(
         const network::service_node& node, const std::vector<config::Namespace>& namespaces) {
     auto now_ms = epoch_ms(clock_now_ms());
     auto ed25519_hex = globals.pubkey_ed25519().hex();
 
     // Build per-namespace signatures for namespaces that require authentication; index-aligned with
     // `namespaces`.  Empty string means no auth needed for that namespace.  Signed here rather than
-    // once per poll because the signature covers a timestamp the storage server checks for
+    // once per retrieve because the signature covers a timestamp the storage server checks for
     // freshness, so a continuation round cannot reuse the first round's.
     std::vector<std::string> ns_sig(namespaces.size());
     {
@@ -910,7 +920,7 @@ void Core::_record_swarm_cursor(
 
     // Every hash goes in, not just the ones that produced something we kept: the cursor is a
     // position in what this node returned, so leaving out what we ignored would park it behind
-    // those and fetch them again on every poll.  Insertion order is the order the node returned
+    // those and fetch them again on every retrieve.  Insertion order is the order the node returned
     // them, which is what `id DESC` reads back.
     conn.prepared_exec(
             "INSERT INTO swarm_nodes (pubkey) VALUES (?) ON CONFLICT DO NOTHING", node_pubkey);
@@ -954,7 +964,7 @@ DELETE FROM swarm_hashes
             SWARM_HASH_HISTORY);
 }
 
-void Core::_handle_poll_response(
+void Core::_handle_retrieve_response(
         network::service_node node,
         std::vector<config::Namespace> namespaces,
         std::string body,
@@ -972,9 +982,10 @@ void Core::_handle_poll_response(
         if (it == json.end() || !it->is_array())
             return;
 
-        // One poll can carry several config namespaces, and each merge would otherwise dump on its
-        // way out.  Nothing reads those intermediate states, so hold them until the whole response
-        // is handled.  (An external caller feeding receive_messages() directly can take its own.)
+        // One retrieve can carry several config namespaces, and each merge would otherwise dump on
+        // its way out.  Nothing reads those intermediate states, so hold them until the whole
+        // response is handled.  (An external caller feeding receive_messages() directly can take
+        // its own.)
         auto configs_held = configs.batch();
 
         auto& results = *it;
@@ -994,7 +1005,7 @@ void Core::_handle_poll_response(
             _record_swarm_cursor(sn_pubkey, ns, swarm_messages);
         }
     } catch (const std::exception& e) {
-        log::warning(cat, "Failed to parse poll response: {}", e.what());
+        log::warning(cat, "Failed to parse retrieve response: {}", e.what());
         return;
     }
 
@@ -1006,12 +1017,12 @@ void Core::_handle_poll_response(
         return;
     }
 
-    if (round + 1 >= POLL_MAX_ROUNDS) {
+    if (round + 1 >= RETRIEVE_MAX_ROUNDS) {
         log::warning(
                 cat,
-                "Stopping poll of {} after {} rounds with {} namespace(s) still reporting more",
+                "Stopping retrieve from {} after {} rounds; {} namespace(s) still report more",
                 sn_pubkey.hex(),
-                POLL_MAX_ROUNDS,
+                RETRIEVE_MAX_ROUNDS,
                 unfinished.size());
         return;
     }
@@ -1020,7 +1031,7 @@ void Core::_handle_poll_response(
     // continuation has to go back to the same one.  If it has since become unusable the swarm
     // request falls back to choosing normally, and the round starts over from that member's
     // cursor rather than resuming from one it never issued.
-    _send_poll(std::move(unfinished), round + 1, std::move(node));
+    _send_retrieve(std::move(unfinished), round + 1, std::move(node));
 }
 
 std::optional<network::PathInfo> Core::current_swarm_path() const {
@@ -1032,7 +1043,7 @@ std::optional<network::PathInfo> Core::current_swarm_path() const {
 
 void Core::_maybe_subscribe(const network::service_node& node) {
     // On our queue because everything below -- the timer ids especially -- is Core's loop state.
-    // Inline once the caller is already there, which the poll response now is, so this costs a
+    // Inline once the caller is already there, which the retrieve response now is, so this costs a
     // check rather than a turn of the loop.
     call([this, node] {
         // Already have one, or are waiting on one: a subscription is with a single node, and
@@ -1128,25 +1139,29 @@ void Core::_send_subscribe(network::Network* net, network::service_node node) {
                     if (!_subscribed) {
                         _subscribed = true;
 
-                        // Stop polling: from here the node pushes what arrives, and the only
-                        // requests we make are the renew tick's.
-                        _remove_timer(_poll_timer);
+                        // Stop the periodic retrieves: from here the node pushes what arrives, and
+                        // the only requests we make are the renew's and the probe's.
+                        _remove_timer(_retrieve_timer);
                         _sub_timer = _jq.add_timer(
                                 SUBSCRIPTION_RENEW_INTERVAL, [this] { _subscription_renew(); });
                         _probe_timer = _jq.add_timer(
                                 SUBSCRIPTION_PROBE_INTERVAL, [this] { _subscription_probe(); });
 
                         log::info(
-                                cat, "Subscribed to {}; polling stopped", node.remote_pubkey.hex());
+                                cat,
+                                "Subscribed to {}; periodic retrieves stopped",
+                                node.remote_pubkey.hex());
 
-                        // One last poll, against the member we just subscribed with.
+                        // One last retrieve, against the member we just subscribed with.  Sent
+                        // directly: `_start_receiving` declines once a subscription is held.
                         //
                         // Draining ran before the subscription existed, so a message stored
                         // between the last retrieve's snapshot and the subscription taking effect
                         // was in neither: too late for the retrieve, too early to be pushed.  This
                         // is the only thing that closes that window -- the renew sends no
                         // retrieve, and the probe asks about a namespace that is empty by design.
-                        _send_poll({POLL_NAMESPACES.begin(), POLL_NAMESPACES.end()}, 0, node);
+                        _send_retrieve(
+                                {RECEIVE_NAMESPACES.begin(), RECEIVE_NAMESPACES.end()}, 0, node);
                     }
                 });
             });
@@ -1165,8 +1180,8 @@ void Core::_subscription_renew() {
 //
 // This exists because a subscription that has stopped applying is *silent*.  The storage server
 // runs no swarm check when subscribing and none when a swarm changes underneath one:
-// `get_notifiers` simply stops matching, so a client that has given up polling cannot tell "nothing
-// has been sent to me" from "I am subscribed to a node that no longer holds my messages".
+// `get_notifiers` simply stops matching, so a client that has stopped retrieving cannot tell
+// "nothing has been sent to me" from "I am subscribed to a node that no longer holds my messages".
 //
 // It is deliberately the cheapest question that still produces a 421.  The storage server decides
 // that from the pubkey alone, on the first two lines of its retrieve handler -- before the
@@ -1253,9 +1268,9 @@ void Core::_drop_subscription(std::string_view why) {
     for (auto* timer : {&_sub_timer, &_probe_timer})
         _remove_timer(*timer);
 
-    // Back to polling, which is also what picks the next node: the swarm member a fresh
+    // Back to periodic retrieves, which are also what pick the next node: the swarm member a fresh
     // `get_swarm` happens to hand back first.
-    _update_polling();
+    _update_receiving();
 }
 
 void Core::_handle_server_push(std::string_view endpoint, std::span<const std::byte> body) {

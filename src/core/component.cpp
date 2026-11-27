@@ -36,7 +36,7 @@ void CoreComponent::enqueue(std::function<void()> job) {
 
 bool CoreComponent::on_loop() const {
     // Before the end of Core's constructor there is no other thread that could have reached a
-    // component: the loop runs nothing of ours until `init()` starts polling, and the caller
+    // component: the loop runs nothing of ours until `init()` has finished, and the caller
     // constructing Core is the only one holding it.  Component `init()` therefore runs off the
     // loop legitimately, and asserting otherwise would fire on every open.
     return !core._constructed || core._loop.inside();

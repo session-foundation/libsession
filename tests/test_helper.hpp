@@ -393,18 +393,21 @@ class TestHelper {
         });
     }
 
-    /// Polls the way the ticker does: on the loop.
+    /// Starts receiving as the retrieve timer does: on the loop.  Sends a retrieve unless a
+    /// subscription is held, which is when Core itself would not.
     ///
-    /// Not `core._poll()` on the caller's thread.  A poll reaches component state, which is the
-    /// loop's alone, and everything the walk does afterwards keys off being there already --
-    /// `JobQueue::call` runs inline inside the loop and defers outside it, so a poll driven from a
-    /// test's own thread would answer its first member and leave the rest of the walk queued.
-    static void poll(core::Core& core) {
-        core.call_get([&core] { core._poll(); });
+    /// Not `core._start_receiving()` on the caller's thread.  A retrieve reaches component state,
+    /// which is the loop's alone, and everything the walk does afterwards keys off being there
+    /// already -- `JobQueue::call` runs inline inside the loop and defers outside it, so a retrieve
+    /// driven from a test's own thread would answer its first member and leave the rest of the walk
+    /// queued.
+    static void start_receiving(core::Core& core) {
+        core.call_get([&core] { core._start_receiving(); });
     }
 
-    /// Stops attaching a network from polling at once, for a test that drives every poll itself.
-    static void no_poll_on_attach(core::Core& core) { core._poll_on_attach = false; }
+    /// Stops attaching a network from starting to receive at once, for a test that drives every
+    /// retrieve itself.
+    static void no_receive_on_attach(core::Core& core) { core._receive_on_attach = false; }
 
     /// Runs `f` on Core's loop and hands back what it returned.
     ///
@@ -510,7 +513,7 @@ class TestHelper {
     }
 
     // The cursor a retrieve from this namespace+node would send: the newest hash that node handed
-    // us and still holds.  Derived rather than stored, so this asks the same question the poll
+    // us and still holds.  Derived rather than stored, so this asks the same question the retrieve
     // does.
     static std::optional<std::string> namespace_last_hash(
             core::Core& core, int16_t ns, const network::ed25519_pubkey& sn_pubkey) {
@@ -537,7 +540,8 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         return d.decrypt_device_data(data);
     }
 
-    // Feeds an encrypted device group message through the receive path, as a poll would.
+    // Feeds an encrypted device group message through the receive path, as a retrieve or a push
+    // would.
     static void receive_device_group_message(core::Devices& d, std::span<const std::byte> data) {
         d.receive_device_group_message(data);
     }
@@ -577,7 +581,7 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
     };
 
     // Returns true if any swarm node has handed us a hash in the given namespace.  Used by live
-    // tests to detect that a poll completed and delivered at least one message.
+    // tests to detect that a retrieve completed and delivered at least one message.
     static bool has_any_namespace_sync(core::Core& core, config::Namespace ns) {
         auto count = core.db.conn().prepared_get<int64_t>(
                 "SELECT COUNT(*) FROM swarm_hashes WHERE namespace = ?", static_cast<int16_t>(ns));
@@ -628,15 +632,15 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
 /// Network outright -- nothing else may hold it alive -- so a test that goes on poking at the mock
 /// keeps a raw pointer rather than a second reference.
 ///
-/// Unlike attaching a network any other way, this does not start a poll at once: a test that uses
-/// it drives each poll itself and counts what was sent.
+/// Unlike attaching a network any other way, this does not start receiving at once: a test that
+/// uses it drives each retrieve itself and counts what was sent.
 ///
 /// `config` for a test that depends on how the network is configured -- which router it uses, say.
 inline MockNetwork* attach_mock_network(core::Core& core, network::config::Config config = {}) {
     auto net = std::make_unique<MockNetwork>(std::move(config));
     auto* raw = net.get();
     raw->core = &core;
-    TestHelper::no_poll_on_attach(core);
+    TestHelper::no_receive_on_attach(core);
     core.set_network(std::move(net));
     return raw;
 }

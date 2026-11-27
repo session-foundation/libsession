@@ -63,7 +63,7 @@ std::vector<std::vector<std::byte>> push_from_another_device(TempCore& c, std::s
 }
 
 /// Note the spans: a SwarmMessage points at its data rather than owning it, exactly as one decoded
-/// from a poll response does, so whatever is passed in here has to outlive the result.
+/// from a retrieve response does, so whatever is passed in here has to outlive the result.
 std::vector<SwarmMessage> as_swarm_messages(
         const std::vector<std::vector<std::byte>>& messages, std::string_view tag = "fakehash") {
     std::vector<SwarmMessage> out;
@@ -310,8 +310,8 @@ TEST_CASE("Configs: a merge that changed something is reported", "[core][configs
         CHECK(w.reported[0] == std::vector{config::Namespace::UserProfile});
 
         // The same message again changes nothing, and nothing is what gets reported -- otherwise
-        // every poll that re-fetched the same config would send the application round the houses
-        // again.
+        // every retrieve that re-fetched the same config would send the application round the
+        // houses again.
         c->receive_messages(incoming, config::Namespace::UserProfile, true);
         CHECK(w.reported.size() == 1);
     });
@@ -333,7 +333,7 @@ TEST_CASE("Configs: one batch reports everything it changed, once", "[core][conf
             c->receive_messages(contacts, config::Namespace::Contacts, true);
         }
 
-        // One notification carrying both, not one per config: a poll can deliver all four, and
+        // One notification carrying both, not one per config: a retrieve can deliver all four, and
         // telling the application about each in turn shows it a half-applied state.
         REQUIRE(w.reported.size() == 1);
         auto changed = w.reported[0];
@@ -650,10 +650,10 @@ TEST_CASE(
         REQUIRE_FALSE(TestHelper::push_scheduled(c->configs));
         REQUIRE_FALSE(c->configs.user_profile().needs_dump());
 
-        // A bare change: no batch around it, nothing merged, nothing polling.  That is the shape
+        // A bare change: no batch around it, nothing merged, nothing receiving.  That is the shape
         // every Client setter makes, and it used to reach neither disk nor the swarm -- the only
         // thing that armed the timer was a caller announcing a run of changes was over, and no
-        // local caller ever did.  It survived because a poll held a batch every few seconds and
+        // local caller ever did.  It survived because a retrieve held a batch every few seconds and
         // swept it up.
         c->configs.user_profile().set_name("Leia");
 

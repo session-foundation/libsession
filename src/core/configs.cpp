@@ -207,10 +207,10 @@ void Configs::_flush() {
 }
 
 void Configs::merge(config::Namespace ns, std::span<const SwarmMessage> messages) {
-    // A poll reports every namespace it successfully fetched, including ones that returned nothing,
-    // because some handlers need to know the fetch happened.  Configs are not among them: there is
-    // no state here that a completed-but-empty poll settles, so an empty batch would only run a
-    // merge of nothing and a flush behind it, on every namespace, on every poll.
+    // A retrieve reports every namespace it successfully fetched, including ones that returned
+    // nothing, because some handlers need to know the fetch happened.  Configs are not among them:
+    // there is no state here that a completed-but-empty retrieve settles, so an empty batch would
+    // only run a merge of nothing and a flush behind it, on every namespace, on every retrieve.
     if (messages.empty())
         return;
 

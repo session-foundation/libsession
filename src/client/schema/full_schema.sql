@@ -178,7 +178,7 @@ CREATE TABLE messages (
     -- A row rather than a DELETE because `swarm_hash` is what a redelivery dedupes against, and a
     -- message deleted only here is still on the swarm to be delivered again.  Removing the row
     -- would let it come back looking new -- which is not hypothetical: a storage server stops
-    -- honouring a `last_hash` once it has expired, and the poll that follows returns the whole
+    -- honouring a `last_hash` once it has expired, and the retrieve that follows returns the whole
     -- retention window.
     --
     -- Which of the two it is has to survive, not just that it happened: deleting for everyone is

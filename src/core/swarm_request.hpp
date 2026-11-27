@@ -4,8 +4,9 @@
 /// signed, what the signed value looks like, and how long one is allowed to take.
 ///
 /// Internal to the core library.  It exists because more than one part of Core talks to a swarm --
-/// polling, sending a message, pushing a config -- and each of them needs the same three answers.
-/// Transcribing them separately is how one copy ends up disagreeing with the storage server.
+/// retrieving, sending a message, pushing a config -- and each of them needs the same three
+/// answers.  Transcribing them separately is how one copy ends up disagreeing with the storage
+/// server.
 
 #include <chrono>
 #include <cstdint>
