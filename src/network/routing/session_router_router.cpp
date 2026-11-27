@@ -140,6 +140,16 @@ void SessionRouter::_init() {
     listen=:0
     )"_format(opt::netid::to_string(_config.netid), _config.cache_directory);
 
+    // One path rather than a spare to rotate to, since nothing lives long enough to rotate, and
+    // half the default build timeout so that a stuck build leaves time inside the caller's deadline
+    // (seconds, for a notification extension) for another attempt.
+    if (_config.one_shot)
+        test_ini += R"(
+    [paths]
+    outbound-paths=1
+    build-timeout=5s
+    )";
+
     try {
         _update_status(ConnectionStatus::connecting);
 

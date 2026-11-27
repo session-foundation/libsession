@@ -494,3 +494,18 @@ CREATE INDEX message_attachments_url ON message_attachments(url) WHERE url IS NO
 -- Partial for the same reason as above: most rows are not cached at any given moment, and those
 -- are never the subject of this question.
 CREATE INDEX message_attachments_cached ON message_attachments(cached) WHERE cached IS NOT NULL;
+
+-- The messages a notification has been posted for, by whichever process sharing this database
+-- posted it: the claim that keeps an application and its notification extension from both posting
+-- one for the same message, whichever of them received it first.  push::Notifications::claim reads
+-- and writes it; it lives in Client's schema because push has none of its own.  A row outlives its
+-- message, so that the notification is still reported for taking down once the message is deleted
+-- outright; push prunes rows that can no longer matter, keeping each conversation's newest.
+CREATE TABLE notified (
+    message INTEGER PRIMARY KEY,        -- messages.id, never reused; no foreign key (see above)
+    hash TEXT,                          -- the message's swarm hash, which names its notification
+    at INTEGER NOT NULL,                -- ms since epoch
+    -- When it was first reported for taking down, its message having been read or deleted; ms
+    -- since epoch.
+    removed INTEGER
+) STRICT;
