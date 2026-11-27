@@ -2178,6 +2178,39 @@ namespace {
     int64_t read_point_ceiling() {
         return epoch_ms(clock_now_ms() + READ_POINT_LEAD);
     }
+
+    // Read points from ConvoInfoVolatile that were past READ_POINT_LEAD when taken, by session ID.
+    // Such a value stays in the config -- we publish the larger of ours and its -- so held near our
+    // clock again at every reconcile, it would follow the clock forward and count each arrival
+    // read at the next read anywhere on the account.  It is taken once, and again only when it
+    // changes.  Kept in the database because a Client does not last: the app on iOS rebuilds it
+    // whenever it comes back to the front.  Usually empty.
+    constexpr auto KEY_HELD_READ_POINTS = "client:held_read_points"sv;
+
+    // One "<session id hex> <read point>" per line.
+    std::unordered_map<std::string, int64_t> parse_held_read_points(std::string_view text) {
+        std::unordered_map<std::string, int64_t> held;
+        while (!text.empty()) {
+            auto end = text.find('\n');
+            auto line = text.substr(0, end);
+            text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
+            auto space = line.find(' ');
+            if (space == std::string_view::npos)
+                continue;
+            int64_t value;
+            auto num = line.substr(space + 1);
+            if (std::from_chars(num.data(), num.data() + num.size(), value).ec == std::errc{})
+                held.emplace(line.substr(0, space), value);
+        }
+        return held;
+    }
+
+    std::string format_held_read_points(const std::unordered_map<std::string, int64_t>& held) {
+        std::string text;
+        for (const auto& [sid, value] : held)
+            text += "{} {}\n"_format(sid, value);
+        return text;
+    }
 }  // namespace
 
 void Client::_mark_read(const ConversationId& id, std::optional<sys_ms> up_to) {
@@ -3384,6 +3417,11 @@ void Client::_sync_all_contacts() {
 void Client::_reconcile_convo_volatile() {
     auto& volatiles = core.configs.convo_info_volatile();
 
+    auto held_text = core.globals.get_text(KEY_HELD_READ_POINTS);
+    auto held = parse_held_read_points(held_text.value_or(""));
+    std::unordered_map<std::string, int64_t> still_held;
+    const auto ceiling = read_point_ceiling();
+
     std::vector<ConversationId> touched;
     {
         auto c = core.database().conn();
@@ -3426,21 +3464,29 @@ WHERE id = ?1 AND (pro_revocation_tag, pro_expiry) IS NOT (?2, ?3)
                                        tag,
                                        expiry) > 0;
 
+            // A read point already taken while too far ahead is not taken again: see
+            // KEY_HELD_READ_POINTS.
+            auto was_held = held.find(entry.session_id);
+            bool taken = was_held != held.end() && was_held->second == entry.last_read;
+            if (taken || entry.last_read > ceiling)
+                still_held.emplace(entry.session_id, entry.last_read);
+
             // Forwards only.  The config does not enforce this -- it lets a value be written
             // backwards on purpose, so that a client can reset one -- and a conflict between two
             // devices at the same seqno resolves by a tie-break that knows nothing about which
             // value is newer.  Left alone, that would make messages someone has read unread again.
-            bool read_changed = c.prepared_exec(
-                                        R"(
+            bool read_changed =
+                    !taken && c.prepared_exec(
+                                      R"(
 UPDATE conversations
 SET last_read = ?2,
     unread_count = (SELECT COUNT(*) FROM messages
                      WHERE conversation = ?1 AND {} AND timestamp > ?2)
 WHERE id = ?1 AND last_read < ?2
 )"_format(UNREAD),
-                                        *convo,
-                                        // Bounded as our own reads are: see READ_POINT_LEAD.
-                                        std::min(entry.last_read, read_point_ceiling())) > 0;
+                                      *convo,
+                                      // Bounded as our own reads are: see READ_POINT_LEAD.
+                                      std::min(entry.last_read, ceiling)) > 0;
 
             // The flag is an ordinary setting, though: someone marking a conversation unread on
             // another device is telling us to, and there is no ordering to preserve.
@@ -3455,6 +3501,15 @@ WHERE id = ?1 AND last_read < ?2
         }
 
         tx.commit();
+    }
+
+    // After the commit: a crash between the two takes a held read point once more, as a new
+    // Client would have without this.
+    if (still_held != held) {
+        if (still_held.empty())
+            core.globals.erase(KEY_HELD_READ_POINTS);
+        else
+            core.globals.set(KEY_HELD_READ_POINTS, format_held_read_points(still_held));
     }
 
     // No deletion pass, and there must not be one: entries here are pruned by age -- thirty days

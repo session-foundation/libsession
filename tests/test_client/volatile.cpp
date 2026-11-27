@@ -1,3 +1,4 @@
+#include "../utils.hpp"
 #include "config_helpers.hpp"
 
 // Recent, because ConvoInfoVolatile refuses to store a last-read older than PRUNE_LOW (30 days)
@@ -173,4 +174,52 @@ TEST_CASE(
     // Held within minutes of now: the lead is five minutes, and ten is clear of it.
     deliver(*c, them, "two", clock_now_ms() + 10min, "h2");
     CHECK(c->conversation(id, await)->unread() == 1);
+}
+
+TEST_CASE(
+        "Client: a read point far ahead from another device is taken once, not at every reconcile",
+        "[client][volatile]") {
+    TempClient c;
+    SenderKeys them, other;
+    auto id = ConversationId::dm(them.session_id);
+    auto hex = oxenc::to_hex(them.session_id);
+    auto other_hex = oxenc::to_hex(other.session_id);
+    approve(*c, them.session_id);
+    approve(*c, other.session_id);
+    // Read state is reconciled only for conversations we have.
+    deliver(*c, them, "one", recently(10s), "h1");
+    deliver(*c, other, "elsewhere", recently(10s), "h2");
+
+    merge_volatile(*c.client, volatile_from_another_device(*c.client, [&](auto& theirs) {
+        auto e = theirs.get_or_construct_1to1(hex);
+        e.last_read = (clock_now_ms() + 30 * 24h).time_since_epoch().count();
+        theirs.set(e);
+    }));
+    REQUIRE(c->conversation(id, await)->unread() == 0);
+
+    // An hour on, past where that read point was held, a message arrives as unread.
+    ScopedClockOffset later{AdjustedClock::get_offset() + 1h};
+    deliver(*c, them, "an hour on", clock_now_ms(), "h3");
+    REQUIRE(c->conversation(id, await)->unread() == 1);
+
+    // A read in another conversation, on another device, reconciles every entry, the one still far
+    // ahead included; it was taken already, so the message stays unread.
+    merge_volatile(*c.client, volatile_from_another_device(*c.client, [&](auto& theirs) {
+        auto e = theirs.get_or_construct_1to1(other_hex);
+        e.last_read = clock_now_ms().time_since_epoch().count();
+        theirs.set(e);
+    }));
+    CHECK(c->conversation(id, await)->unread() == 1);
+
+    // As does a new Client on the same database, which reconciles as it starts.
+    c.reopen();
+    CHECK(c->conversation(id, await)->unread() == 1);
+
+    // A new read point from the other device is taken.
+    merge_volatile(*c.client, volatile_from_another_device(*c.client, [&](auto& theirs) {
+        auto e = theirs.get_or_construct_1to1(hex);
+        e.last_read = (clock_now_ms() + 31 * 24h).time_since_epoch().count();
+        theirs.set(e);
+    }));
+    CHECK(c->conversation(id, await)->unread() == 0);
 }
