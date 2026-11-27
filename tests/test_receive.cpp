@@ -61,7 +61,9 @@ static nlohmann::json make_response(
     return nlohmann::json{{"results", std::move(results)}};
 }
 
-TEST_CASE("Core automatic polling", "[core][poll]") {
+TEST_CASE(
+        "Receive: a retrieve asks for every namespace and resumes from the node's cursor",
+        "[core][retrieve]") {
     bool received = false;
     core::callbacks cbs;
     cbs.device_link_request = [&](int,
@@ -132,7 +134,7 @@ TEST_CASE("Core automatic polling", "[core][poll]") {
     CHECK(params_for(*mock_net->sent_requests[0].request.body, 21)["last_hash"] == "hash1");
 }
 
-TEST_CASE("Poll: attaching a network polls at once", "[core][poll]") {
+TEST_CASE("Receive: attaching a network starts receiving at once", "[core][retrieve]") {
     TempCore core;
     // Attached as an application attaches one, rather than through attach_mock_network, which
     // turns this off for the tests that drive every retrieve themselves.
@@ -150,8 +152,8 @@ TEST_CASE("Poll: attaching a network polls at once", "[core][poll]") {
 }
 
 TEST_CASE(
-        "Polling uses per-node last_hash to avoid missing messages on swarm-member switch",
-        "[core][poll]") {
+        "Receive: retrieves use each node's own last_hash, so switching members misses nothing",
+        "[core][retrieve]") {
     TempCore c;
     auto* mock_net = attach_mock_network(*c);
 
@@ -224,7 +226,7 @@ TEST_CASE(
     }
 }
 
-TEST_CASE("Poll: the sync cursor advances only after the batch is handled", "[core][poll]") {
+TEST_CASE("Receive: the sync cursor advances only after the batch is handled", "[core][retrieve]") {
     // Attached below, once there is a Core to own it; the callback that reads it does not run
     // until then either.
     MockNetwork* mock_net = nullptr;
@@ -292,7 +294,9 @@ static void set_more(
             response["results"][i]["body"]["more"] = true;
 }
 
-TEST_CASE("Poll: a truncated namespace is continued before it is reported final", "[core][poll]") {
+TEST_CASE(
+        "Receive: a truncated namespace is continued before it is reported final",
+        "[core][retrieve]") {
     int calls = 0;
     core::callbacks cbs;
     cbs.device_link_request =
@@ -341,7 +345,7 @@ TEST_CASE("Poll: a truncated namespace is continued before it is reported final"
     CHECK(calls == 1);
 }
 
-TEST_CASE("Poll: `more` with nothing returned does not continue", "[core][poll]") {
+TEST_CASE("Receive: `more` with nothing returned does not continue", "[core][retrieve]") {
     TempCore core;
     auto* mock_net = attach_mock_network(*core);
 
@@ -360,7 +364,7 @@ TEST_CASE("Poll: `more` with nothing returned does not continue", "[core][poll]"
     CHECK(mock_net->sent_requests.size() == 1);
 }
 
-TEST_CASE("Receive: nothing is retrieved while a subscription is held", "[core][poll]") {
+TEST_CASE("Receive: nothing is retrieved while a subscription is held", "[core][retrieve]") {
     TempCore core;
     // A routing mode that can receive pushes, so that a drained retrieve goes on to subscribe.
     network::config::Config config;
