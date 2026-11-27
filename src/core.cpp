@@ -144,11 +144,18 @@ Core::~Core() {
     // could not.
     //
     // Swallowed rather than propagated: this is a destructor, and a database that cannot be written
-    // is not something the caller tearing Core down can act on.
+    // is not something the caller tearing Core down can act on.  The dump is caught on its own so
+    // that its failing - as it does once the database has been interrupted to let the process be
+    // suspended - still lets the queue stop, which is what makes it safe to destroy the members
+    // below.
     try {
         call_get([this] {
-            if (globals.have_account())
-                configs.store_dumps();
+            try {
+                if (globals.have_account())
+                    configs.store_dumps();
+            } catch (const std::exception& e) {
+                log::warning(cat, "Could not store the config dumps at shutdown: {}", e.what());
+            }
             _jq.stop();
         });
     } catch (const std::exception& e) {
