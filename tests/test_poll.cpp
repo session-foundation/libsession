@@ -86,7 +86,8 @@ TEST_CASE("Core automatic polling", "[core][poll]") {
     // the device group needs.
     CHECK(namespaces_in(body) == std::vector<int16_t>{-21, 0, 2, 3, 4, 5, 21});
 
-    for (const auto& r : parse_json(body)["requests"])
+    auto batch = parse_json(body);
+    for (const auto& r : batch["requests"])
         CHECK(r["method"] == "retrieve");
 
     // Devices (ns 21) requires auth, and is the namespace the rest of this test uses.

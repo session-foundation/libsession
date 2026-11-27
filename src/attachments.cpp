@@ -12,6 +12,7 @@
 #include <sodium/crypto_secretstream_xchacha20poly1305.h>
 #include <sodium/utils.h>
 
+#include <algorithm>
 #include <concepts>
 #include <cstring>
 #include <fstream>
@@ -203,16 +204,7 @@ static std::pair<cleared_b32, size_t> encrypt_to_span(
         bool allow_large) {
     Encryptor enc{seed, domain};
     enc.update_key(data);
-
-    size_t pos = 0;
-    auto key = enc.start_encryption(
-            [&](std::span<std::byte> buf) -> size_t {
-                size_t avail = std::min(buf.size(), data.size() - pos);
-                std::memcpy(buf.data(), data.data() + pos, avail);
-                pos += avail;
-                return avail;
-            },
-            allow_large);
+    auto key = enc.start_encryption(data, allow_large);
 
     size_t written = 0;
     for (auto chunk = enc.next(); !chunk.empty(); chunk = enc.next()) {
@@ -292,16 +284,7 @@ cleared_b32 encrypt(
         bool allow_large) {
     Encryptor enc{seed, domain};
     enc.update_key(data);
-
-    size_t pos = 0;
-    auto key = enc.start_encryption(
-            [&](std::span<std::byte> buf) -> size_t {
-                size_t avail = std::min(buf.size(), data.size() - pos);
-                std::memcpy(buf.data(), data.data() + pos, avail);
-                pos += avail;
-                return avail;
-            },
-            allow_large);
+    auto key = enc.start_encryption(data, allow_large);
 
     try {
         std::ofstream out;
@@ -1096,38 +1079,59 @@ void Encryptor::update_key(std::span<const std::byte> data) {
     if (key_given)
         throw std::logic_error{"Encryptor::update_key() called on a fixed-key encryptor"};
     if (phase1_done)
-        throw std::logic_error{"Encryptor::update() called after start_encryption()"};
+        throw std::logic_error{"Encryptor::update_key() called after start_encryption()"};
 
     crypto_generichash_blake2b_update(&b2b_st(hash_st_data), uc(data.data()), data.size());
     hashed_size += data.size();
 }
 
 cleared_b32 Encryptor::start_encryption(
-        std::function<size_t(std::span<std::byte> buffer)> src,
-        bool allow_large,
-        std::optional<size_t> enc_size) {
+        read_callback src, bool allow_large, std::optional<size_t> enc_size) {
+    if (!src)
+        throw std::invalid_argument{"start_encryption() requires a data source"};
+    auto key = begin_encryption(allow_large, enc_size);
+    source = std::move(src);
+    return key;
+}
+
+cleared_b32 Encryptor::start_encryption(std::span<const std::byte> data, bool allow_large) {
+    auto key = begin_encryption(allow_large, data.size());
+    source = data;
+    return key;
+}
+
+size_t Encryptor::pull(std::span<std::byte> buf) {
+    if (auto* read = std::get_if<read_callback>(&source))
+        return (*read)(buf);
+    auto& remaining = std::get<std::span<const std::byte>>(source);
+    auto chunk = remaining.first(std::min(buf.size(), remaining.size()));
+    std::ranges::copy(chunk, buf.begin());
+    remaining = remaining.subspan(chunk.size());
+    return chunk.size();
+}
+
+cleared_b32 Encryptor::begin_encryption(bool allow_large, std::optional<size_t> enc_size) {
     if (phase1_done)
         throw std::logic_error{"start_encryption() called twice"};
+    if (key_given && !enc_size)
+        throw std::invalid_argument{
+                "start_encryption() on a fixed-key encryptor requires encrypt_size: nothing "
+                "hashed the data to know how much is coming"};
+    size_t size = enc_size.value_or(hashed_size);
+    if (size > MAX_REGULAR_SIZE && !allow_large)
+        throw std::invalid_argument{"data to encrypt is too large"};
+
     phase1_done = true;
+    encrypt_size = size;
 
     // With a key of our own there is no hash to finalize; nonce_key was filled at construction.
     if (!key_given)
         crypto_generichash_blake2b_final(
                 &b2b_st(hash_st_data), uc(nonce_key.data()), nonce_key.size());
-    else if (!enc_size)
-        throw std::invalid_argument{
-                "start_encryption() on a fixed-key encryptor requires encrypt_size: nothing "
-                "hashed the data to know how much is coming"};
 
     cleared_b32 key;
     std::memcpy(key.data(), nonce_key.data() + ENCRYPT_HEADER, ENCRYPT_KEY_SIZE);
 
-    encrypt_size = enc_size.value_or(hashed_size);
-
-    if (encrypt_size > MAX_REGULAR_SIZE && !allow_large)
-        throw std::invalid_argument{"data to encrypt is too large"};
-
-    source = std::move(src);
     padding = encrypted_padding(encrypt_size);
     padding_remaining = padding;
 
@@ -1148,8 +1152,6 @@ cleared_b32 Encryptor::start_encryption(
 bool Encryptor::produce_next() {
     if (done)
         return false;
-    if (!source)
-        throw std::logic_error{"Encryptor::next() requires a data source"};
 
     plaintext_buf.clear();
 
@@ -1173,7 +1175,7 @@ bool Encryptor::produce_next() {
     if (need > 0) {
         size_t before = plaintext_buf.size();
         plaintext_buf.resize(before + need);
-        size_t got = source(std::span{plaintext_buf}.subspan(before, need));
+        size_t got = pull(std::span{plaintext_buf}.subspan(before, need));
         plaintext_buf.resize(before + got);
         encrypted_so_far += got;
 

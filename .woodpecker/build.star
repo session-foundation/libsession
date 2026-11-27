@@ -94,8 +94,11 @@ def test_commands(runner = ""):
         for t in ["testLogging", "testAll"]
     ]
 
-def tests(runner = ""):
-    return {"name": "tests", "commands": test_commands(runner)}
+def tests(runner = "", environment = None):
+    check = {"name": "tests", "commands": test_commands(runner)}
+    if environment:
+        check["environment"] = environment
+    return check
 
 # Checks that a database made by every earlier schema in the history upgrades to the current one.
 # Those schemas exist only in git, so this needs the whole history and the tags, which the default
@@ -185,7 +188,8 @@ def upload_step(image, command):
     return step
 
 # A build of the library, followed by `checks` against it: by default the test suite.  Each check
-# runs in a fresh container holding what running it needs, its `pkgs`, by default `test_deps`.
+# runs in a fresh container holding what running it needs, its `pkgs`, by default `test_deps`, with
+# its `environment` if it has one.
 def linux(
         name,
         image,
@@ -214,12 +218,15 @@ def linux(
         build_commands(cmake, jobs),
     )]
     for check in checks:
-        steps.append({
+        step = {
             "name": check["name"],
             "image": image,
             "pull": True,
             "commands": apt_install(image, check.get("pkgs", test_deps), session_repo, foreign_arch) + check["commands"],
-        })
+        }
+        if "environment" in check:
+            step["environment"] = check["environment"]
+        steps.append(step)
     return workflow(name, "linux/" + arch, steps, clone = clone)
 
 def clang(version, distro = "Debian sid", image = "debian-sid-clang"):
@@ -230,35 +237,69 @@ def clang(version, distro = "Debian sid", image = "debian-sid-clang"):
         cmake = {"CMAKE_C_COMPILER": "clang-%d" % version, "CMAKE_CXX_COMPILER": "clang++-%d" % version},
     )
 
-def full_llvm(version, cxx = None, distro = "Debian sid", image = "debian-sid-clang"):
+# AddressSanitizer and UndefinedBehaviorSanitizer, with a UB report as fatal as an ASan one rather
+# than a line in the log of a passing run.
+sanitizer_flags = "-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
+
+# With `sanitize`, a Debug build instrumented with `sanitizer_flags`.  The instrumentation covers what
+# is compiled in-tree: libsession and the C++ dependencies this build takes from submodules.  The
+# distro's C libraries, and the static dependencies session-deps builds with flags of its own, are
+# linked uninstrumented.
+def full_llvm(version, cxx = None, distro = "Debian sid", image = "debian-sid-clang", sanitize = False):
+    cxx_flags = "-stdlib=libc++ -fcolor-diagnostics"
+    link_flags = "-fuse-ld=lld-%d" % version
+    if sanitize:
+        cxx_flags += " " + sanitizer_flags
+        link_flags += " " + sanitizer_flags
     cmake = {
         "CMAKE_C_COMPILER": "clang-%d" % version,
         "CMAKE_CXX_COMPILER": "clang++-%d" % version,
-        "CMAKE_CXX_FLAGS": "-stdlib=libc++ -fcolor-diagnostics",
+        "CMAKE_CXX_FLAGS": cxx_flags,
         "BUILD_SHARED_LIBS": False,
         "OXEN_LOGGING_FORCE_SUBMODULES": True,
         "DEPS_FORCE_protobuf-lite_SUBMODULE": True,
         "DEPS_FORCE_liboxenquic_SUBMODULE": True,
     }
     for kind in ["EXE", "MODULE", "SHARED"]:
-        cmake["CMAKE_%s_LINKER_FLAGS" % kind] = "-fuse-ld=lld-%d" % version
+        cmake["CMAKE_%s_LINKER_FLAGS" % kind] = link_flags
     if cxx:
         cmake["CMAKE_CXX_STANDARD"] = cxx
+    name = "%s: llvm-%d" % (distro, version) + ("" if cxx == None else ": C++%d" % cxx)
+    deps = [
+        "clang-%d" % version,
+        "lld-%d" % version,
+        "libc++-%d-dev" % version,
+        "libc++abi-%d-dev" % version,
+    ] + lib_deps
+    # The checks run in a container of their own, which needs libc++'s runtime to load the test
+    # binaries.  The runtime package's name differs between LLVM versions (libc++1-19, but plain
+    # libc++1 from 21), so it comes in as a dependency of the -dev package.
+    check_deps = test_deps + ["libc++-%d-dev" % version]
+    checks = None
+    if sanitize:
+        name += ": ASan+UBSan"
+        cmake["CMAKE_BUILD_TYPE"] = "Debug"
+        cmake["CMAKE_C_FLAGS"] = sanitizer_flags
+        # The sanitizer runtimes, which clang only recommends.
+        deps.append("libclang-rt-%d-dev" % version)
+        # For llvm-symbolizer, without which reports give addresses instead of source lines.
+        check_deps.append("llvm-%d" % version)
+        checks = [tests(environment = {
+            # llvm-N puts it on the PATH only as llvm-symbolizer-N, which the runtime does not look for.
+            "ASAN_SYMBOLIZER_PATH": "/usr/lib/llvm-%d/bin/llvm-symbolizer" % version,
+            # The C API tests never free the objects they create, and some of a Client's download and
+            # save state is never freed, so LeakSanitizer would fail every run.
+            "ASAN_OPTIONS": "detect_leaks=0",
+            "UBSAN_OPTIONS": "print_stacktrace=1",
+        })]
     return linux(
-        "%s: llvm-%d" % (distro, version) + ("" if cxx == None else ": C++%d" % cxx),
+        name,
         image,
-        deps = [
-            "clang-%d" % version,
-            "lld-%d" % version,
-            "libc++-%d-dev" % version,
-            "libc++abi-%d-dev" % version,
-        ] + lib_deps,
+        deps = deps,
         system = libcxx_system_deps,
-        # The checks run in a container of their own, which needs libc++'s runtime to load the
-        # test binaries.  The runtime package's name differs between LLVM versions (libc++1-19,
-        # but plain libc++1 from 21), so it comes in as a dependency of the -dev package.
-        test_deps = test_deps + ["libc++-%d-dev" % version],
+        test_deps = check_deps,
         cmake = cmake,
+        checks = checks,
     )
 
 # Release archives: built by `commands` and uploaded from `directory`, where they leave the archive.
@@ -420,6 +461,11 @@ def main(ctx):
         # holds against one of them is not a subset.
         linux("Debian sid: C++23", "debian-sid", cmake = {"CMAKE_CXX_STANDARD": 23}),
         full_llvm(23, cxx = 23),
+
+        # libc++ rather than libstdc++ because libc++ annotates std::vector for AddressSanitizer by
+        # default, so a read of a vector's spare capacity is caught as well as one past its
+        # allocation.
+        full_llvm(23, sanitize = True),
 
         linux("Debian stable (i386)", "debian-stable/i386"),
         linux("Debian 13", "debian-trixie", checks = [tests(), schema_history], clone = full_clone),

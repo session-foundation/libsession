@@ -23,7 +23,9 @@ uint64_t CSRNG::operator()() const {
 namespace session::random {
 
 void fill(std::span<std::byte> buf) {
-    randombytes_buf(buf.data(), buf.size());
+    // An empty span's data() may be null, which libsodium declares it never is.
+    if (!buf.empty())
+        randombytes_buf(buf.data(), buf.size());
 }
 void fill(std::span<char> buf) {
     fill(std::span{reinterpret_cast<std::byte*>(buf.data()), buf.size()});
@@ -31,7 +33,9 @@ void fill(std::span<char> buf) {
 
 void fill_deterministic(std::span<std::byte> buf, std::span<const std::byte, 32> seed) {
     static_assert(seed.extent == randombytes_SEEDBYTES);
-    randombytes_buf_deterministic(to_unsigned(buf.data()), buf.size(), to_unsigned(seed.data()));
+    if (!buf.empty())
+        randombytes_buf_deterministic(
+                to_unsigned(buf.data()), buf.size(), to_unsigned(seed.data()));
 }
 
 std::vector<std::byte> random(size_t size) {

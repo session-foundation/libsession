@@ -155,8 +155,10 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
         cbytes33 recipient_pubkey = {};
         std::memcpy(recipient_pubkey.data, keys.session_pk1.data(), sizeof(recipient_pubkey.data));
 
+        // Written only on failure, but printed by INFO after successful calls too.
+        char error[256] = {};
+
         // Withhold the pro signature
-        char error[256];
         session_protocol_encoded_for_destination encrypt_without_pro_sig =
                 session_protocol_encode_dm_v1(
                         data_body.data(),
@@ -196,7 +198,9 @@ TEST_CASE("Session protocol helpers C API", "[session-protocol][helpers]") {
     // Setup a dummy "Session Pro Backend" key
     // We reuse test key 1 as the "Session Pro" backend key that signs the proofs as it
     // doesn't matter what key really, just that we have one available for signing.
-    char error[256];
+
+    // Written only on failure, but printed by INFO after successful calls too.
+    char error[256] = {};
 
     SECTION("Encrypt/decrypt for contact in default namespace w/o pro attached") {
         // Build content without pro attached
