@@ -20,16 +20,6 @@ class Core;
 // Defined in core.hpp, which includes this header; only referenced here as a parameter type.
 struct predefined_seed;
 
-// Core component contains one-off global values that don't make sense storing in a table, typically
-// because the value is highly special purpose or is only used in one single place.  If you ever
-// find yourself wanting to put multiple values in here under the same key, that is a sign that you
-// should not be using this class and should instead refactor to use proper table relations.
-//
-// A note on keys: to avoid conflicts, external users of these globals should use prefix names that
-// are unlikely to conflict with other uses.  For example, "session_ios_dark_mode" is a decent name,
-// but "pubkey" is a terrible one.  All internal libsession keys in this table begin with an
-// underscore, and should never be accesses outside libsession itself.
-//
 /// Thrown when something requiring the account's identity is used before there is one.  Only
 /// reachable when the Core was constructed with defer_account: without it, construction either
 /// finds a seed, is given one, or generates one.
@@ -40,6 +30,26 @@ struct no_account : std::logic_error {
                     "restore_account() first"} {}
 };
 
+/// Thrown by Globals::seed_mnemonic() once Globals::hide_seed() has been called on this device.
+/// Check Globals::seed_hidden() first to avoid it.
+struct seed_hidden_error : std::runtime_error {
+    seed_hidden_error() :
+            std::runtime_error{
+                    "The recovery password has been hidden on this device and cannot be "
+                    "retrieved"} {}
+};
+
+// Core component contains one-off global values that don't make sense storing in a table, typically
+// because the value is highly special purpose or is only used in one single place.  If you ever
+// find yourself wanting to put multiple values in here under the same key, that is a sign that you
+// should not be using this class and should instead refactor to use proper table relations.
+//
+// A note on keys: to avoid conflicts, external users of these globals should use prefix names that
+// are unlikely to conflict with other uses.  For example, "session_ios_dark_mode" is a decent name,
+// but "pubkey" is a terrible one.  All internal libsession keys in this table begin with an
+// underscore, and the public accessors below refuse them, throwing std::invalid_argument: they
+// hold the account seed and the flag hide_seed() sets, which nothing outside libsession may read
+// or change.
 class Globals final : detail::CoreComponent {
 
   private:
@@ -87,6 +97,25 @@ class Globals final : detail::CoreComponent {
     void _create_account();
     void _restore_account(const predefined_seed& seed);
 
+    // The unchecked counterparts of the public accessors, which do the work for them once they have
+    // refused a reserved key.  libsession's own reads and writes of its underscore keys come here
+    // directly, since the public accessors would refuse them.
+    std::optional<int64_t> _get_integer(std::string_view key);
+    std::optional<double> _get_real(std::string_view key);
+    std::optional<std::string> _get_text(std::string_view key);
+    std::optional<std::vector<std::byte>> _get_blob(std::string_view key);
+    std::optional<session::secure_buffer> _get_blob_secure(std::string_view key);
+    bool _get_blob_to(std::string_view key, std::span<std::byte> to);
+    std::variant<std::monostate, int64_t, double, std::string, std::vector<std::byte>> _get(
+            std::string_view key);
+    std::variant<std::monostate, int64_t, double, std::string, session::secure_buffer> _get_secure(
+            std::string_view key);
+    void _set(std::string_view key, int64_t integer);
+    void _set(std::string_view key, double real);
+    void _set(std::string_view key, std::string_view text);
+    void _set(std::string_view key, std::span<const std::byte> blob);
+    bool _erase(std::string_view key);
+
   public:
     /// Whether this account has an identity yet.
     ///
@@ -131,6 +160,9 @@ class Globals final : detail::CoreComponent {
     // value.  You get back nullopt if the database key does not exist, or if it contains a value
     // of some other type.
     //
+    // Each of these, `set` and `erase` throws std::invalid_argument for a key beginning with an
+    // underscore, which is libsession's own (see above).
+    //
     // These, `set` and `erase` are the exception to the threading rule on the rest of this class:
     // each is one self-contained query against a connection the pool hands the calling thread, and
     // touches nothing cached.  An application may call them from wherever it likes, and gets
@@ -139,10 +171,7 @@ class Globals final : detail::CoreComponent {
     std::optional<double> get_real(std::string_view key);
     std::optional<std::string> get_text(std::string_view key);
     std::optional<std::vector<std::byte>> get_blob(std::string_view key);
-    // Same as get_blob, but allocates a libsodium secure buffer to old the value.
-    //
-    // Do not use this to access the "seed" value: that value is cached in the Core object and
-    // accessible via CoreComponent::access_seed().
+    // Same as get_blob, but allocates a libsodium secure buffer to hold the value.
     std::optional<session::secure_buffer> get_blob_secure(std::string_view key);
     // Reads a fixed size blob into `to`.  If the database does not contain a BLOB value of byte
     // length `to.size()`, returns false; other writes the blob value to `to` and returns true.
@@ -193,6 +222,10 @@ class Globals final : detail::CoreComponent {
     // Each of these needs an identity, so each throws no_account when there is not one yet.  That
     // is only reachable via defer_account; without it an account always exists by the time the
     // Core constructor returns.
+    //
+    // account_seed() works whether or not the seed is hidden (see hide_seed()), because libsession
+    // derives keys from it.  A client that exports the raw seed -- as hex for a QR code, say --
+    // must check seed_hidden() itself before doing so.
     AccountSeedAccess account_seed() {
         _require_account();
         auto acc = _account_seed.access();
@@ -221,10 +254,36 @@ class Globals final : detail::CoreComponent {
     /// If `force_24` is false (the default), returns 13 words when the upper 16 bytes of the
     /// seed are all zero (128-bit entropy), or 25 words otherwise.  If `force_24` is true,
     /// always returns 25 words.
+    ///
+    /// @throws seed_hidden_error once hide_seed() has been called on this device.
+    /// @throws no_account if there is no identity yet.
     mnemonics::secure_mnemonic seed_mnemonic(
             const mnemonics::Mnemonics& lang, bool force_24 = false);
     mnemonics::secure_mnemonic seed_mnemonic(
             std::string_view lang_name = "English", bool force_24 = false);
+
+    /// Permanently hides the account's recovery password on this device: from then on
+    /// seed_mnemonic() throws seed_hidden_error.  There is no way to undo it.
+    ///
+    /// The flag is stored in this device's database, so it survives restarts but is not synced:
+    /// the account's other devices, and this account restored onto a fresh database, are
+    /// unaffected.  Calling it again is harmless.
+    ///
+    /// Like `get` and `set`, safe to call from any thread, subject to have_account()'s rule on
+    /// reading the identity while create_account() or restore_account() is in flight.
+    ///
+    /// @throws no_account if there is no identity yet: there is nothing to hide, and a flag set now
+    /// would silently apply to whichever account is created later.
+    void hide_seed();
+
+    /// Whether hide_seed() has been called on this device.
+    ///
+    /// This only gates seed_mnemonic(): account_seed() keeps working, since libsession derives keys
+    /// from it, so a client exporting the raw seed in any other form must check this itself.
+    ///
+    /// Like `get` and `set`, safe to call from any thread: it reads the database on each call
+    /// rather than a cached value.
+    bool seed_hidden();
 };
 
 }  // namespace session::core
