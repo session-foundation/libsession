@@ -407,7 +407,6 @@ bool Notifications::fetch_on_push(config::Namespace ns) {
         case config::Namespace::GroupKeys:
         case config::Namespace::GroupInfo:
         case config::Namespace::GroupMembers: return true;
-        // Our own profile changes nothing a notification shows.
         default: return false;
     }
 }
