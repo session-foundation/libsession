@@ -1,6 +1,6 @@
 #pragma once
 
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <oxenc/base64.h>
 #include <oxenc/hex.h>
 

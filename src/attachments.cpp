@@ -8,7 +8,9 @@
 #include <nettle/sha2.h>
 #include <session/attachments.h>
 #include <sodium/crypto_core_hchacha20.h>
+#include <sodium/crypto_generichash_blake2b.h>
 #include <sodium/crypto_secretstream_xchacha20poly1305.h>
+#include <sodium/utils.h>
 
 #include <concepts>
 #include <cstring>
