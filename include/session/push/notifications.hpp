@@ -376,9 +376,12 @@ class Notifications {
     ///
     /// The push server can notify before a message has reached every member of the swarm, so a
     /// single member may not have it yet.  This asks FETCH_MEMBERS members at once, and the first
-    /// that has it ends the fetch.  If every one answers without it, it asks again once, after
-    /// FETCH_RETRY_DELAY, provided that leaves time before `deadline`.  Reaching `deadline` ends it
-    /// with whatever it has: not_found if any member answered, failed if none did.
+    /// that has it ends the fetch.  If every one answers without it, it asks again after
+    /// FETCH_RETRY_DELAY, up to FETCH_ROUNDS rounds, while that leaves time before `deadline`.
+    /// Outside the inbox it stops after the second round once a member has handed over all it
+    /// holds without it: a newer config message deletes the one it replaces, so that one will not
+    /// turn up.  Reaching `deadline` ends it with whatever it has: not_found if any member
+    /// answered, failed if none did.
     ///
     /// Answers arriving after `cb` are still received, as they came from our own swarm.
     ///

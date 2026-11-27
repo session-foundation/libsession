@@ -46,12 +46,21 @@ namespace {
 
         /// Members still being asked in the current round.
         size_t outstanding = 0;
-        /// Rounds started: the first, and the one retry.
+        /// Rounds started, up to Notifications::FETCH_ROUNDS.
         int attempts = 0;
         /// Whether any member answered usably, which separates not_found from failed.
         bool answered = false;
+        /// Whether a member asked in the current round handed over all it holds without the hash.
+        bool complete = false;
         bool concluded = false;
     };
+
+    // The rounds after which a member that has handed over all it holds without the message ends a
+    // fetch outside the inbox.  A config message is deleted from the swarm once a newer one
+    // replaces it, so the push for an earlier one names a message no member will ever have; asking
+    // every round until the deadline would only delay the handler.  The first retry still covers a
+    // message that had not yet spread through the swarm.
+    constexpr int SUPERSEDED_AFTER_ROUNDS = 2;
 
     // The least time worth starting another round with: a request given less cannot resolve a node,
     // connect and get an answer.
@@ -91,6 +100,7 @@ namespace {
             return;
 
         op->attempts++;
+        op->complete = false;
         net->get_swarm(op->core->globals.pubkey_x25519(), false, [op](auto, auto swarm) {
             op->core->call([op, swarm = std::move(swarm)] {
                 if (op->concluded)
@@ -175,6 +185,9 @@ namespace {
                             failed->second});
         }
 
+        if (!got->more)
+            op->complete = true;
+
         // Not yet, but this member says it holds more past what it returned, so the message may
         // still be among it.  The continuation goes back to the same member, whose cursor it
         // resumes from.
@@ -204,6 +217,10 @@ namespace {
         // moment to propagate, while the deadline leaves room for that and a request after it: a
         // push can arrive well before the message has spread through the swarm, and a message never
         // found shows nothing.
+        if (op->ns != config::Namespace::Default && op->complete &&
+            op->attempts >= SUPERSEDED_AFTER_ROUNDS)
+            return conclude(*op, FetchResult::not_found);
+
         auto retry_at = std::chrono::steady_clock::now() + Notifications::FETCH_RETRY_DELAY;
         if (op->attempts < Notifications::FETCH_ROUNDS &&
             retry_at + MIN_ROUND_BUDGET < op->deadline) {

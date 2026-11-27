@@ -190,6 +190,44 @@ TEST_CASE("Push fetch: asks again while no member has it yet", "[push_notificati
     }
 }
 
+TEST_CASE(
+        "Push fetch: outside the inbox, a complete answer without it ends the fetch after one "
+        "retry",
+        "[push_notifications]") {
+    Setup s{3};
+    s.notifications.fetch_message(config::Namespace::Contacts, "h-replaced", 10s, [&](auto r) {
+        s.results.push_back(std::move(r));
+    });
+    TestHelper::drain(s.c->core);
+
+    SECTION("a member that held all it had, in the second round") {
+        for (auto& r : take_retrieves(*s.net))
+            s.reply(r, answer({}));
+        CHECK(s.results.empty());
+        s.wait(PAST_THE_RETRY);
+        auto again = take_retrieves(*s.net);
+        REQUIRE(again.size() == 3);
+        s.reply_error(again[0]);
+        s.reply_error(again[1]);
+        s.reply(again[2], answer({"h-newer"}));
+        CHECK(s.outcomes() == std::vector{FetchResult::not_found});
+        s.wait(PAST_THE_RETRY);
+        CHECK(take_retrieves(*s.net).empty());
+    }
+
+    SECTION("no member answered in full, so it asks again") {
+        for (int round = 1; round <= 2; round++) {
+            auto sent = take_retrieves(*s.net);
+            REQUIRE(sent.size() == 3);
+            for (auto& r : sent)
+                s.reply_error(r);
+            CHECK(s.results.empty());
+            s.wait(PAST_THE_RETRY);
+        }
+        CHECK(take_retrieves(*s.net).size() == 3);
+    }
+}
+
 TEST_CASE("Push fetch: no retry when the deadline leaves no room", "[push_notifications]") {
     Setup s{3};
     s.fetch("h-target", 1s);
@@ -559,11 +597,12 @@ TEST_CASE(
                         signed_ns)));
     };
 
-    // Everything the account polls but messages and its own published keys (-21), first, so that
-    // a push server keeping one subscription per device keeps the one with data, sent after it.
+    // Everything the account polls but messages, its own profile (2) and its own published keys
+    // (-21), first, so that a push server keeping one subscription per device keeps the one with
+    // data, sent after it.
     auto first = take_sent_to(*s.net, "subscribe");
     REQUIRE(first.size() == 1);
-    check_request(first[0], false, {2, 3, 4, 5, 21}, "2,3,4,5,21");
+    check_request(first[0], false, {3, 4, 5, 21}, "3,4,5,21");
 
     s.reply(first[0], accepted());
     CHECK(s.results.empty());
@@ -962,15 +1001,16 @@ TEST_CASE("Push handle: a push without data", "[push_notifications]") {
         auto sent = take_retrieves(*x.net);
         REQUIRE(sent.size() == 1);
         CHECK(retrieve_params(sent[0])["namespace"] == 21);
-        // Empty every round, FETCH_ROUNDS of them.
+        // Empty, and complete: after the one retry, that ends it, since a config message no member
+        // holds may have been replaced by a newer one.
         x.reply(sent[0], answer({}));
-        for (int round = 2; round <= Notifications::FETCH_ROUNDS; round++) {
-            x.wait(PAST_THE_RETRY);
-            auto again = take_retrieves(*x.net);
-            REQUIRE(again.size() == 1);
-            x.reply(again[0], answer({}));
-        }
+        x.wait(PAST_THE_RETRY);
+        auto again = take_retrieves(*x.net);
+        REQUIRE(again.size() == 1);
+        x.reply(again[0], answer({}));
         CHECK(x.only().outcome == push::Handled::not_found);
+        x.wait(PAST_THE_RETRY);
+        CHECK(take_retrieves(*x.net).empty());
     }
 
     SECTION("for the read state, which is fetched now") {
