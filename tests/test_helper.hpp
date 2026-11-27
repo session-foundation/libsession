@@ -30,6 +30,26 @@ inline nlohmann::json parse_json(std::span<const std::byte> body) {
     return nlohmann::json::parse(to_string_view(body));
 }
 
+/// A storage server's answer to the batch of retrieves in `request_body`: one result per
+/// subrequest, matched by position as the server does, with `messages` -- (hash, data) in the order
+/// the node returns them -- in the one that asked for `ns` and nothing in the rest.
+inline nlohmann::json retrieve_response(
+        std::span<const std::byte> request_body,
+        int16_t ns,
+        const std::vector<std::pair<std::string, std::vector<std::byte>>>& messages) {
+    auto batch = parse_json(request_body);
+    auto results = nlohmann::json::array();
+    for (const auto& r : batch["requests"]) {
+        nlohmann::json body;
+        body["messages"] = nlohmann::json::array();
+        if (r["params"]["namespace"] == ns)
+            for (const auto& [hash, data] : messages)
+                body["messages"].push_back({{"data", oxenc::to_base64(data)}, {"hash", hash}});
+        results.push_back({{"code", 200}, {"body", std::move(body)}});
+    }
+    return nlohmann::json{{"results", std::move(results)}};
+}
+
 /// A minimal in-process mock of network::Network for unit tests.
 /// Tests can set `current_node` to control which node get_swarm returns, and inspect
 /// `sent_requests` to observe outgoing requests and fire their callbacks.
