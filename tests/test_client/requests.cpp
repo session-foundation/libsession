@@ -23,7 +23,7 @@ TEST_CASE("Client: a stranger's message is a request, not a conversation", "[cli
     CHECK(r.added[0].dm()->request);
     REQUIRE(c->conversation(id, await));
     CHECK(c->conversation(id, await)->dm()->request);
-    CHECK(c->conversation(id, await)->messages(await).size() == 1);
+    CHECK(c->conversation(id, await)->messages(await).messages.size() == 1);
 
     // And it is synced, so a request answered on one device is not still waiting on another.  Their
     // writing to us is what says they approved us; nothing yet says we approved them.
@@ -129,17 +129,17 @@ TEST_CASE("Client: a blocked account's messages are refused", "[client][requests
     auto id = ConversationId::dm(sender.session_id);
 
     deliver(*c, sender, "first", from_epoch_ms(5000), "h1");
-    REQUIRE(c->conversation(id, await)->messages(await).size() == 1);
+    REQUIRE(c->conversation(id, await)->messages(await).messages.size() == 1);
 
     c->dm(id, await)->set_blocked(true, await);
     deliver(*c, sender, "and again", from_epoch_ms(6000), "h2");
 
     // Refused on arrival rather than hidden when drawing, so nothing they send becomes history or
     // an unread count.
-    CHECK(c->conversation(id, await)->messages(await).size() == 1);
+    CHECK(c->conversation(id, await)->messages(await).messages.size() == 1);
     CHECK(c->conversation(id, await)->unread() == 1);
 
     c->dm(id, await)->set_blocked(false, await);
     deliver(*c, sender, "still there?", from_epoch_ms(7000), "h3");
-    CHECK(c->conversation(id, await)->messages(await).size() == 2);
+    CHECK(c->conversation(id, await)->messages(await).messages.size() == 2);
 }

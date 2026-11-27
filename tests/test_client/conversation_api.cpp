@@ -126,18 +126,22 @@ TEST_CASE("Client: a page size has to be a page", "[client][convos]") {
     // Unchecked, these reach SQLite as `LIMIT ?`, where a negative is no limit at all: asking for
     // one message would load every message in the conversation.
     for (int limit : {0, -1, -50}) {
-        CHECK_THROWS_AS(c->conversation(id, await)->messages(limit, await), std::invalid_argument);
         CHECK_THROWS_AS(
-                c->conversation(id, await)->messages(limit, std::nullopt, true, await),
+                c->conversation(id, await)->messages({.limit = limit}, await),
+                std::invalid_argument);
+        CHECK_THROWS_AS(
+                c->conversation(id, await)->messages(
+                        {.limit = limit, .include_deleted = true}, await),
                 std::invalid_argument);
     }
 
     // The handler form refuses on the calling thread too, rather than reporting it: the caller is
     // still there to catch, and a bad page size is its bug rather than a runtime condition.
-    auto ignore = [](Expected<std::vector<Message>>) {};
-    CHECK_THROWS_AS(c->conversation(id, await)->messages(0, ignore), std::invalid_argument);
+    auto ignore = [](Expected<MessagePageResult>) {};
+    CHECK_THROWS_AS(
+            c->conversation(id, await)->messages({.limit = 0}, ignore), std::invalid_argument);
 
-    CHECK(c->conversation(id, await)->messages(1, await).size() == 1);
+    CHECK(c->conversation(id, await)->messages({.limit = 1}, await).messages.size() == 1);
 }
 
 TEST_CASE("Client: a conversation knows which kind it is", "[client][convos]") {
@@ -194,10 +198,10 @@ TEST_CASE(
     // And on an outright temporary, which is how it reads at a call site.
     std::optional<Error> paged = Error{"test.not_called", "not called"};
     size_t got = 0;
-    c->conversation(id, await)->messages(50, [&](auto r) {
+    c->conversation(id, await)->messages({.limit = 50}, [&](auto r) {
         if (r) {
             paged.reset();
-            got = r->size();
+            got = r->messages.size();
         } else
             paged = std::move(r).error();
     });

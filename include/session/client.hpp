@@ -3,6 +3,7 @@
 #include <atomic>
 #include <deque>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <optional>
 #include <oxen/quic/loop.hpp>
@@ -975,16 +976,33 @@ class Client {
     // Takes a bare statement rather than a `StatementWrapper` so that it serves both a cached
     // statement and a one-off; see `_load_reply_targets` for why one of its callers cannot use the
     // cache.
+    //
+    // At most `max` rows are built.  A statement that has another row beyond them sets `*more`,
+    // which is how a page learns whether history continues: it asks for one row more than it
+    // returns, and that row is stepped to but never built.
     std::vector<Message> _build_messages(
             sqlite::Connection& c,
             const ConversationId& convo,
             ReplyDepth depth,
-            SQLite::Statement& st);
+            SQLite::Statement& st,
+            size_t max = std::numeric_limits<size_t>::max(),
+            bool* more = nullptr);
     template <typename... Bind>
     std::vector<Message> _query_messages(
             sqlite::Connection& c,
             const ConversationId& convo,
             ReplyDepth depth,
+            const std::string& query,
+            const Bind&... bind);
+
+    // A page of `limit` messages from `query`, whose last parameter is its `LIMIT`: binds one more
+    // than `limit` there and sets `more` to whether that row was found.
+    template <typename... Bind>
+    std::vector<Message> _query_page(
+            sqlite::Connection& c,
+            const ConversationId& convo,
+            int limit,
+            bool& more,
             const std::string& query,
             const Bind&... bind);
     void _load_attachments(sqlite::Connection& c, std::vector<Message>& msgs);
@@ -1174,11 +1192,23 @@ class Client {
             const ConversationId& id,
             transfer_progress on_progress,
             result_function<std::optional<std::vector<std::byte>>> cb);
-    std::vector<Message> _messages(
+    MessagePageResult _messages(const ConversationId& id, const MessagePage& page);
+    MessagePageResult _messages_older(
+            sqlite::Connection& c,
             const ConversationId& id,
-            int limit,
-            std::optional<MessageCursor> before,
-            bool include_deleted);
+            int64_t convo,
+            const MessagePage& page);
+    MessagePageResult _messages_after(
+            sqlite::Connection& c,
+            const ConversationId& id,
+            int64_t convo,
+            const MessagePage& page);
+    MessagePageResult _messages_around(
+            sqlite::Connection& c,
+            const ConversationId& id,
+            int64_t convo,
+            const MessagePage& page);
+    std::optional<MessageCursor> _first_unread(const ConversationId& id);
     std::optional<Message> _message(int64_t id);
     int64_t _send_message(const ConversationId& id, const OutgoingMessage& msg);
     int64_t _send_message(
@@ -1464,7 +1494,7 @@ class Client {
 
     void _require_dm(std::string_view op, const ConversationId& id);
     void _require_contact(std::string_view op, const ConversationId& id);
-    void _require_page(std::string_view op, int limit);
+    void _require_page(std::string_view op, const MessagePage& page);
     void _require_readable(const std::vector<OutgoingAttachment>& attachments);
 
     // Everything a send must be able to reject before storing anything: the conversation kind, the

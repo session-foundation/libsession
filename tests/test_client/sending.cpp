@@ -200,8 +200,9 @@ TEST_CASE("Client: a throwing handler is contained", "[client][signals]") {
     // The exception is caught and logged rather than escaping into Core's event loop, and the
     // message is stored regardless: a broken listener must not cost us data.
     CHECK_NOTHROW(deliver(*c, sender, "still fine", from_epoch_ms(1000), "h1"));
-    CHECK(c->conversation(ConversationId::dm(sender.session_id), await)->messages(await).size() ==
-          1);
+    CHECK(c->conversation(ConversationId::dm(sender.session_id), await)
+                  ->messages(await)
+                  .messages.size() == 1);
 }
 
 TEST_CASE("Client: send status changes are reported as messages_updated", "[client][signals]") {
@@ -386,7 +387,7 @@ TEST_CASE("Client: sending to ourselves stores once", "[client][send]") {
 
     // That single store went to our own swarm, so its hash is one worth keeping.
     CHECK(c->message(id, await)->hash == store_hash_for(oxenc::to_hex(me)));
-    CHECK(c->conversation(ConversationId::dm(me), await)->messages(await).size() == 1);
+    CHECK(c->conversation(ConversationId::dm(me), await)->messages(await).messages.size() == 1);
 
     // ...and when our own swarm hands it straight back on the next poll, which is what note to self
     // does, it must recognise its own message rather than storing a second copy.  What makes that
@@ -412,5 +413,5 @@ TEST_CASE("Client: sending to ourselves stores once", "[client][send]") {
         return 0;
     });
 
-    CHECK(c->conversation(ConversationId::dm(me), await)->messages(await).size() == 1);
+    CHECK(c->conversation(ConversationId::dm(me), await)->messages(await).messages.size() == 1);
 }
