@@ -1,7 +1,5 @@
 #pragma once
 
-#include <sodium/randombytes.h>
-
 #include <algorithm>
 #include <concepts>
 #include <cstdint>
@@ -22,11 +20,7 @@ struct CSRNG {
 
     static constexpr uint64_t max() { return std::numeric_limits<uint64_t>::max(); };
 
-    uint64_t operator()() const {
-        uint64_t i;
-        randombytes_buf(&i, sizeof(i));
-        return i;
-    };
+    uint64_t operator()() const;
 };
 
 // Convenience instance.

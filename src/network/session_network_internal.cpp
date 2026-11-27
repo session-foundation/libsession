@@ -3,6 +3,7 @@
 #include <numeric>
 #include <oxen/quic/address.hpp>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "session/network/service_node.hpp"
