@@ -11,6 +11,7 @@
 #include <cassert>
 #include <cstring>
 #include <oxen/log.hpp>
+#include <session/crypto/mlkem768.hpp>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -19,13 +20,13 @@
 #include "session/blinding.hpp"
 #include "session/clock.hpp"
 #include "session/crypto/ed25519.hpp"
-#include "session/crypto/mlkem768.hpp"
 #include "session/crypto/x25519.hpp"
 #include "session/encrypt.hpp"
 #include "session/hash.hpp"
 #include "session/random.hpp"
 #include "session/sodium_array.hpp"
 #include "session/types.hpp"
+#include "session/util.hpp"
 
 using namespace std::literals;
 using namespace session::literals;

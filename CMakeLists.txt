@@ -107,8 +107,6 @@ option(STATIC_LIBSTD "Statically link libstdc++/libgcc" ${default_static_libstd}
 
 option(USE_LTO "Use Link-Time Optimization" ${use_lto_default})
 
-option(ENABLE_NETWORKING_SROUTER "Build with session-router networking support" ON)
-
 # jpegli produces standard JPEGs around 10-15% smaller than libjpeg-turbo at the same perceived
 # quality, and about as fast.  Off, libvips' own (libjpeg-turbo) encoder is used instead.  Either
 # way libjpeg-turbo does all JPEG decoding.

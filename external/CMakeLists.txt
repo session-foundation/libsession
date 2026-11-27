@@ -20,9 +20,12 @@ if(NOT BUILD_STATIC_DEPS AND NOT FORCE_ALL_SUBMODULES)
   find_package(PkgConfig REQUIRED)
 endif()
 
-function(add_static_subdirectory dir)
+# For a dependency whose submodule build gets linked into our own libraries (and the static bundle)
+# rather than installed beside them: as a shared library it would be one more .so to ship, and one
+# that clashes with the system package of the same library.
+function(static_sessiondep_or_submodule)
     set(BUILD_SHARED_LIBS OFF)
-    add_subdirectory(${dir} ${ARGN})
+    sessiondep_or_submodule(${ARGN})
 endfunction()
 
 session_dep(libsodium 1.0.21)
@@ -32,23 +35,6 @@ if(NOT TARGET oxenc::oxenc)
     set(OXENC_BUILD_TESTS OFF CACHE BOOL "")
     set(OXENC_BUILD_DOCS OFF CACHE BOOL "")
     sessiondep_or_submodule(liboxenc 1.6.0 session-router/external/oxen-libquic/external/oxen-encoding oxenc::oxenc)
-endif()
-
-if(ENABLE_NETWORKING_SROUTER)
-    set(SROUTER_FULL OFF CACHE BOOL "")
-    set(SROUTER_DAEMON OFF CACHE BOOL "")
-    set(SROUTER_NATIVE_BUILD OFF CACHE BOOL "")
-    set(SROUTER_JEMALLOC OFF CACHE BOOL "")
-
-    add_static_subdirectory(session-router EXCLUDE_FROM_ALL)
-    libsession_static_bundle(session-router::core)
-endif()
-
-# The network library always needs oxen::quic.  When session-router is built (SROUTER, above) it
-# provides oxen::quic transitively; otherwise pull in oxen-libquic on its own.
-if(NOT TARGET oxen::quic)
-    set(LIBQUIC_BUILD_TESTS OFF CACHE BOOL "")
-    sessiondep_or_submodule(liboxenquic 1.12.0 session-router/external/oxen-libquic oxen::quic)
 endif()
 
 if(NOT TARGET oxen::logging)
@@ -63,6 +49,47 @@ if(NOT TARGET oxen::logging)
         set(OXEN_LOGGING_FORCE_SUBMODULES ON)
     endif()
     include(session-router/external/oxen-libquic/external/oxen-logging/cmake/load.cmake)
+endif()
+
+# A system libsessionrouter-core is a shared library linked against the system libquic and
+# oxen-logging, so it is only usable when ours come from the system too.  A submodule copy of either
+# would be a second one in the process: two libquics interpose each other's symbols, and two
+# oxen-loggings keep separate logger registries, so session-router's logs would miss our sinks.
+#
+# oxen-logging is settled above, but libquic can't be looked up before session-router: the
+# session-router submodule resolves libquic itself (under the same DEPS_FORCE_* options) and fails if
+# oxen::quic already exists.  So this asks whether that lookup would come up with the system library.
+set(LIBQUIC_MIN_VERSION 1.14.1)
+set(sessionrouter_submodule_reason)
+if(NOT TARGET oxen-logging-system)
+    set(sessionrouter_submodule_reason "oxen-logging is not the system library")
+elseif(DEPS_FORCE_liboxenquic_SUBMODULE)
+    set(sessionrouter_submodule_reason "the libquic submodule is forced")
+else()
+    pkg_check_modules(system_liboxenquic QUIET liboxenquic>=${LIBQUIC_MIN_VERSION})
+    if(NOT system_liboxenquic_FOUND)
+        set(sessionrouter_submodule_reason "there is no system liboxenquic>=${LIBQUIC_MIN_VERSION}")
+    endif()
+endif()
+if(sessionrouter_submodule_reason)
+    message(STATUS "Not using a system session-router: ${sessionrouter_submodule_reason}")
+    set(DEPS_FORCE_libsessionrouter-core_SUBMODULE ON)
+endif()
+
+set(SROUTER_FULL OFF CACHE BOOL "")
+set(SROUTER_DAEMON OFF CACHE BOOL "")
+set(SROUTER_NATIVE_BUILD OFF CACHE BOOL "")
+set(SROUTER_JEMALLOC OFF CACHE BOOL "")
+
+# 1.1.1 is the first release with session::mlkem768 and installed headers.
+static_sessiondep_or_submodule(libsessionrouter-core 1.1.1 session-router session-router::core)
+libsession_static_bundle(session-router::core)
+
+# The session-router submodule has already provided oxen::quic; this is for a system session-router,
+# for which the check above has made sure this finds the system libquic.
+if(NOT TARGET oxen::quic)
+    set(LIBQUIC_BUILD_TESTS OFF CACHE BOOL "")
+    sessiondep_or_submodule(liboxenquic ${LIBQUIC_MIN_VERSION} session-router/external/oxen-libquic oxen::quic)
 endif()
 
 
@@ -104,29 +131,6 @@ sessiondep_or_submodule(protobuf-lite 3.21 protobuf protobuf::libprotobuf-lite)
 set(BUILD_STATIC_libzstd ON CACHE BOOL "" FORCE)
 session_dep(libzstd 1.5)
 libsession_static_bundle(sessiondep::libzstd)
-
-# TODO FIXME: integrate this with the updated networking PR, which will end up right about here when
-# merging.  This can basically just get deleted once we are always building session-router.
-if(NOT TARGET mlkem_native::mlkem768)
-    file(GLOB_RECURSE mlkem_sources
-        session-router/external/mlkem-native/mlkem/src/*.c
-        session-router/external/mlkem-native/mlkem/src/*.S)
-
-    add_library(mlkem_native768 STATIC ${mlkem_sources})
-
-    target_compile_definitions(mlkem_native768 PUBLIC
-        MLK_CONFIG_NO_RANDOMIZED_API
-        MLK_CONFIG_PARAMETER_SET=768
-        MLK_CONFIG_NAMESPACE_PREFIX=sr_mlkem768
-        MLK_CONFIG_NO_SUPERCOP
-        MLK_CONFIG_USE_NATIVE_BACKEND_ARITH
-        MLK_CONFIG_USE_NATIVE_BACKEND_FIPS202
-    )
-
-    target_include_directories(mlkem_native768 PUBLIC session-router/external/mlkem-native/mlkem)
-
-    add_library(mlkem_native::mlkem768 ALIAS mlkem_native768)
-endif()
 
 if(NOT TARGET nlohmann_json::nlohmann_json)
     set(JSON_BuildTests OFF CACHE INTERNAL "")

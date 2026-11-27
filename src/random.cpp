@@ -10,6 +10,16 @@
 #include "session/random.h"
 #include "session/util.hpp"
 
+namespace session {
+
+uint64_t CSRNG::operator()() const {
+    uint64_t i;
+    randombytes_buf(&i, sizeof(i));
+    return i;
+}
+
+}  // namespace session
+
 namespace session::random {
 
 void fill(std::span<std::byte> buf) {
