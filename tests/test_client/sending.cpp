@@ -110,24 +110,113 @@ TEST_CASE("Client: the application is told what changed", "[client][signals]") {
     sync(*c);
 
     auto convo = ConversationId::dm(sender.session_id);
-    CHECK(r.order == std::vector<std::string>{"added", "message", "updated"});
+    // The request list and not the conversation list: an inbound message from someone we have not
+    // written to is a request, and the two lists are complements, so only the one it sits in is
+    // stale.  A conversation-list replacement here would say something false about the other.
+    //
+    // The add comes with the flush, in place of the row's update: it carries the settled row and
+    // where it goes, so a separate update would say the same thing twice.
+    CHECK(r.order == std::vector<std::string>{"message", "added", "requests"});
+    REQUIRE(r.requests_replaced.size() == 1);
+    CHECK(r.replaced.empty());
 
     // Every handler is given the state itself, not something to go and look up.
     REQUIRE(r.added.size() == 1);
     CHECK(r.added[0].id() == convo);
+    CHECK(preview_body(r.added[0]) == "ping");
+    CHECK(r.added[0].unread() == 1);
     REQUIRE(r.msg_added.size() == 1);
     REQUIRE(r.msg_added[0].size() == 1);
     CHECK(r.msg_added[0][0].conversation == convo);
     CHECK(r.msg_added[0][0].body == "ping");
-    REQUIRE(r.updated.size() == 1);
-    CHECK(preview_body(r.updated[0]) == "ping");
-    CHECK(r.updated[0].unread() == 1);
+    CHECK(r.updated.empty());
 
-    // A second message on an existing conversation does not re-announce the conversation.
+    // A second message on an existing conversation does not re-announce the conversation, but the
+    // list is stale again -- the row's snippet changed, and the list is what carries it for a
+    // subscriber that holds no per-row handler.
     r.order.clear();
+    r.requests_replaced.clear();
     deliver(*c, sender, "pong", from_epoch_ms(2000), "h2");
     sync(*c);
-    CHECK(r.order == std::vector<std::string>{"message", "updated"});
+    CHECK(r.order == std::vector<std::string>{"message", "updated", "requests"});
+    CHECK(r.requests_replaced.size() == 1);
+    REQUIRE(r.updated.size() == 1);
+    CHECK(preview_body(r.updated.back()) == "pong");
+}
+
+TEST_CASE("Client: a subscriber that wants lists is sent them", "[client][signals]") {
+    SenderKeys a, b;
+    Recorder r;
+    // No order handlers, so the order events have nowhere to go and a whole list is the only way
+    // this subscriber can learn that one row now sits in front of another.
+    TempClient c{r.handlers()};
+    approve(*c, a.session_id);
+    approve(*c, b.session_id);
+    auto ida = ConversationId::dm(a.session_id);
+    auto idb = ConversationId::dm(b.session_id);
+
+    deliver(*c, a, "first", from_epoch_ms(1000), "h1");
+    deliver(*c, b, "second", from_epoch_ms(2000), "h2");
+    sync(*c);
+    r.order.clear();
+    r.replaced.clear();
+
+    deliver(*c, a, "third", from_epoch_ms(3000), "h3");
+    sync(*c);
+
+    CHECK(r.order == std::vector<std::string>{"message", "updated", "replaced"});
+    REQUIRE(r.replaced.size() == 1);
+    REQUIRE(r.replaced[0].size() == 2);
+    CHECK(r.replaced[0][0].id() == ida);
+    CHECK(r.replaced[0][1].id() == idb);
+}
+
+TEST_CASE("Client: a replacement is sent even when nothing moved", "[client][signals]") {
+    SenderKeys sender;
+    Recorder r;
+    TempClient c{r.handlers()};
+    approve(*c, sender.session_id);
+
+    deliver(*c, sender, "ping", from_epoch_ms(1000), "h1");
+    sync(*c);
+    r.order.clear();
+    r.replaced.clear();
+
+    // A second message to the only conversation moves nothing, so an order event would be
+    // suppressed -- but the snippet changed, and for this subscriber the list is the only thing
+    // carrying it.  Suppressing the list on an unchanged order would leave it showing "ping".
+    deliver(*c, sender, "pong", from_epoch_ms(2000), "h2");
+    sync(*c);
+
+    REQUIRE(r.replaced.size() == 1);
+    REQUIRE(r.replaced[0].size() == 1);
+    CHECK(preview_body(r.replaced[0][0]) == "pong");
+}
+
+TEST_CASE("Client: a change that moves nothing still replaces the list", "[client][signals]") {
+    SenderKeys sender;
+    Recorder r;
+    TempClient c{r.handlers()};
+    approve(*c, sender.session_id);
+    auto id = ConversationId::dm(sender.session_id);
+
+    deliver(*c, sender, "ping", from_epoch_ms(1000), "h1");
+    sync(*c);
+    REQUIRE(r.replaced.size() >= 1);
+    CHECK(r.replaced.back()[0].unread() == 1);
+    r.order.clear();
+    r.replaced.clear();
+
+    // Reading the conversation changes `unread_count` and moves nothing, so it never reaches
+    // `_dirty_order`.  For this subscriber the list is the only thing carrying the count, so
+    // driving the replacement off what *moved* rather than off what *changed* would leave it
+    // showing an unread conversation the user has just read.
+    c->conversation(id, await)->mark_read(await);
+    sync(*c);
+
+    REQUIRE(r.replaced.size() == 1);
+    REQUIRE(r.replaced[0].size() == 1);
+    CHECK(r.replaced[0][0].unread() == 0);
 }
 
 TEST_CASE(
@@ -168,12 +257,120 @@ TEST_CASE(
     });
     sync(*c);
 
-    // Five messages, but the conversation settles once rather than being rebuilt five times.
+    // Five messages, but the conversation settles once rather than being rebuilt five times: the
+    // batch made it, so that once is its add.
     CHECK(std::ranges::count(r.order, "message") == 5);
-    CHECK(std::ranges::count(r.order, "updated") == 1);
-    REQUIRE(r.updated.size() == 1);
-    CHECK(r.updated[0].unread() == 5);
-    CHECK(preview_body(r.updated[0]) == "m4");
+    CHECK(std::ranges::count(r.order, "added") == 1);
+    CHECK(std::ranges::count(r.order, "updated") == 0);
+    REQUIRE(r.added.size() == 1);
+    CHECK(r.added[0].unread() == 5);
+    CHECK(preview_body(r.added[0]) == "m4");
+}
+
+TEST_CASE("Client: an update says where its row was and now belongs", "[client][signals]") {
+    SenderKeys a, b;
+    Recorder r;
+    TempClient c{r.handlers()};
+    approve(*c, a.session_id);
+    approve(*c, b.session_id);
+    auto ida = ConversationId::dm(a.session_id);
+    auto idb = ConversationId::dm(b.session_id);
+
+    deliver(*c, a, "first", from_epoch_ms(1000), "h1");
+    sync(*c);
+
+    // The add says where it goes: nothing to remove, into the conversation list, and nothing above
+    // it -- which an unset anchor is what says.
+    REQUIRE(r.add_placements.size() == 1);
+    CHECK(r.add_placements[0].from == ConversationList::none);
+    CHECK(r.add_placements[0].to == ConversationList::conversations);
+    CHECK_FALSE(r.add_placements[0].after.has_value());
+    CHECK(r.placements.empty());
+
+    // Pinning a puts it above everything unpinned, so the next row to move sits after it rather
+    // than at the top -- which is the case an anchor exists to express and a bare "moved to front"
+    // could not.
+    c->conversation(ida, await)->set_priority(3, await);
+    sync(*c);
+    r.placements.clear();
+    r.updated.clear();
+
+    deliver(*c, b, "second", from_epoch_ms(2000), "h2");
+    sync(*c);
+
+    // b is new, so it is reported as added, after the pinned a.
+    REQUIRE(r.add_placements.size() == 2);
+    CHECK(r.add_placements[1].from == ConversationList::none);
+    CHECK(r.add_placements[1].to == ConversationList::conversations);
+    REQUIRE(r.add_placements[1].after.has_value());
+    CHECK(*r.add_placements[1].after == ida);
+    CHECK(r.added.back().id() == idb);
+}
+
+TEST_CASE("Client: a hidden row is given no position", "[client][signals]") {
+    SenderKeys sender;
+    Recorder r;
+    TempClient c{r.handlers()};
+    approve(*c, sender.session_id);
+    auto id = ConversationId::dm(sender.session_id);
+
+    deliver(*c, sender, "ping", from_epoch_ms(1000), "h1");
+    sync(*c);
+    c->conversation(id, await)->set_priority(-1, await);
+    sync(*c);
+    // The hide is itself a placement: out of the conversation list, into neither.
+    REQUIRE(r.placements.size() == 1);
+    CHECK(r.placements[0].from == ConversationList::conversations);
+    CHECK(r.placements[0].to == ConversationList::none);
+    r.placements.clear();
+
+    // Hidden is in neither list, so there is no gap to name.  Unset here means "do not place
+    // this", not "place it first" -- which is why the two are different states.
+    deliver(*c, sender, "pong", from_epoch_ms(2000), "h2");
+    sync(*c);
+
+    // Still in neither, and nothing to take it out of: the hide already did.
+    REQUIRE(r.placements.size() == 1);
+    CHECK(r.placements[0].from == ConversationList::none);
+    CHECK(r.placements[0].to == ConversationList::none);
+}
+
+TEST_CASE("Client: a request is placed in the request list", "[client][signals]") {
+    SenderKeys stranger;
+    Recorder r;
+    TempClient c{r.handlers()};
+
+    // Nobody approved: a stranger's first message is a request, so the position names that list.
+    deliver(*c, stranger, "hello", from_epoch_ms(1000), "h1");
+    sync(*c);
+
+    // The add places it in the request list; nothing held it before.
+    REQUIRE(r.add_placements.size() == 1);
+    CHECK(r.add_placements[0].from == ConversationList::none);
+    CHECK(r.add_placements[0].to == ConversationList::requests);
+    CHECK_FALSE(r.add_placements[0].after.has_value());
+}
+
+TEST_CASE("Client: a removal says which list to take it out of", "[client][signals]") {
+    SenderKeys sender;
+    Recorder r;
+    TempClient c{r.handlers()};
+    approve(*c, sender.session_id);
+    auto id = ConversationId::dm(sender.session_id);
+
+    deliver(*c, sender, "ping", from_epoch_ms(1000), "h1");
+    sync(*c);
+    r.order.clear();
+
+    // Deleting the contact removes the conversation row outright.  The list it was in has to come
+    // from what the subscriber was last told, not from the database -- by the time this is
+    // reported the row is already gone, so there is nothing left to look it up from.
+    c->dm(id, await)->delete_contact(await);
+
+    REQUIRE(r.removed.size() == 1);
+    CHECK(r.removed[0] == id);
+    REQUIRE(r.removed_from.size() == 1);
+    CHECK(r.removed_from[0] == ConversationList::conversations);
 }
 
 TEST_CASE("Client: state is committed before the handler fires", "[client][signals]") {
@@ -287,41 +484,57 @@ TEST_CASE("Client: priority orders the list and hides", "[client][convos]") {
     CHECK(ids() == std::vector{ida, idd, idb});
 }
 
-TEST_CASE("Client: a priority change replaces the whole list", "[client][signals]") {
+TEST_CASE("Client: a priority change is placed, and replaces the list", "[client][signals]") {
     SenderKeys a, b;
     Recorder r;
     TempClient c{r.handlers()};
     approve(*c, a.session_id);
     approve(*c, b.session_id);
+    auto ida = ConversationId::dm(a.session_id);
+    auto idb = ConversationId::dm(b.session_id);
 
     deliver(*c, a, "first", from_epoch_ms(1000), "h1");
     deliver(*c, b, "second", from_epoch_ms(2000), "h2");
     sync(*c);
-    r.order.clear();
-
-    c->conversation(ConversationId::dm(a.session_id), await)->set_priority(3, await);
-
-    // Reported as a replacement, not as an update to the one conversation whose priority changed:
-    // what moved is the list.  Both lists are replaced together, because hiding takes a
-    // conversation out of whichever one it was in and the caller does not have to work out which.
-    CHECK(r.order == std::vector<std::string>{"replaced", "requests"});
-    REQUIRE(r.replaced.size() == 1);
-    REQUIRE(r.replaced[0].size() == 2);
-    CHECK(r.replaced[0][0].id() == ConversationId::dm(a.session_id));
-    CHECK(r.replaced[0][0].priority() == 3);
-
-    // Hiding removes it from the replacement list, which is how a subscriber learns it is gone.
+    // Each delivery changed a row in the list, which reports the list, so what the setup sent is
+    // cleared along with the order.
     r.order.clear();
     r.replaced.clear();
-    c->conversation(ConversationId::dm(a.session_id), await)->set_priority(-1, await);
-    CHECK(r.order == std::vector<std::string>{"replaced", "requests"});
+    r.placements.clear();
+
+    c->conversation(ida, await)->set_priority(3, await);
+    sync(*c);
+
+    // The row whose priority changed, placed at the top, and then the list for a subscriber
+    // keeping whole lists.  The conversation list only: priority moves a row within the list it
+    // is in and never between the two, so the request list did not change and is not read.
+    CHECK(r.order == std::vector<std::string>{"updated", "replaced"});
+    REQUIRE(r.placements.size() == 1);
+    CHECK(r.placements[0].to == ConversationList::conversations);
+    CHECK_FALSE(r.placements[0].after.has_value());
+    REQUIRE(r.replaced.size() == 1);
+    REQUIRE(r.replaced[0].size() == 2);
+    CHECK(r.replaced[0][0].id() == ida);
+    CHECK(r.replaced[0][0].priority() == 3);
+
+    // Hiding places it in neither list and leaves it out of the replacement.
+    r.order.clear();
+    r.replaced.clear();
+    r.placements.clear();
+    c->conversation(ida, await)->set_priority(-1, await);
+    sync(*c);
+    CHECK(r.order == std::vector<std::string>{"updated", "replaced"});
+    REQUIRE(r.placements.size() == 1);
+    CHECK(r.placements[0].from == ConversationList::conversations);
+    CHECK(r.placements[0].to == ConversationList::none);
     REQUIRE(r.replaced.size() == 1);
     REQUIRE(r.replaced[0].size() == 1);
-    CHECK(r.replaced[0][0].id() == ConversationId::dm(b.session_id));
+    CHECK(r.replaced[0][0].id() == idb);
 
     // Setting the same value again changes nothing, so it says nothing.
     r.order.clear();
-    c->conversation(ConversationId::dm(a.session_id), await)->set_priority(-1, await);
+    c->conversation(ida, await)->set_priority(-1, await);
+    sync(*c);
     CHECK(r.order.empty());
 }
 

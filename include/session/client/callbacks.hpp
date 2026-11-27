@@ -11,6 +11,41 @@
 #include <vector>
 
 namespace session::client {
+/// Which of the two lists a conversation sits in.
+///
+/// `none` is a real answer rather than a missing one: a hidden conversation is in neither list, and
+/// so is one the subscriber has not been shown.
+enum class ConversationList {
+    none,
+    conversations,
+    requests,
+};
+
+/// Where a conversation was, and where it belongs now.
+///
+/// Enough to apply on its own, and it reads as the two steps it is:
+///
+///     if (p.from != ConversationList::none) remove(p.from, convo.id());
+///     if (p.to   != ConversationList::none) insert(p.to, std::move(convo), p.after);
+///
+/// `from` is the list the subscriber was last *told* this row was in, which is what it is holding
+/// rather than what the database now says. It saves searching the list the row did not come from;
+/// it does not save finding the row, which is a lookup by id either way.
+///
+/// The two lists are ordered differently -- conversations by `priority DESC, last_activity DESC,
+/// id` and requests by `last_activity DESC, id`, with no priority term -- so which list a position
+/// is in is part of the position rather than a detail.
+struct ListPlacement {
+    /// Where the subscriber is holding this row, so it knows which list to take it out of.
+    /// `none` when it is holding it nowhere: a row it has not been shown, or one that was hidden.
+    ConversationList from = ConversationList::none;
+    /// Where it belongs now.  `none` means neither list, which is what hiding does -- then it is
+    /// only removed.
+    ConversationList to = ConversationList::none;
+    /// The row it now follows in `to`; unset means first in that list.  Meaningless, and always
+    /// unset, when `to` is `none`.
+    std::optional<ConversationId> after;
+};
 
 /// Notifications of everything the conversation layer changes, so that an application never has to
 /// ask.  A caller sets the handlers it cares about and leaves the rest empty; an unset handler is
@@ -39,31 +74,67 @@ namespace session::client {
 /// is not a template on its argument — it is a promise by the caller that the object is spent
 /// afterwards.
 ///
-/// The conversation list an application maintains from these is expected to be *complete*: ordering
-/// is a comparison against every other conversation, so a partial list cannot be sorted.  Showing
-/// only part of it is fine, holding only part of it is not.
+/// **There are two independent ways to keep the conversation lists**, and a subscriber normally
+/// picks one:
+///
+/// - **Placements.**  Read each list once, with `conversations()` and `message_requests()`, then
+///   apply `conversation_added`, `conversation_updated` and `conversation_removed` in the order
+///   they arrive.  Every change to either list reaches one of those three -- a new message, a pin,
+///   a hide, an approval, a whole config merge from another device -- so they are complete on
+///   their own, and each costs an indexed seek.
+/// - **Whole lists.**  `conversation_list_replaced` and `request_list_replaced` re-send a list,
+///   ordered, whenever anything about it changes.  Simpler to keep, and dearer: every change reads
+///   the whole list again.  Nothing is read for a handler that is not registered, so a subscriber
+///   keeping placements pays nothing for these by leaving them unset.
+///
+/// Either way the list an application holds is expected to be *complete*: a placement names the
+/// row it follows, so a partial list has nowhere to put one.  Showing only part of it is fine,
+/// holding only part of it is not.
+///
+/// The order itself is **ours, not the application's**.  Every handler that carries a list carries
+/// it already ordered, and every placement says where its row goes, so an application never has
+/// to sort, and should not: the two lists are not sorted the same way and a comparator copied from
+/// one gets the other wrong.
 struct callbacks {
     /// A conversation now exists that did not before.
-    std::function<void(AnyConversation&&)> conversation_added;
+    ///
+    /// Carries where it belongs, on the same terms as `conversation_updated`: `from` is normally
+    /// `none`, since a row that did not exist was not being held anywhere.
+    std::function<void(AnyConversation&&, ListPlacement&&)> conversation_added;
 
     /// A conversation's contents changed: a new or edited message, a name, an unread count, its
     /// last activity.  Fired once with the conversation's settled state rather than once per
     /// underlying change, so a poll that delivers fifty messages to one conversation fires this
     /// once.
-    std::function<void(AnyConversation&&)> conversation_updated;
+    ///
+    /// The second argument says where the row was and where it belongs now, which is enough to
+    /// apply without consulting anything: remove it from `from`, insert it into `to`.
+    ///
+    /// **Applying these in order is what keeps a list correct.**  Each one places a row relative to
+    /// another, so one applied out of order, or skipped, leaves the list wrong with nothing to
+    /// detect it.  A subscriber that has not read the list once with `conversations()` has nothing
+    /// to place rows into.
+    ///
+    /// Several changed at once -- one poll, one config merge pinning and hiding several rows -- are
+    /// reported in the order of the lists they end up in, top to bottom, so each one's anchor has
+    /// already been placed or never moved.  A pin, unpin, hide or unhide is reported here like any
+    /// other change: a hidden row's `to` is `none`.
+    std::function<void(AnyConversation&&, ListPlacement&&)> conversation_updated;
 
-    /// A conversation is gone and should be dropped from the list.
-    std::function<void(ConversationId&&)> conversation_removed;
+    /// A conversation is gone and should be dropped from the list it is in, which is the second
+    /// argument -- `none` if it was never shown in one.  Saves searching both.
+    std::function<void(ConversationId&&, ConversationList)> conversation_removed;
 
-    /// Priorities changed — a pin, unpin, hide or unhide — carrying the whole list in its new
-    /// order.  A replacement rather than a description of what moved, because one config update
-    /// from another device can repin, reveal and hide arbitrarily many conversations at once, and
-    /// because a replacement cannot leave the application subtly out of step the way a missed
-    /// delta would.
+    /// The conversation list changed in any way -- a row's contents, its position, a row joining
+    /// or leaving -- carrying the whole list in its new order, once per batch of changes.
+    ///
+    /// The whole-list way to keep it, and an alternative to the placements above rather than a
+    /// supplement: a subscriber holding only this is correct, at the price of the list being read
+    /// on every change.  Left unset, it costs nothing.
     std::function<void(std::vector<AnyConversation>&&)> conversation_list_replaced;
 
-    /// The message requests changed, carrying the whole list of them, for the same reasons and with
-    /// the same guarantees as the above.
+    /// The message requests changed, carrying the whole list of them, on the same terms as the
+    /// above.
     ///
     /// The two lists are disjoint and a conversation moves between them, so approving one fires
     /// both: it left the requests and joined the conversations.  `conversation_added` and the rest
