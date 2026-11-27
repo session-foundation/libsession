@@ -25,6 +25,62 @@ TEST_CASE("Globals: set/get round-trip", "[core][globals]") {
     CHECK(!c->globals.get_integer("a_string"));
 }
 
+TEST_CASE("Globals: every public accessor round-trips an ordinary key", "[core][globals]") {
+    TempCore c{};
+    auto& g = c->globals;
+
+    const std::vector<std::byte> blob{
+            std::byte{0x00}, std::byte{0xff}, std::byte{0x42}, std::byte{0x05}};
+    auto secure_bytes = [](session::secure_buffer& sb) {
+        auto acc = sb.access();
+        return std::vector<std::byte>(acc.buf.begin(), acc.buf.end());
+    };
+
+    g.set("rt_int", int64_t{-42});
+    g.set("rt_real", 2.25);
+    g.set("rt_text", "hello"sv);
+    g.set("rt_blob", std::span<const std::byte>{blob});
+
+    CHECK(g.get_integer("rt_int") == -42);
+    CHECK(g.get_real("rt_real") == 2.25);
+    CHECK(g.get_text("rt_text") == "hello");
+    CHECK(g.get_blob("rt_blob") == blob);
+    auto secure = g.get_blob_secure("rt_blob");
+    REQUIRE(secure);
+    CHECK(secure_bytes(*secure) == blob);
+
+    std::array<std::byte, 4> exact{};
+    CHECK(g.get_blob_to("rt_blob", exact));
+    CHECK(std::vector<std::byte>(exact.begin(), exact.end()) == blob);
+    // A size mismatch is a miss, not a partial copy.
+    std::array<std::byte, 3> wrong_size{};
+    CHECK_FALSE(g.get_blob_to("rt_blob", wrong_size));
+
+    CHECK(std::get<int64_t>(g.get("rt_int")) == -42);
+    CHECK(std::get<double>(g.get("rt_real")) == 2.25);
+    CHECK(std::get<std::string>(g.get("rt_text")) == "hello");
+    CHECK(std::get<std::vector<std::byte>>(g.get("rt_blob")) == blob);
+    CHECK(std::holds_alternative<std::monostate>(g.get("rt_missing")));
+
+    CHECK(std::get<int64_t>(g.get_secure("rt_int")) == -42);
+    CHECK(std::get<double>(g.get_secure("rt_real")) == 2.25);
+    CHECK(std::get<std::string>(g.get_secure("rt_text")) == "hello");
+    auto any_secure = g.get_secure("rt_blob");
+    REQUIRE(std::holds_alternative<session::secure_buffer>(any_secure));
+    CHECK(secure_bytes(std::get<session::secure_buffer>(any_secure)) == blob);
+    CHECK(std::holds_alternative<std::monostate>(g.get_secure("rt_missing")));
+
+    // Each typed getter misses a value of any other type.
+    CHECK_FALSE(g.get_real("rt_int"));
+    CHECK_FALSE(g.get_text("rt_blob"));
+    CHECK_FALSE(g.get_blob("rt_text"));
+    CHECK_FALSE(g.get_blob_secure("rt_int"));
+    CHECK_FALSE(g.get_blob_to("rt_text", exact));
+
+    CHECK(g.erase("rt_blob"));
+    CHECK_FALSE(g.get_blob("rt_blob"));
+}
+
 TEST_CASE("Globals: erase", "[core][globals]") {
     TempCore c{};
 
