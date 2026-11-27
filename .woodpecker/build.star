@@ -168,8 +168,18 @@ def apt_install(image, pkgs, session_repo = True, foreign_arch = None, apt_sourc
         "eatmydata " + apt_get + " install --no-install-recommends -y " + " ".join(pkgs),
     ]
 
-def build_step(image, commands):
-    step = {"name": "build", "image": image, "commands": ['echo "Building on $${CI_MACHINE}"'] + commands}
+def build_step(image, commands, ccache_stats = True):
+    if ccache_stats:
+        commands = [
+            # The cache directory's own counters cover every build that has used it, so they say
+            # nothing about this job; a log of its own does.
+            'export CCACHE_STATSLOG="$(mktemp "$${TMPDIR:-/tmp}/ccache-stats.XXXXXX")"',
+        ] + commands + ["ccache --show-log-stats -v"]
+    step = {
+        "name": "build",
+        "image": image,
+        "commands": ['echo "Building on $${CI_MACHINE}"'] + commands,
+    }
     if image != "sh":
         step["pull"] = True
     return step
@@ -333,6 +343,13 @@ mac_setup = [
     # If you don't do this then the C compiler doesn't have an include path containing basic system
     # headers.  WTF apple:
     'export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"',
+    # The workspace is a new temporary directory for every job, so absolute paths in the compile
+    # commands would miss the cache on every run.  This runs at the top of the workspace, whose
+    # path compilers see in its /private/var form.  With -g, ccache also hashes the working
+    # directory, since it ends up in the debug info; not hashing it lets a hit carry an earlier
+    # job's directory there, which CI builds don't care about.
+    'export CCACHE_BASEDIR="$(pwd -P)"',
+    "export CCACHE_NOHASHDIR=1",
 ]
 
 def macos(name, arch, cmake = {}):
@@ -426,7 +443,7 @@ def main(ctx):
                 ". .venv/bin/activate",
                 "pip install -r requirements.txt",
                 "make build-all",
-            ]),
+            ], ccache_stats = False),
             upload_step(registry + "debian-stable", "cd docs/api && ../../utils/ci/docs-upload.sh"),
         ], when = [{"event": "push", "branch": "dev"}]),
 
