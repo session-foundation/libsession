@@ -2180,13 +2180,16 @@ namespace {
     }
 
     // Read points from ConvoInfoVolatile that were past READ_POINT_LEAD when taken, by session ID.
-    // Such a value stays in the config until some device publishes another, so held near our clock
-    // again at every reconcile, it would follow the clock forward and count each arrival read at
-    // the next read anywhere on the account.  It is taken once, and again only when it changes;
-    // the next time we publish that conversation's read state -- a read there, or the start of a
-    // Client, which publishes every conversation's -- ours goes over it (_sync_convo_volatile).
-    // Kept in the database because a Client does not last: the app on iOS rebuilds it whenever it
-    // comes back to the front.  Usually empty.
+    // Such a value stays in the config -- we publish the larger of ours and its -- so held near our
+    // clock again at every reconcile, it would follow the clock forward and count each arrival
+    // read at the next read anywhere on the account.  It is taken once, and again only when it
+    // changes.  Kept in the database because a Client does not last: the app on iOS rebuilds it
+    // whenever it comes back to the front.  Usually empty.
+    //
+    // While it is held, a read here does not reach another device that holds it back too: we
+    // still publish the larger value.  Publishing ours over it instead does not end the hold.  The
+    // device that set it cannot lower its own read point, so it publishes the value again, and
+    // this device would take it again as a new value, counting everything since as read.
     constexpr auto KEY_HELD_READ_POINTS = "client:held_read_points"sv;
 
     // One "<session id hex> <read point>" per line.
@@ -2205,10 +2208,6 @@ namespace {
                 held.emplace(line.substr(0, space), value);
         }
         return held;
-    }
-
-    std::unordered_map<std::string, int64_t> held_read_points(core::Globals& globals) {
-        return parse_held_read_points(globals.get_text(KEY_HELD_READ_POINTS).value_or(""));
     }
 
     std::string format_held_read_points(const std::unordered_map<std::string, int64_t>& held) {
@@ -3423,7 +3422,8 @@ void Client::_sync_all_contacts() {
 void Client::_reconcile_convo_volatile() {
     auto& volatiles = core.configs.convo_info_volatile();
 
-    auto held = held_read_points(core.globals);
+    auto held_text = core.globals.get_text(KEY_HELD_READ_POINTS);
+    auto held = parse_held_read_points(held_text.value_or(""));
     std::unordered_map<std::string, int64_t> still_held;
     const auto ceiling = read_point_ceiling();
 
@@ -3558,18 +3558,11 @@ void Client::_sync_convo_volatile(const ConversationId& id) {
     // Built on the entry that is there, which is what keeps the Pro fields alive: they are set from
     // a proof we verified rather than from any row here, so there is nothing to re-derive them
     // from.
-    auto hex = oxenc::to_hex(id.session_id());
-    auto entry = volatiles.get_or_construct_1to1(hex);
+    auto entry = volatiles.get_or_construct_1to1(oxenc::to_hex(id.session_id()));
 
     // Forwards only here too, and for the same reason as the merge: our value can be the stale one,
-    // and publishing it would tell every other device to unread what it has read.  Except over a
-    // read point we hold back (see KEY_HELD_READ_POINTS): kept, it would stay the larger, and no
-    // read here would reach another device that holds it back too.  Ours replaces it, which ends
-    // the hold everywhere.
-    auto held = held_read_points(core.globals);
-    auto was_held = held.find(hex);
-    bool replace = was_held != held.end() && was_held->second == entry.last_read;
-    entry.last_read = replace ? last_read : std::max(entry.last_read, last_read);
+    // and publishing it would tell every other device to unread what it has read.
+    entry.last_read = std::max(entry.last_read, last_read);
     entry.unread = marked_unread != 0;
     volatiles.set(entry);
 }
