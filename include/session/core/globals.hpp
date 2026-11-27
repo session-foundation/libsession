@@ -32,9 +32,9 @@ struct no_account : std::logic_error {
 
 /// Thrown by Globals::seed_mnemonic() once Globals::hide_seed() has been called on this device.
 /// Check Globals::seed_hidden() first to avoid it.
-struct seed_hidden_error : std::logic_error {
+struct seed_hidden_error : std::runtime_error {
     seed_hidden_error() :
-            std::logic_error{
+            std::runtime_error{
                     "The recovery password has been hidden on this device and cannot be "
                     "retrieved"} {}
 };
