@@ -149,11 +149,6 @@ class MockNetwork : public network::Network {
     }
 };
 
-/// Gives `core` a fresh MockNetwork and hands back a non-owning pointer to it.  A Core owns its
-/// Network outright -- nothing else may hold it alive -- so a test that goes on poking at the mock
-/// keeps a raw pointer rather than a second reference.
-///
-/// `config` for a test that depends on how the network is configured -- which router it uses, say.
 /// Answers one captured download with `data`, delivered in chunks as a transport would rather than
 /// in one piece -- a decryptor that only works when handed the whole file at once is a bug this is
 /// meant to catch -- and stops the moment its caller asks it to, as a router does.  Returns how
@@ -629,8 +624,14 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
     }
 };
 
-/// Attaches a MockNetwork, without the poll attaching one would otherwise start: a test that uses
-/// this drives each poll itself and counts what was sent.
+/// Gives `core` a fresh MockNetwork and hands back a non-owning pointer to it.  A Core owns its
+/// Network outright -- nothing else may hold it alive -- so a test that goes on poking at the mock
+/// keeps a raw pointer rather than a second reference.
+///
+/// Unlike attaching a network any other way, this does not start a poll at once: a test that uses
+/// it drives each poll itself and counts what was sent.
+///
+/// `config` for a test that depends on how the network is configured -- which router it uses, say.
 inline MockNetwork* attach_mock_network(core::Core& core, network::config::Config config = {}) {
     auto net = std::make_unique<MockNetwork>(std::move(config));
     auto* raw = net.get();
