@@ -1,4 +1,4 @@
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <oxenc/hex.h>
 #include <session/config/groups/keys.h>
 #include <sodium/crypto_sign_ed25519.h>

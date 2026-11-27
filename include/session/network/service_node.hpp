@@ -4,7 +4,8 @@
 #include <oxenc/hex.h>
 
 #include <nlohmann/json.hpp>
-#include <oxen/quic.hpp>
+#include <oxen/quic/address.hpp>
+#include <oxen/quic/ip.hpp>
 
 #include "session/network/service_node.h"
 #include "session/network/swarm.hpp"
