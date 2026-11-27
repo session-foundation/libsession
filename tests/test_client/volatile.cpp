@@ -223,3 +223,34 @@ TEST_CASE(
     }));
     CHECK(c->conversation(id, await)->unread() == 0);
 }
+
+TEST_CASE(
+        "Client: a read here replaces a far-ahead read point held from another device",
+        "[client][volatile]") {
+    TempClient c;
+    SenderKeys them;
+    auto id = ConversationId::dm(them.session_id);
+    auto hex = oxenc::to_hex(them.session_id);
+    approve(*c, them.session_id);
+    deliver(*c, them, "one", recently(10s), "h1");
+
+    auto ahead = (clock_now_ms() + 30 * 24h).time_since_epoch().count();
+    merge_volatile(*c.client, volatile_from_another_device(*c.client, [&](auto& theirs) {
+        auto e = theirs.get_or_construct_1to1(hex);
+        e.last_read = ahead;
+        theirs.set(e);
+    }));
+
+    ScopedClockOffset later{AdjustedClock::get_offset() + 1h};
+    deliver(*c, them, "an hour on", clock_now_ms(), "h2");
+    REQUIRE(c->conversation(id, await)->unread() == 1);
+
+    // Publishing the larger of the two would leave the held value in place, and this read would
+    // reach no other device that holds it back.  Ours replaces it.
+    c->conversation(id, await)->mark_read(await);
+    CHECK(c->conversation(id, await)->unread() == 0);
+    auto entry = in_configs(*c, [&](auto& cfg) { return cfg.convo_info_volatile().get_1to1(hex); });
+    REQUIRE(entry);
+    CHECK(entry->last_read < ahead);
+    CHECK(entry->last_read <= (clock_now_ms() + 5min).time_since_epoch().count());
+}
