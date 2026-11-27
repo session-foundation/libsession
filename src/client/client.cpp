@@ -2183,9 +2183,10 @@ namespace {
     // Such a value stays in the config until some device publishes another, so held near our clock
     // again at every reconcile, it would follow the clock forward and count each arrival read at
     // the next read anywhere on the account.  It is taken once, and again only when it changes;
-    // our next read in that conversation publishes ours over it (_sync_convo_volatile).  Kept in
-    // the database because a Client does not last: the app on iOS rebuilds it whenever it comes
-    // back to the front.  Usually empty.
+    // the next time we publish that conversation's read state -- a read there, or the start of a
+    // Client, which publishes every conversation's -- ours goes over it (_sync_convo_volatile).
+    // Kept in the database because a Client does not last: the app on iOS rebuilds it whenever it
+    // comes back to the front.  Usually empty.
     constexpr auto KEY_HELD_READ_POINTS = "client:held_read_points"sv;
 
     // One "<session id hex> <read point>" per line.
