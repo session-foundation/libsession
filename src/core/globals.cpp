@@ -75,7 +75,7 @@ static auto get_variant_impl(sqlite::Connection&& c, std::string_view key, BlobL
     if (st->executeStep()) {
         auto val = st->getColumn(0);
         auto type = static_cast<std::string>(st->getColumn(1));
-        if (type == "int")
+        if (type == "integer")
             result.template emplace<int64_t>(std::move(val));
         else if (type == "text")
             result.template emplace<std::string>(std::move(val));
