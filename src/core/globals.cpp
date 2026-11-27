@@ -22,31 +22,16 @@ using namespace std::literals;
 
 static const std::string GET_ONE = "SELECT value FROM globals WHERE key = ? AND typeof(value) = ?"s;
 
-// The public accessors' guard: keys beginning with an underscore are libsession's own, and include
-// the account seed and the flag that hides it.
-static void require_public_key(std::string_view key) {
-    if (key.starts_with('_'))
-        throw std::invalid_argument{
-                "globals keys beginning with '_' are reserved for libsession: {}"_format(key)};
-}
-
 std::optional<int64_t> Globals::_get_integer(std::string_view key) {
     return conn().prepared_maybe_get<int64_t>(GET_ONE, key, "integer");
 }
-std::optional<int64_t> Globals::get_integer(std::string_view key) {
-    require_public_key(key);
-    return _get_integer(key);
-}
-std::optional<double> Globals::get_real(std::string_view key) {
-    require_public_key(key);
+std::optional<double> Globals::_get_real(std::string_view key) {
     return conn().prepared_maybe_get<double>(GET_ONE, key, "real");
 }
-std::optional<std::string> Globals::get_text(std::string_view key) {
-    require_public_key(key);
+std::optional<std::string> Globals::_get_text(std::string_view key) {
     return conn().prepared_maybe_get<std::string>(GET_ONE, key, "text");
 }
-std::optional<std::vector<std::byte>> Globals::get_blob(std::string_view key) {
-    require_public_key(key);
+std::optional<std::vector<std::byte>> Globals::_get_blob(std::string_view key) {
     std::optional<std::vector<std::byte>> result;
     auto c = conn();
     auto st = c.prepared_bind(GET_ONE, key, "blob");
@@ -57,18 +42,13 @@ std::optional<std::vector<std::byte>> Globals::get_blob(std::string_view key) {
     }
     return result;
 }
-std::optional<session::secure_buffer> Globals::get_blob_secure(std::string_view key) {
-    require_public_key(key);
+std::optional<session::secure_buffer> Globals::_get_blob_secure(std::string_view key) {
     std::optional<secure_buffer> result;
     auto c = conn();
     auto st = c.prepared_bind(GET_ONE, key, "blob");
     if (st->executeStep())
         result.emplace(sqlite::get<sqlite::blob>(st));
     return result;
-}
-bool Globals::get_blob_to(std::string_view key, std::span<std::byte> to) {
-    require_public_key(key);
-    return _get_blob_to(key, to);
 }
 bool Globals::_get_blob_to(std::string_view key, std::span<std::byte> to) {
     auto c = conn();
@@ -108,9 +88,8 @@ static auto get_variant_impl(sqlite::Connection&& c, std::string_view key, BlobL
     return result;
 }
 
-std::variant<std::monostate, int64_t, double, std::string, std::vector<std::byte>> Globals::get(
+std::variant<std::monostate, int64_t, double, std::string, std::vector<std::byte>> Globals::_get(
         std::string_view key) {
-    require_public_key(key);
     return get_variant_impl(conn(), key, [](sqlite::blob data) {
         std::vector<std::byte> v;
         v.reserve(data.size());
@@ -118,10 +97,8 @@ std::variant<std::monostate, int64_t, double, std::string, std::vector<std::byte
         return v;
     });
 }
-
 std::variant<std::monostate, int64_t, double, std::string, session::secure_buffer>
-Globals::get_secure(std::string_view key) {
-    require_public_key(key);
+Globals::_get_secure(std::string_view key) {
     return get_variant_impl(conn(), key, [](sqlite::blob data) { return secure_buffer{data}; });
 }
 
@@ -132,29 +109,68 @@ static const std::string SET_VAL =
 void Globals::_set(std::string_view key, int64_t integer) {
     conn().prepared_exec(SET_VAL, key, integer);
 }
+void Globals::_set(std::string_view key, double real) {
+    conn().prepared_exec(SET_VAL, key, real);
+}
+void Globals::_set(std::string_view key, std::string_view text) {
+    conn().prepared_exec(SET_VAL, key, text);
+}
 void Globals::_set(std::string_view key, std::span<const std::byte> blob) {
     conn().prepared_exec(SET_VAL, key, blob);
 }
-void Globals::set(std::string_view key, int64_t integer) {
-    require_public_key(key);
-    _set(key, integer);
-}
-void Globals::set(std::string_view key, double real) {
-    require_public_key(key);
-    conn().prepared_exec(SET_VAL, key, real);
-}
-void Globals::set(std::string_view key, std::string_view text) {
-    require_public_key(key);
-    conn().prepared_exec(SET_VAL, key, text);
-}
-void Globals::set(std::string_view key, std::span<const std::byte> blob) {
-    require_public_key(key);
-    _set(key, blob);
+
+bool Globals::_erase(std::string_view key) {
+    return conn().prepared_exec("DELETE FROM globals WHERE key = ?"s, key) > 0;
 }
 
+// Keys beginning with an underscore are libsession's own: the account seed and the flag hiding it.
+static std::string_view public_field(std::string_view key) {
+    if (!key.starts_with('_'))
+        return key;
+    throw std::invalid_argument{
+            "globals keys beginning with '_' are reserved for libsession: {}"_format(key)};
+}
+
+std::optional<int64_t> Globals::get_integer(std::string_view key) {
+    return _get_integer(public_field(key));
+}
+std::optional<double> Globals::get_real(std::string_view key) {
+    return _get_real(public_field(key));
+}
+std::optional<std::string> Globals::get_text(std::string_view key) {
+    return _get_text(public_field(key));
+}
+std::optional<std::vector<std::byte>> Globals::get_blob(std::string_view key) {
+    return _get_blob(public_field(key));
+}
+std::optional<session::secure_buffer> Globals::get_blob_secure(std::string_view key) {
+    return _get_blob_secure(public_field(key));
+}
+bool Globals::get_blob_to(std::string_view key, std::span<std::byte> to) {
+    return _get_blob_to(public_field(key), to);
+}
+std::variant<std::monostate, int64_t, double, std::string, std::vector<std::byte>> Globals::get(
+        std::string_view key) {
+    return _get(public_field(key));
+}
+std::variant<std::monostate, int64_t, double, std::string, session::secure_buffer>
+Globals::get_secure(std::string_view key) {
+    return _get_secure(public_field(key));
+}
+void Globals::set(std::string_view key, int64_t integer) {
+    _set(public_field(key), integer);
+}
+void Globals::set(std::string_view key, double real) {
+    _set(public_field(key), real);
+}
+void Globals::set(std::string_view key, std::string_view text) {
+    _set(public_field(key), text);
+}
+void Globals::set(std::string_view key, std::span<const std::byte> blob) {
+    _set(public_field(key), blob);
+}
 bool Globals::erase(std::string_view key) {
-    require_public_key(key);
-    return conn().prepared_exec("DELETE FROM globals WHERE key = ?"s, key) > 0;
+    return _erase(public_field(key));
 }
 
 void Globals::_adopt_seed(const cleared_b32& seed, bool persist) {

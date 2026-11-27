@@ -20,18 +20,6 @@ class Core;
 // Defined in core.hpp, which includes this header; only referenced here as a parameter type.
 struct predefined_seed;
 
-// Core component contains one-off global values that don't make sense storing in a table, typically
-// because the value is highly special purpose or is only used in one single place.  If you ever
-// find yourself wanting to put multiple values in here under the same key, that is a sign that you
-// should not be using this class and should instead refactor to use proper table relations.
-//
-// A note on keys: to avoid conflicts, external users of these globals should use prefix names that
-// are unlikely to conflict with other uses.  For example, "session_ios_dark_mode" is a decent name,
-// but "pubkey" is a terrible one.  All internal libsession keys in this table begin with an
-// underscore, and the public accessors below refuse them, throwing std::invalid_argument: they
-// hold the account seed and the flag hide_seed() sets, which nothing outside libsession may read
-// or change.
-//
 /// Thrown when something requiring the account's identity is used before there is one.  Only
 /// reachable when the Core was constructed with defer_account: without it, construction either
 /// finds a seed, is given one, or generates one.
@@ -51,6 +39,17 @@ struct seed_hidden_error : std::logic_error {
                     "retrieved"} {}
 };
 
+// Core component contains one-off global values that don't make sense storing in a table, typically
+// because the value is highly special purpose or is only used in one single place.  If you ever
+// find yourself wanting to put multiple values in here under the same key, that is a sign that you
+// should not be using this class and should instead refactor to use proper table relations.
+//
+// A note on keys: to avoid conflicts, external users of these globals should use prefix names that
+// are unlikely to conflict with other uses.  For example, "session_ios_dark_mode" is a decent name,
+// but "pubkey" is a terrible one.  All internal libsession keys in this table begin with an
+// underscore, and the public accessors below refuse them, throwing std::invalid_argument: they
+// hold the account seed and the flag hide_seed() sets, which nothing outside libsession may read
+// or change.
 class Globals final : detail::CoreComponent {
 
   private:
@@ -98,11 +97,24 @@ class Globals final : detail::CoreComponent {
     void _create_account();
     void _restore_account(const predefined_seed& seed);
 
-    // The accessors libsession's own underscore keys go through: the public ones refuse those keys.
+    // The unchecked counterparts of the public accessors, which do the work for them once they have
+    // refused a reserved key.  libsession's own reads and writes of its underscore keys come here
+    // directly, since the public accessors would refuse them.
     std::optional<int64_t> _get_integer(std::string_view key);
+    std::optional<double> _get_real(std::string_view key);
+    std::optional<std::string> _get_text(std::string_view key);
+    std::optional<std::vector<std::byte>> _get_blob(std::string_view key);
+    std::optional<session::secure_buffer> _get_blob_secure(std::string_view key);
     bool _get_blob_to(std::string_view key, std::span<std::byte> to);
+    std::variant<std::monostate, int64_t, double, std::string, std::vector<std::byte>> _get(
+            std::string_view key);
+    std::variant<std::monostate, int64_t, double, std::string, session::secure_buffer> _get_secure(
+            std::string_view key);
     void _set(std::string_view key, int64_t integer);
+    void _set(std::string_view key, double real);
+    void _set(std::string_view key, std::string_view text);
     void _set(std::string_view key, std::span<const std::byte> blob);
+    bool _erase(std::string_view key);
 
   public:
     /// Whether this account has an identity yet.
@@ -159,10 +171,7 @@ class Globals final : detail::CoreComponent {
     std::optional<double> get_real(std::string_view key);
     std::optional<std::string> get_text(std::string_view key);
     std::optional<std::vector<std::byte>> get_blob(std::string_view key);
-    // Same as get_blob, but allocates a libsodium secure buffer to old the value.
-    //
-    // Do not use this to access the "seed" value: that value is cached in the Core object and
-    // accessible via CoreComponent::access_seed().
+    // Same as get_blob, but allocates a libsodium secure buffer to hold the value.
     std::optional<session::secure_buffer> get_blob_secure(std::string_view key);
     // Reads a fixed size blob into `to`.  If the database does not contain a BLOB value of byte
     // length `to.size()`, returns false; other writes the blob value to `to` and returns true.
