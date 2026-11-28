@@ -1,9 +1,6 @@
 [submodule "tests/Catch2"]
 	path = tests/Catch2
 	url = https://github.com/catchorg/Catch2
-[submodule "external/ios-cmake"]
-	path = external/ios-cmake
-	url = https://github.com/leetal/ios-cmake
 [submodule "external/protobuf"]
 	path = external/protobuf
 	url = https://github.com/protocolbuffers/protobuf.git

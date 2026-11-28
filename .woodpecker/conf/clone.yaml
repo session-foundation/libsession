@@ -4,12 +4,13 @@
 submodules:
   # No CI build configures these.
   skip:
-    - /cmake/session-deps/external/ios-cmake
     - /external/**/Catch2
+    # Anchored at /external/ because cmake/session-deps/external/ios-cmake is the copy utils/ios.sh
+    # loads.
+    - /external/**/ios-cmake
     - googletest
     - /external/protobuf/third_party/benchmark
     - /external/session-router/gui
-    - /external/session-router/external/oxen-libquic/cmake/session-deps/external/ios-cmake
     - /external/session-router/external/oxen-libquic/tests/CLI11
     # Not oxen-mq itself, pybind11 or sqlite_orm: session-router's external/CMakeLists.txt runs
     # check_submodule() on them unconditionally.

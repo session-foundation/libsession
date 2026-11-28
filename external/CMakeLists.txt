@@ -1,7 +1,6 @@
 include(../cmake/session-deps/Deps.cmake)
 
 message(STATUS "Checking submodules")
-check_submodule(ios-cmake)
 check_submodule(session-router external/nlohmann external/oxen-libquic)
 # check_submodule's extra arguments are resolved as gitlinks of the first argument's repo, and it
 # only recurses one level, so anything deeper needs its own call rooted at the repo that records it:
