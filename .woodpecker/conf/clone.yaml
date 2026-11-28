@@ -12,7 +12,6 @@ submodules:
     - /external/protobuf/third_party/benchmark
     - /external/session-router/gui
     - /external/session-router/external/oxen-libquic/tests/CLI11
-    # Not oxen-mq itself, pybind11 or sqlite_orm: session-router's external/CMakeLists.txt runs
-    # check_submodule() on them unconditionally.
-    - /external/session-router/external/oxen-mq/cppzmq
-    - /external/session-router/external/oxen-mq/oxen-*
+    - /external/session-router/external/oxen-mq
+    - /external/session-router/external/pybind11
+    - /external/session-router/external/sqlite_orm
