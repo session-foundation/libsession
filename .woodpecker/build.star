@@ -109,10 +109,10 @@ schema_history = {
     "commands": ["tests/schema_history_check.sh build/tests/schema-upgrade-check"],
 }
 
-def workflow(name, platform, steps, when = None, clone_settings = None):
+def workflow(name, platform, steps, when = None, clone_settings = None, labels = {}):
     wf = {
         "name": name,
-        "labels": {"platform": platform, "backend": "local" if platform.startswith("darwin/") else "docker"},
+        "labels": {"platform": platform, "backend": "local" if platform.startswith("darwin/") else "docker"} | labels,
         # The debian/* and ubuntu/* branches build packages, with CI configs of their own.
         "when": when or [{"event": events, "branch": {"exclude": ["debian/*", "ubuntu/*"]}}],
         "steps": steps,
@@ -308,7 +308,16 @@ def full_llvm(version, cxx = None, distro = "Debian sid", image = "debian-sid-cl
     )
 
 # Release archives: built by `commands` and uploaded from `directory`, where they leave the archive.
-def package(name, image, commands, directory, arch = "amd64", deps = gcc_deps, session_repo = False, meson = None):
+def package(
+        name,
+        image,
+        commands,
+        directory,
+        arch = "amd64",
+        deps = gcc_deps,
+        session_repo = False,
+        meson = None,
+        labels = {}):
     image = registry + image
     m = meson_tools(meson)
     return workflow(name, "linux/" + arch, [
@@ -319,9 +328,9 @@ def package(name, image, commands, directory, arch = "amd64", deps = gcc_deps, s
             ["export JOBS=6"] + commands,
         ),
         upload_step(image, "cd %s && ../utils/ci/static-upload.sh" % directory),
-    ])
+    ], labels = labels)
 
-def static_linux(name, image, archive, arch = "amd64", deps = gcc_deps, cmake = {}):
+def static_linux(name, image, archive, arch = "amd64", deps = gcc_deps, cmake = {}, labels = {}):
     opts = {"STATIC_LIBSTD": True}
     opts.update(cmake)
     opts["LOCAL_MIRROR"] = default_cmake["LOCAL_MIRROR"]
@@ -332,7 +341,11 @@ def static_linux(name, image, archive, arch = "amd64", deps = gcc_deps, cmake = 
         "build",
         arch = arch,
         deps = deps,
+        labels = labels,
     )
+
+# The label the Raspberry Pi 5 agents carry, which the Pi 4s do not.
+pi5 = {"mem8": "yes"}
 
 mac_setup = [
     # If you don't do this then the C compiler doesn't have an include path containing basic system
@@ -522,12 +535,21 @@ def main(ctx):
 
         static_linux("Static Linux: amd64", "debian-stable", "libsession-util-linux-amd64-TAG.tar.xz"),
         static_linux("Static Linux: i386", "debian-stable/i386", "libsession-util-linux-i386-TAG.tar.xz"),
-        static_linux("Static Linux: arm64", "debian-stable", "libsession-util-linux-arm64-TAG.tar.xz", arch = "arm64"),
+        # The slowest jobs in the pipeline, which a Pi 5 builds about three times faster than a
+        # Pi 4: waiting for a Pi 5 to come free finishes sooner than starting at once on a Pi 4.
+        static_linux(
+            "Static Linux: arm64",
+            "debian-stable",
+            "libsession-util-linux-arm64-TAG.tar.xz",
+            arch = "arm64",
+            labels = pi5,
+        ),
         static_linux(
             "Static Linux: armhf",
             "debian-stable/arm32v7",
             "libsession-util-linux-armhf-TAG.tar.xz",
             arch = "arm64",
+            labels = pi5,
         ),
         static_linux(
             "Static Windows x64",

@@ -174,7 +174,7 @@ bool Globals::erase(std::string_view key) {
 }
 
 void Globals::_adopt_seed(const cleared_b32& seed, bool persist) {
-    // Everything below this line is cached state that Core's loop reads while polling, rewritten
+    // Everything below this line is cached state that Core's loop reads while receiving, rewritten
     // in place: the secure buffer reallocates and `_session_id_hex` is reassigned.  Reached from
     // init() during construction, which on_loop() excuses, and otherwise only from the two public
     // account methods.
@@ -228,7 +228,7 @@ void Globals::init() {
     } else {
         // defer_account, and nothing stored: the application chooses an identity before this
         // account can do anything.  Nothing else in Core needs the seed at init time -- Devices
-        // only stores its own device id, and polling does not start until a network is attached.
+        // only stores its own device id, and receiving does not start until a network is attached.
         log::info(cat, "Opened with no account; awaiting create_account() or restore_account()");
     }
 

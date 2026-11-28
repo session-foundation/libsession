@@ -137,7 +137,7 @@ TEST_CASE(
     Recorder r;
     TempClient c{r.handlers()};
 
-    // One delivery carrying several messages, as a swarm poll produces.
+    // One delivery carrying several messages, as a retrieve produces.
     std::vector<std::string> encoded;
     for (int i = 0; i < 5; i++) {
         SessionProtos::Content content;
@@ -388,10 +388,10 @@ TEST_CASE("Client: sending to ourselves stores once", "[client][send]") {
     CHECK(c->message(id, await)->hash == store_hash_for(oxenc::to_hex(me)));
     CHECK(c->conversation(ConversationId::dm(me), await)->messages(await).size() == 1);
 
-    // ...and when our own swarm hands it straight back on the next poll, which is what note to self
-    // does, it must recognise its own message rather than storing a second copy.  What makes that
-    // work is the msgid: the copy coming back carries the one we generated when sending, which is
-    // exactly what a hash of the two copies could not do.
+    // ...and when our own swarm hands it straight back on the next retrieve, which is what note to
+    // self does, it must recognise its own message rather than storing a second copy.  What makes
+    // that work is the msgid: the copy coming back carries the one we generated when sending, which
+    // is exactly what a hash of the two copies could not do.
     auto ts = c->message(id, await)->timestamp;
     auto msgid = c->core.loop().call_get([&] {
         return c->core.database().conn().prepared_get<int64_t>(

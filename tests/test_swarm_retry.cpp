@@ -10,8 +10,8 @@ using namespace std::literals;
 
 // Re-aiming a swarm request is Core's, not Network's: only Core can know whether being answered by
 // a different member matters to it, and a substitution made below Core is invisible to the
-// bookkeeping that depends on it.  These drive it through the poll, which is a real caller rather
-// than a harness, so what is asserted is the behaviour a caller actually gets.
+// bookkeeping that depends on it.  These drive it through the retrieve, which is a real caller
+// rather than a harness, so what is asserted is the behaviour a caller actually gets.
 
 namespace {
 
@@ -45,7 +45,7 @@ bool all_distinct(std::vector<ed25519_pubkey> keys) {
     return std::ranges::adjacent_find(keys) == keys.end();
 }
 
-/// A batch response that says nothing was found, so a poll treats the member as drained.
+/// A batch response that says nothing was found, so a retrieve treats the member as drained.
 std::string empty_batch(const Request& req) {
     auto batch = parse_json(*req.body);
     auto results = nlohmann::json::array();
@@ -54,22 +54,22 @@ std::string empty_batch(const Request& req) {
     return nlohmann::json{{"results", std::move(results)}}.dump();
 }
 
-struct PollFixture {
+struct RetrieveFixture {
     TempCore core;
     MockNetwork* net;
 
-    explicit PollFixture(size_t members) : net{attach_mock_network(*core)} {
+    explicit RetrieveFixture(size_t members) : net{attach_mock_network(*core)} {
         for (size_t i = 0; i < members; i++)
             net->current_swarm.push_back(node_at(static_cast<uint8_t>(i + 1)));
     }
 
-    void poll() { TestHelper::poll(*core); }
+    void retrieve() { TestHelper::start_receiving(*core); }
 };
 
 }  // namespace
 
 TEST_CASE("Core: an unreachable member moves the request to the next one", "[core][swarm]") {
-    PollFixture f{4};
+    RetrieveFixture f{4};
 
     // Only one member is reachable; the rest have no relay contact, which is what session routing
     // reports as an invalid destination rather than as a failure of the request.
@@ -80,7 +80,7 @@ TEST_CASE("Core: an unreachable member moves the request to the next one", "[cor
         return MockNetwork::Reply{false, false, ERROR_INVALID_DESTINATION, "unreachable"};
     };
 
-    f.poll();
+    f.retrieve();
 
     // It reached the one that works, spending no member twice on the way.  Which it tried first is
     // deliberately not asserted: get_swarm shuffles, so the order is not fixed.
@@ -92,13 +92,13 @@ TEST_CASE("Core: an unreachable member moves the request to the next one", "[cor
 }
 
 TEST_CASE("Core: running out of members ends the walk", "[core][swarm]") {
-    PollFixture f{3};
+    RetrieveFixture f{3};
 
     f.net->auto_reply = [](const Request&) -> std::optional<MockNetwork::Reply> {
         return MockNetwork::Reply{false, false, ERROR_INVALID_DESTINATION, "unreachable"};
     };
 
-    f.poll();
+    f.retrieve();
 
     // Every member tried, once each: it ends when selection has nothing left rather than at a
     // fixed count, and never revisits one already spent.
@@ -110,7 +110,7 @@ TEST_CASE("Core: running out of members ends the walk", "[core][swarm]") {
 TEST_CASE(
         "Core: a failure that is not the member's fault is not retried elsewhere",
         "[core][swarm]") {
-    PollFixture f{3};
+    RetrieveFixture f{3};
 
     // A 500 says the request was carried and the server disliked it.  Asking a different member of
     // the same swarm the same question gets the same answer, so this is not what the walk is for.
@@ -118,13 +118,13 @@ TEST_CASE(
         return MockNetwork::Reply{false, false, 500, "nope"};
     };
 
-    f.poll();
+    f.retrieve();
 
     CHECK(tried(*f.net).size() == 1);
 }
 
 TEST_CASE("Core: a misdirected request is re-aimed at another member", "[core][swarm]") {
-    PollFixture f{3};
+    RetrieveFixture f{3};
 
     // A 421 says this member does not hold the account.  Unlike an unreachable member it says our
     // swarm information was wrong, so Core re-resolves rather than merely stepping along -- but
@@ -136,7 +136,7 @@ TEST_CASE("Core: a misdirected request is re-aimed at another member", "[core][s
         return MockNetwork::Reply{true, false, 200, empty_batch(req)};
     };
 
-    f.poll();
+    f.retrieve();
 
     auto attempts = tried(*f.net);
     REQUIRE(attempts.size() >= 1);
@@ -147,7 +147,7 @@ TEST_CASE("Core: a misdirected request is re-aimed at another member", "[core][s
 }
 
 TEST_CASE("Core: redirects are bounded", "[core][swarm]") {
-    PollFixture f{3};
+    RetrieveFixture f{3};
 
     // Every member insists the account is not theirs.  Re-resolving cannot help -- the corrected
     // swarm is the one now rejecting us -- so this has to stop rather than loop.
@@ -155,7 +155,7 @@ TEST_CASE("Core: redirects are bounded", "[core][swarm]") {
         return MockNetwork::Reply{false, false, ERROR_MISDIRECTED_REQUEST, "wrong swarm"};
     };
 
-    f.poll();
+    f.retrieve();
 
     // Bounded, and bounded low: a handful of attempts, not one per member per round.
     CHECK(tried(*f.net).size() <= 5);

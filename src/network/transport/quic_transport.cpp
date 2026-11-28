@@ -43,7 +43,7 @@ namespace {
             case RequestCategory::file_small: return true;
             // Small enough to qualify for the reserved stream, and deliberately kept off it: a
             // config push is the one swarm request that can be large, and stream 0 also carries
-            // the polls, the stores and the server's pushes back to us.
+            // the retrieves, the stores and the server's pushes back to us.
             case RequestCategory::config: return false;
         }
         return false;  // Shouldn't happen

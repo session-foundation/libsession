@@ -230,13 +230,14 @@ class Conversation {
     /// **This can bring a message back.** A message deleted only here is still in our swarm, and
     /// that row's swarm hash is the only thing that recognises it if it is delivered again — which
     /// a storage server makes likely rather than hypothetical, since it stops honouring a
-    /// `last_hash` once that has expired and answers the next poll with the whole retention window.
+    /// `last_hash` once that has expired and answers the next retrieve with the whole retention
+    /// window.
     /// Removing the row removes the memory of it, and the message returns looking new.
     ///
     /// The alternative — deleting our swarm copy too, so there is nothing to come back — is worse
-    /// and is deliberately not done: that copy is what our *other devices* poll, so destroying it
-    /// would turn "delete for me" into "delete on every device I own", including devices that have
-    /// never seen the message and then never would.
+    /// and is deliberately not done: that copy is what our *other devices* receive, so destroying
+    /// it would turn "delete for me" into "delete on every device I own", including devices that
+    /// have never seen the message and then never would.
     ///
     /// Messages we sent and deleted everywhere are not exposed to this: their swarm copy is already
     /// gone, so there is nothing left to return.

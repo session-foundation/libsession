@@ -24,7 +24,7 @@
 
 /// `session::client::Client` is the conversation-level data model of a Session client: the
 /// conversation list, message history, unread state and drafts, built on top of a `core::Core`
-/// which owns the synced account state (keys, configs, polling, decryption).
+/// which owns the synced account state (keys, configs, receiving, decryption).
 ///
 /// Client owns a Core rather than being part of one.  The consequence that matters is the one the
 /// compiler enforces: Core has no dependency on Client, and builds, tests and runs with none of
@@ -297,7 +297,7 @@ class Client {
     /// swarm still holds the message, and the swarm hash on that row is the only thing that
     /// recognises it if it is delivered again -- which a storage server makes likely rather than
     /// hypothetical, since it stops honouring a `last_hash` once that has expired and answers the
-    /// next poll with the whole retention window.  Delete the row and the message comes back
+    /// next retrieve with the whole retention window.  Delete the row and the message comes back
     /// looking new.
     ///
     /// Files are not touched.  An attachment's path names a file the user chose -- one they picked
@@ -1690,22 +1690,22 @@ class Client {
     void _emit_messages(bool added, std::vector<int64_t> ids);
 
     // Conversations whose settled state still has to be reported.  A conversation is marked here
-    // rather than reported immediately so that a poll delivering fifty messages to one conversation
-    // reports it once; `_flush_pending` is scheduled on the loop and runs when the work that
-    // dirtied them is finished.
+    // rather than reported immediately so that a retrieve delivering fifty messages to one
+    // conversation reports it once; `_flush_pending` is scheduled on the loop and runs when the
+    // work that dirtied them is finished.
     std::vector<ConversationId> _dirty;
     bool _flush_scheduled = false;
     void _touch(const ConversationId& id);
     void _flush_pending();
 
   public:
-    /// The account state this Client is built on: keys, device group, configs, polling.  A
+    /// The account state this Client is built on: keys, device group, configs, receiving.  A
     /// Client-based application uses this for everything below the conversation layer.
     ///
     /// Declared last, which is load-bearing rather than stylistic: members are destroyed in reverse
     /// declaration order, so this is destroyed *first*.  Core's callbacks and loop jobs capture
     /// `this` and reach the members above -- the signal registry, the send-id map, the pending
-    /// flush -- and Core's polling thread can be part-way through delivering one when a Client is
+    /// flush -- and Core's loop thread can be part-way through delivering one when a Client is
     /// destroyed.  `quic::Loop::~Loop()` joins that thread, so once this member is gone no callback
     /// can fire, and everything destroyed after it is unreachable by definition.
     ///

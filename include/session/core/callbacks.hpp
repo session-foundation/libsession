@@ -168,7 +168,8 @@ struct callbacks {
     ///
     /// When receive_messages() is called directly by the application, `msg` is a reference to one
     /// of the SwarmMessage elements passed in, which the caller can identify exactly by comparing
-    /// pointers.  When triggered by internal polling, `msg` refers to an internally-owned object.
+    /// pointers.  When triggered by Core's own receiving, `msg` refers to an internally-owned
+    /// object.
     ///
     /// Parameters:
     /// - msg    -- the raw swarm message that could not be decrypted
@@ -197,7 +198,7 @@ struct callbacks {
     /// reconcile it.
     ///
     /// Fires once per batch of merges rather than once per config, with every namespace that
-    /// changed: one poll can carry all four, and reacting to each in turn would show the
+    /// changed: one retrieve can carry all four, and reacting to each in turn would show the
     /// application a half-applied state.  It fires *after* the changed configs have been dumped,
     /// so what a handler reads is already on disk.
     ///

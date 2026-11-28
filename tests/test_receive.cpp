@@ -10,11 +10,11 @@
 
 using namespace session;
 
-// The batch _poll() sends is one subrequest per polled namespace, and results are matched to it by
-// position.  Both helpers below therefore work from the *request*: which namespaces it asked for,
-// and in what order.  That is what the real storage server does, and it means these tests do not
-// have to be rewritten each time Core learns to poll another namespace -- a positional assertion
-// breaks on every such change and says nothing about why.
+// The batch a retrieve sends is one subrequest per namespace received, and results are matched to
+// it by position.  Both helpers below therefore work from the *request*: which namespaces it asked
+// for, and in what order.  That is what the real storage server does, and it means these tests do
+// not have to be rewritten each time Core learns to receive another namespace -- a positional
+// assertion breaks on every such change and says nothing about why.
 
 // The parameters of the subrequest asking for `ns`.
 // Note each of these binds the parsed json to a local before iterating it: ranging directly over
@@ -61,7 +61,9 @@ static nlohmann::json make_response(
     return nlohmann::json{{"results", std::move(results)}};
 }
 
-TEST_CASE("Core automatic polling", "[core][poll]") {
+TEST_CASE(
+        "Receive: a retrieve asks for every namespace and resumes from the node's cursor",
+        "[core][retrieve]") {
     bool received = false;
     core::callbacks cbs;
     cbs.device_link_request = [&](int,
@@ -73,8 +75,7 @@ TEST_CASE("Core automatic polling", "[core][poll]") {
     // Use a fixed non-zero pubkey for the node.
     mock_net->current_node.remote_pubkey[0] = std::byte{0x01};
 
-    // Trigger poll via TestHelper
-    TestHelper::poll(*core);
+    TestHelper::start_receiving(*core);
 
     REQUIRE(mock_net->sent_requests.size() == 1);
     auto& sent = mock_net->sent_requests[0];
@@ -82,7 +83,7 @@ TEST_CASE("Core automatic polling", "[core][poll]") {
     CHECK(sent.request.endpoint == "batch");
     auto& body = *sent.request.body;
 
-    // Every namespace the account polls: the four user configs, one-to-one messages, and the two
+    // Every namespace the account receives: the four user configs, one-to-one messages, and the two
     // the device group needs.
     CHECK(namespaces_in(body) == std::vector<int16_t>{-21, 0, 2, 3, 4, 5, 21});
 
@@ -125,17 +126,34 @@ TEST_CASE("Core automatic polling", "[core][poll]") {
           "hash1");
     CHECK(received);
 
-    // Poll again with the same node — should include last_hash in the Devices subrequest.
+    // Retrieve again with the same node — should include last_hash in the Devices subrequest.
     mock_net->sent_requests.clear();
-    TestHelper::poll(*core);
+    TestHelper::start_receiving(*core);
 
     REQUIRE(mock_net->sent_requests.size() == 1);
     CHECK(params_for(*mock_net->sent_requests[0].request.body, 21)["last_hash"] == "hash1");
 }
 
+TEST_CASE("Receive: attaching a network starts receiving at once", "[core][retrieve]") {
+    TempCore core;
+    // Attached as an application attaches one, rather than through attach_mock_network, which
+    // turns this off for the tests that drive every retrieve themselves.
+    auto net = std::make_unique<MockNetwork>(network::config::Config{});
+    auto* mock_net = net.get();
+    mock_net->core = &*core;
+    core->set_network(std::move(net));
+
+    // Long before the retrieve interval: the attach started receiving on its own.
+    TestHelper::drain(*core);
+    REQUIRE(mock_net->sent_requests.size() == 1);
+    CHECK(mock_net->sent_requests[0].request.endpoint == "batch");
+    CHECK(namespaces_in(*mock_net->sent_requests[0].request.body) ==
+          std::vector<int16_t>{-21, 0, 2, 3, 4, 5, 21});
+}
+
 TEST_CASE(
-        "Polling uses per-node last_hash to avoid missing messages on swarm-member switch",
-        "[core][poll]") {
+        "Receive: retrieves use each node's own last_hash, so switching members misses nothing",
+        "[core][retrieve]") {
     TempCore c;
     auto* mock_net = attach_mock_network(*c);
 
@@ -144,9 +162,9 @@ TEST_CASE(
     node_a.remote_pubkey[0] = std::byte{0xAA};
     node_b.remote_pubkey[0] = std::byte{0xBB};
 
-    // ── First poll: node A, no prior state ──────────────────────────────────────
+    // ── First retrieve: node A, no prior state ──────────────────────────────────
     mock_net->current_node = node_a;
-    TestHelper::poll(*c);
+    TestHelper::start_receiving(*c);
     REQUIRE(mock_net->sent_requests.size() == 1);
     {
         auto p = params_for(*mock_net->sent_requests[0].request.body, 21);
@@ -165,19 +183,19 @@ TEST_CASE(
     CHECK(TestHelper::namespace_last_hash(*c, 21, node_a.remote_pubkey) == "xyz");
     CHECK_FALSE(TestHelper::namespace_last_hash(*c, 21, node_b.remote_pubkey).has_value());
 
-    // ── Second poll: still node A — must use A's stored hash ────────────────────
+    // ── Second retrieve: still node A — must use A's stored hash ────────────────
     mock_net->sent_requests.clear();
-    TestHelper::poll(*c);
+    TestHelper::start_receiving(*c);
     REQUIRE(mock_net->sent_requests.size() == 1);
     {
         auto p = params_for(*mock_net->sent_requests[0].request.body, 21);
         CHECK(p["last_hash"] == "xyz");
     }
 
-    // ── Third poll: switch to node B — no stored hash for B, so request everything ──
+    // ── Third retrieve: switch to node B — no stored hash for B, so request everything ──
     mock_net->sent_requests.clear();
     mock_net->current_node = node_b;
-    TestHelper::poll(*c);
+    TestHelper::start_receiving(*c);
     REQUIRE(mock_net->sent_requests.size() == 1);
     {
         auto p = params_for(*mock_net->sent_requests[0].request.body, 21);
@@ -197,10 +215,10 @@ TEST_CASE(
     // A's hash is untouched.
     CHECK(TestHelper::namespace_last_hash(*c, 21, node_a.remote_pubkey) == "xyz");
 
-    // ── Fourth poll: back to node A — must still use A's hash, not B's ──────────
+    // ── Fourth retrieve: back to node A — must still use A's hash, not B's ──────
     mock_net->sent_requests.clear();
     mock_net->current_node = node_a;
-    TestHelper::poll(*c);
+    TestHelper::start_receiving(*c);
     REQUIRE(mock_net->sent_requests.size() == 1);
     {
         auto p = params_for(*mock_net->sent_requests[0].request.body, 21);
@@ -208,7 +226,7 @@ TEST_CASE(
     }
 }
 
-TEST_CASE("Poll: the sync cursor advances only after the batch is handled", "[core][poll]") {
+TEST_CASE("Receive: the sync cursor advances only after the batch is handled", "[core][retrieve]") {
     // Attached below, once there is a Core to own it; the callback that reads it does not run
     // until then either.
     MockNetwork* mock_net = nullptr;
@@ -241,7 +259,7 @@ TEST_CASE("Poll: the sync cursor advances only after the batch is handled", "[co
     TempCore linker{core::predefined_seed{std::span<const std::byte, 32>{seed_bytes}}};
     auto outer_msg = linker->devices.build_link_request(await).message;
 
-    TestHelper::poll(*core);
+    TestHelper::start_receiving(*core);
     REQUIRE(mock_net->sent_requests.size() == 1);
     mock_net->sent_requests[0].callback(
             true,
@@ -276,7 +294,9 @@ static void set_more(
             response["results"][i]["body"]["more"] = true;
 }
 
-TEST_CASE("Poll: a truncated namespace is continued before it is reported final", "[core][poll]") {
+TEST_CASE(
+        "Receive: a truncated namespace is continued before it is reported final",
+        "[core][retrieve]") {
     int calls = 0;
     core::callbacks cbs;
     cbs.device_link_request =
@@ -294,7 +314,7 @@ TEST_CASE("Poll: a truncated namespace is continued before it is reported final"
     TempCore linker{core::predefined_seed{std::span<const std::byte, 32>{seed_bytes}}};
     auto outer_msg = linker->devices.build_link_request(await).message;
 
-    TestHelper::poll(*core);
+    TestHelper::start_receiving(*core);
     REQUIRE(mock_net->sent_requests.size() == 1);
 
     auto first = *mock_net->sent_requests[0].request.body;
@@ -325,11 +345,11 @@ TEST_CASE("Poll: a truncated namespace is continued before it is reported final"
     CHECK(calls == 1);
 }
 
-TEST_CASE("Poll: `more` with nothing returned does not continue", "[core][poll]") {
+TEST_CASE("Receive: `more` with nothing returned does not continue", "[core][retrieve]") {
     TempCore core;
     auto* mock_net = attach_mock_network(*core);
 
-    TestHelper::poll(*core);
+    TestHelper::start_receiving(*core);
     REQUIRE(mock_net->sent_requests.size() == 1);
 
     auto first = *mock_net->sent_requests[0].request.body;
@@ -342,4 +362,42 @@ TEST_CASE("Poll: `more` with nothing returned does not continue", "[core][poll]"
 
     // There is no new hash to move the cursor to, so another round would ask the same question.
     CHECK(mock_net->sent_requests.size() == 1);
+}
+
+TEST_CASE("Receive: nothing is retrieved while a subscription is held", "[core][retrieve]") {
+    TempCore core;
+    // A routing mode that can receive pushes, so that a drained retrieve goes on to subscribe.
+    network::config::Config config;
+    config.router = network::opt::router::Type::direct;
+    auto* mock_net = attach_mock_network(*core, std::move(config));
+
+    TestHelper::start_receiving(*core);
+    REQUIRE(mock_net->sent_requests.size() == 1);
+    auto reply = mock_net->sent_requests[0].callback;
+    reply(true,
+          false,
+          200,
+          {},
+          make_empty_response(*mock_net->sent_requests[0].request.body).dump());
+    TestHelper::drain(*core);
+
+    REQUIRE(mock_net->sent_requests.size() == 2);
+    REQUIRE(mock_net->sent_requests[1].request.endpoint == "monitor");
+
+    // Asked for but not yet confirmed: nothing is being pushed, so retrieving carries on.
+    TestHelper::start_receiving(*core);
+    REQUIRE(mock_net->sent_requests.size() == 3);
+    CHECK(mock_net->sent_requests[2].request.endpoint == "batch");
+
+    auto confirm = mock_net->sent_requests[1].callback;
+    confirm(true, false, 200, {}, "d7:successi1ee");
+    TestHelper::drain(*core);
+
+    // Confirming it sends one last retrieve, to the member subscribed with...
+    REQUIRE(mock_net->sent_requests.size() == 4);
+    CHECK(mock_net->sent_requests[3].request.endpoint == "batch");
+
+    // ...and from then on that member pushes, so starting to receive sends nothing.
+    TestHelper::start_receiving(*core);
+    CHECK(mock_net->sent_requests.size() == 4);
 }

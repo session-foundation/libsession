@@ -37,7 +37,7 @@ namespace detail {
     /// **A component's own state is Core's loop's, not the caller's.**  The database underneath is
     /// a thread-safe pool and does not care which thread reads it, but a component is more than
     /// its tables: it caches account key material, holds the config objects, and lazily builds
-    /// both.  None of that is synchronised, and Core's loop touches all of it while polling.  So
+    /// both.  None of that is synchronised, and Core's loop touches all of it while receiving.  So
     /// anything a component does beyond a self-contained query has to happen on the loop, and
     /// every such method asserts `on_loop()` in a debug build.
     ///

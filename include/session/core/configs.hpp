@@ -39,13 +39,13 @@ namespace session::core {
 /// The configs are built on first use rather than during init(), because they are encrypted to the
 /// account key and a Core opened with `defer_account` does not have one yet.  Nothing can reach
 /// them before an account exists in any case: a network cannot be attached without one, so neither
-/// polling nor pushing can run, and a direct caller gets the same `no_account` any other
+/// receiving nor pushing can run, and a direct caller gets the same `no_account` any other
 /// account-dependent call would throw.
 ///
 /// **Every method here belongs to Core's loop**, with no exceptions of the kind Globals has: there
 /// is no self-contained query on this class.  The accessors hand out a reference into an object
-/// that `merge()` rewrites on the loop as poll results arrive, and building them is itself lazy,
-/// so a caller on another thread races either the construction or the merge.  A debug build
+/// that `merge()` rewrites on the loop as received configs arrive, and building them is itself
+/// lazy, so a caller on another thread races either the construction or the merge.  A debug build
 /// asserts it.
 ///
 /// An application does not reach these directly.  `session::client::Client` wraps the parts it
@@ -67,7 +67,7 @@ class Configs : public detail::CoreComponent {
     int _batch_depth = 0;
 
     // Namespaces a merge has altered since the last time the application was told, deduplicated.
-    // Held rather than reported immediately so that one poll carrying several config namespaces
+    // Held rather than reported immediately so that one retrieve carrying several config namespaces
     // produces one notification of a settled state rather than several of partial ones.
     std::vector<config::Namespace> _changed;
 

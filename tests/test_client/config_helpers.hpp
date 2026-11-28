@@ -2,7 +2,8 @@
 
 #include "common.hpp"
 
-/// Building what "another device on this account" pushed, and feeding it back in as a poll would.
+/// Building what "another device on this account" pushed, and feeding it back in as a retrieve
+/// would.
 /// Shared by every test whose subject is reconciliation between the configs and the database.
 namespace client_test {
 
@@ -29,7 +30,7 @@ inline std::vector<std::vector<std::byte>> profile_from_another_device(
     });
 }
 
-/// Feeds them in as a poll would.  A SwarmMessage points at its data rather than owning it, so
+/// Feeds them in as a retrieve would.  A SwarmMessage points at its data rather than owning it, so
 /// `messages` has to outlive this call.
 inline void merge_profile(Client& c, const std::vector<std::vector<std::byte>>& messages) {
     std::vector<core::SwarmMessage> incoming;
@@ -39,7 +40,7 @@ inline void merge_profile(Client& c, const std::vector<std::vector<std::byte>>& 
         m.data = messages[i];
         incoming.push_back(std::move(m));
     }
-    // Merging is config work, so it belongs on Core's loop just as a real poll's would.
+    // Merging is config work, so it belongs on Core's loop just as a real retrieve's would.
     TestHelper::on_loop(c.core, [&] {
         c.core.receive_messages(incoming, config::Namespace::UserProfile, true);
     });

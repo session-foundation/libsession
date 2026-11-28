@@ -88,7 +88,7 @@ TEST_CASE("Client: Core is usable directly through the Client", "[client][callba
 // ── Threading ───────────────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("Client: reads are safe while messages arrive on another thread", "[client][threads]") {
-    // An application reads conversations and history from its UI thread while Core's poll thread
+    // An application reads conversations and history from its UI thread while Core's loop thread
     // writes arriving messages.  Those are two connections from the shared pool against a WAL
     // database, so readers should not block behind the writer nor see SQLITE_BUSY -- but that is a
     // claim about configuration, and nothing exercised it until this.

@@ -143,7 +143,7 @@ TEST_CASE("Profile fetch: a config arriving after it reported is still merged", 
     REQUIRE(calls == 1);
 
     // Too late to be reported, not too late to count: it came from our own swarm, and dropping it
-    // would only leave the next poll to fetch it again.
+    // would only leave a later retrieve to fetch it again.
     reply(c, sent[1], answer(newer, "h-new"));
     CHECK(name_of(c) == "Current");
     CHECK(calls == 1);

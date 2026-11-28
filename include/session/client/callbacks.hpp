@@ -48,8 +48,8 @@ struct callbacks {
 
     /// A conversation's contents changed: a new or edited message, a name, an unread count, its
     /// last activity.  Fired once with the conversation's settled state rather than once per
-    /// underlying change, so a poll that delivers fifty messages to one conversation fires this
-    /// once.
+    /// underlying change, so a retrieve that delivers fifty messages to one conversation fires
+    /// this once.
     std::function<void(AnyConversation&&)> conversation_updated;
 
     /// A conversation is gone and should be dropped from the list.
