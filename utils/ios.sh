@@ -138,7 +138,7 @@ if [ "${SHOULD_BUILD_STATIC_LIBS}" == "SHOULD_BUILD_STATIC_LIBS" ]; then
 
         env -i "${build_env[@]}" \
             ./utils/static-bundle.sh "$build" "" \
-            -DCMAKE_TOOLCHAIN_FILE="${projdir}/external/ios-cmake/ios.toolchain.cmake" \
+            -DCMAKE_TOOLCHAIN_FILE="${projdir}/cmake/session-deps/external/ios-cmake/ios.toolchain.cmake" \
             -DPLATFORM=$platform \
             -DDEPLOYMENT_TARGET=$IPHONEOS_DEPLOYMENT_TARGET \
             -DENABLE_BITCODE=$ENABLE_BITCODE \

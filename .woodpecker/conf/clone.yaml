@@ -1,0 +1,17 @@
+# The submodules CI's clone step fetches (see clone/README.md in session-docker-ci).  Patterns work
+# as in .gitignore; skipping a submodule skips everything under it, and a submodule added upstream
+# is fetched until it is listed here.
+submodules:
+  # No CI build configures these.
+  skip:
+    - /external/**/Catch2
+    # Anchored at /external/ because cmake/session-deps/external/ios-cmake is the copy utils/ios.sh
+    # loads.
+    - /external/**/ios-cmake
+    - googletest
+    - /external/protobuf/third_party/benchmark
+    - /external/session-router/gui
+    - /external/session-router/external/oxen-libquic/tests/CLI11
+    - /external/session-router/external/oxen-mq
+    - /external/session-router/external/pybind11
+    - /external/session-router/external/sqlite_orm
